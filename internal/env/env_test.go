@@ -61,3 +61,38 @@ func TestMergeUserExcludeAndDeterministicOrder(t *testing.T) {
 		t.Fatalf("got %v", out)
 	}
 }
+
+func TestMergeStripLocal(t *testing.T) {
+	local := []string{"AWS_PROFILE=personal", "PORT=3000"}
+	task := map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/x"}
+	got := toMap(Merge(local, task, Options{StripLocal: LocalAWSCredentialVars}))
+	if _, ok := got["AWS_PROFILE"]; ok {
+		t.Fatalf("AWS_PROFILE must be stripped, got %v", got)
+	}
+	if got["PORT"] != "3000" {
+		t.Fatalf("PORT must survive, got %v", got)
+	}
+	if got["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "/v2/x" {
+		t.Fatalf("task URI must survive, got %v", got)
+	}
+}
+
+func TestMergeOverrideBeatsExclusion(t *testing.T) {
+	local := []string{"PATH=/usr/bin"}
+	task := map[string]string{"PATH": "/task/bin"}
+	got := toMap(Merge(local, task, Options{Override: map[string]string{"PATH": "/override/bin"}}))
+	if got["PATH"] != "/override/bin" {
+		t.Fatalf("PATH override must win even though PATH is excluded, got %v", got)
+	}
+}
+
+func TestMergeSkipsMalformedLocalEntry(t *testing.T) {
+	local := []string{"NOEQUALS", "PORT=3000"}
+	got := toMap(Merge(local, nil, Options{}))
+	if _, ok := got["NOEQUALS"]; ok {
+		t.Fatalf("malformed local entry must be dropped, got %v", got)
+	}
+	if got["PORT"] != "3000" {
+		t.Fatalf("got %v", got)
+	}
+}
