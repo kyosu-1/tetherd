@@ -6,6 +6,7 @@ package transport
 import (
 	"context"
 	"net"
+	"time"
 )
 
 // Task identifies one running agent.
@@ -16,6 +17,9 @@ type Task struct {
 	RuntimeID string
 	// Addr is host:port of the control port, used by the direct transport.
 	Addr string
+	// SubnetID and StartedAt come from DescribeTasks (ECS provider).
+	SubnetID  string
+	StartedAt time.Time
 }
 
 // Transport opens one TCP connection to the agent's control port.
