@@ -2,7 +2,10 @@ BIN := bin
 PKGS := ./...
 LDFLAGS := -X github.com/kyosu-1/tetherd/internal/version.Version=$(shell git describe --tags --always --dirty)
 
-.PHONY: build test lint clean e2e-local
+ECR_REGISTRY ?=
+TAG ?= dev
+
+.PHONY: build test lint clean e2e-local push-images
 
 build:
 	mkdir -p $(BIN)
@@ -22,3 +25,11 @@ clean:
 
 e2e-local: build
 	bash hack/e2e-local.sh
+
+# Build linux/arm64 images (Fargate runs Graviton in dev-env) and push to ECR.
+# Usage: aws ecr get-login-password --profile personal | docker login --username AWS --password-stdin $ECR_REGISTRY
+#        make push-images ECR_REGISTRY=738925651667.dkr.ecr.ap-northeast-1.amazonaws.com
+push-images:
+	@test -n "$(ECR_REGISTRY)" || { echo "ECR_REGISTRY is required"; exit 2; }
+	docker buildx build --platform linux/arm64 -f deploy/docker/agent.Dockerfile -t $(ECR_REGISTRY)/tetherd-agent:$(TAG) --push .
+	docker buildx build --platform linux/arm64 -f deploy/docker/sampleapp.Dockerfile -t $(ECR_REGISTRY)/tetherd-sampleapp:$(TAG) --push .
