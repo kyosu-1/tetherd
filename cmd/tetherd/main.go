@@ -4,14 +4,16 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/kyosu-1/tetherd/internal/version"
+	"github.com/kyosu-1/tetherd/internal/cli"
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "version" {
-		fmt.Println("tetherd", version.Version)
-		return
+	root := cli.NewRootCommand()
+	if err := root.Execute(); err != nil {
+		code := cli.ExitCode(err)
+		if code == 1 || code == 2 {
+			fmt.Fprintf(os.Stderr, "tetherd  ✗ %v\n", err)
+		}
+		os.Exit(code)
 	}
-	fmt.Fprintln(os.Stderr, "tetherd: not implemented yet")
-	os.Exit(2)
 }
