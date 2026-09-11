@@ -27,6 +27,10 @@ type Capturer struct {
 	h  Helper
 	mu sync.Mutex
 	ln net.Listener
+
+	// Logf, if set, receives a line for each connection whose natlook
+	// fails (the connection is dropped but capture keeps running).
+	Logf func(string, ...any)
 }
 
 // New returns a Capturer that talks to h.
@@ -64,6 +68,9 @@ func (c *Capturer) RedirectPort() int {
 }
 
 // Accept returns the next captured connection with its original destination.
+// A connection whose natlook fails is closed and skipped rather than failing
+// Accept itself, so one stray loopback connect cannot end capture; only a
+// listener error (e.g. Close) returns an error.
 func (c *Capturer) Accept() (capture.Conn, error) {
 	c.mu.Lock()
 	ln := c.ln
@@ -71,18 +78,27 @@ func (c *Capturer) Accept() (capture.Conn, error) {
 	if ln == nil {
 		return capture.Conn{}, errors.New("pfrdr: not started")
 	}
-	conn, err := ln.Accept()
-	if err != nil {
-		return capture.Conn{}, err
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return capture.Conn{}, err
+		}
+		src := conn.RemoteAddr().(*net.TCPAddr).AddrPort()
+		dst := conn.LocalAddr().(*net.TCPAddr).AddrPort()
+		orig, err := c.h.NatLook("tcp", netip.AddrPortFrom(src.Addr().Unmap(), src.Port()), netip.AddrPortFrom(dst.Addr().Unmap(), dst.Port()))
+		if err != nil {
+			conn.Close()
+			c.logf("natlook for %s: %v", src, err)
+			continue
+		}
+		return capture.Conn{Conn: conn, OriginalDst: orig}, nil
 	}
-	src := conn.RemoteAddr().(*net.TCPAddr).AddrPort()
-	dst := conn.LocalAddr().(*net.TCPAddr).AddrPort()
-	orig, err := c.h.NatLook("tcp", netip.AddrPortFrom(src.Addr().Unmap(), src.Port()), netip.AddrPortFrom(dst.Addr().Unmap(), dst.Port()))
-	if err != nil {
-		conn.Close()
-		return capture.Conn{}, fmt.Errorf("natlook for %s: %w", src, err)
+}
+
+func (c *Capturer) logf(format string, args ...any) {
+	if c.Logf != nil {
+		c.Logf(format, args...)
 	}
-	return capture.Conn{Conn: conn, OriginalDst: orig}, nil
 }
 
 // Close removes the pf rules and stops listening.
