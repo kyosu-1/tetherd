@@ -122,6 +122,7 @@ func TestDialThroughPlugin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { conn.Close() })
 	if got := aws.ToString(api.started.Target); got != "ecs:c_t1_rt1" {
 		t.Fatalf("target = %q", got)
 	}

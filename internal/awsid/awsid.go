@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"time"
@@ -49,7 +50,7 @@ func FetchContainerCredentials(ctx context.Context, dial func(ctx context.Contex
 		return aws.Credentials{}, fmt.Errorf("task credentials endpoint: HTTP %d", resp.StatusCode)
 	}
 	var c containerCreds
-	if err := json.NewDecoder(resp.Body).Decode(&c); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&c); err != nil {
 		return aws.Credentials{}, fmt.Errorf("task credentials: %w", err)
 	}
 	return aws.Credentials{
