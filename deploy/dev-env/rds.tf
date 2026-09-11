@@ -15,6 +15,9 @@ resource "aws_security_group" "app" {
   }
 }
 
+# No egress block on purpose: RDS never initiates outbound connections, so
+# there's nothing for this group to allow out (AWS defaults a security
+# group with no egress rules to denying all outbound traffic).
 resource "aws_security_group" "rds" {
   name   = "${var.name}-rds"
   vpc_id = aws_vpc.this.id

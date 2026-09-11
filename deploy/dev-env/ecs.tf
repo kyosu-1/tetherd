@@ -64,7 +64,7 @@ resource "aws_iam_role_policy" "task" {
         ]
         Resource = "*"
       },
-      { Effect = "Allow", Action = ["s3:ListAllMyBuckets", "sts:GetCallerIdentity"], Resource = "*" },
+      { Effect = "Allow", Action = ["s3:ListAllMyBuckets"], Resource = "*" },
     ]
   })
 }
@@ -119,6 +119,7 @@ resource "aws_ecs_task_definition" "api" {
       environment = [
         { name = "PORT", value = "8081" },
         { name = "TETHERD_ENV", value = "dev" },
+        { name = "AWS_REGION", value = var.region },
         { name = "DB_HOST", value = aws_db_instance.this.address },
         { name = "DB_PORT", value = "5432" },
         { name = "DB_USER", value = "tetherd" },

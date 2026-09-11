@@ -41,10 +41,16 @@ terraform output -raw tetherd_run_example
 terraform destroy
 ```
 
+開発者ポリシー（`terraform output` の ARN）を手で IAM ユーザーにアタッチしていた場合は、先にデタッチしておく。アタッチされたままだと `DeleteConflict` で `aws_iam_policy` の削除に失敗する:
+
+```
+aws iam detach-user-policy --profile personal --user-name <user> --policy-arn $(terraform output -raw developer_policy_arn)
+```
+
 ## 中身
 
 - VPC 10.0.0.0/16、public × 2（ALB / NAT）、private × 2（Fargate / RDS）、NAT 1 つ
-- ALB :80 → app :8081（v0.3 で agent :8080 に切り替える）
+- ALB :80 → app :8081（v0.3 で agent :8080 に切り替える）。既定は `0.0.0.0/0` に公開しているので、共有環境では `allowed_ingress_cidrs` で自分の IP に絞る
 - ECS cluster `tetherd-dev`、service `api`（`enableExecuteCommand`、`pidMode: task`）、コンテナ `tetherd-agent`（`SYS_PTRACE`）+ `app`
 - RDS Postgres 16 `db.t4g.micro`、パスワードは Secrets Manager → app の `DB_PASSWORD`
 - SSM Parameter `/tetherd-dev/FEATURE_FLAG` → app の `FEATURE_FLAG`

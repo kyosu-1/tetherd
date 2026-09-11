@@ -10,9 +10,15 @@ variable "region" {
 }
 
 variable "profile" {
-  description = "AWS CLI profile (empty = default credential chain)"
+  description = "AWS CLI profile (empty = default credential chain). Defaults to \"personal\", the profile this repo's own dev env is deployed under; override it for any other account"
   type        = string
   default     = "personal"
+}
+
+variable "allowed_ingress_cidrs" {
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+  description = "CIDRs allowed to reach the ALB on :80; narrow to your IP for anything beyond a throwaway env"
 }
 
 variable "vpc_cidr" {
