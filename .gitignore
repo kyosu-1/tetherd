@@ -1,0 +1,20 @@
+# Binaries
+/bin/
+/dist/
+tetherd
+tetherd-agent
+
+# Go
+*.test
+*.out
+coverage.*
+
+# Local config / secrets
+.tetherd.local.yml
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+.idea/
+*.swp
