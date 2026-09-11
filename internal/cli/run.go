@@ -145,7 +145,7 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 		return 0, nil
 	case <-sess.Done():
 		logf("✗ agent session lost: %v", sess.Err())
-		child.Process.Signal(os.Interrupt)
+		cancel()
 		<-waitErr
 		return 1, sess.Err()
 	}

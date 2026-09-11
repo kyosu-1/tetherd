@@ -55,10 +55,13 @@ func newRunCommand() *cobra.Command {
 			}
 			code, err := runFn(opts)
 			if err != nil {
-				return err
+				if code == 0 {
+					code = 1
+				}
+				return &exitError{code: code, err: err}
 			}
 			if code != 0 {
-				return &exitError{code: code}
+				return &exitError{code: code, child: true}
 			}
 			return nil
 		},
@@ -74,18 +77,37 @@ func newRunCommand() *cobra.Command {
 	return cmd
 }
 
-type exitError struct{ code int }
+type exitError struct {
+	code  int
+	err   error // nil for a child exit
+	child bool  // true when code is the child's own exit status
+}
 
-func (e *exitError) Error() string { return fmt.Sprintf("exit status %d", e.code) }
+func (e *exitError) Error() string {
+	if e.err != nil {
+		return e.err.Error()
+	}
+	return fmt.Sprintf("exit status %d", e.code)
+}
 
-// ExitCode extracts the child's exit code from an error returned by Execute.
+func (e *exitError) Unwrap() error { return e.err }
+
+// ExitCode maps an error from Execute to a process exit code: child exit ->
+// its code; tetherd's own failure -> the code Run chose; anything else
+// (cobra usage errors) -> 2.
 func ExitCode(err error) int {
 	var ee *exitError
 	if errors.As(err, &ee) {
 		return ee.code
 	}
 	if err != nil {
-		return 1
+		return 2
 	}
 	return 0
+}
+
+// IsChildExit reports whether err carries the child's own exit status.
+func IsChildExit(err error) bool {
+	var ee *exitError
+	return errors.As(err, &ee) && ee.child
 }
