@@ -3,6 +3,7 @@ package ecs
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,15 +85,34 @@ func TestDiscoverExplicitTaskID(t *testing.T) {
 
 func TestDiscoverNotReadyReasons(t *testing.T) {
 	now := time.Now()
-	f := &fakeECS{arns: []string{"a", "b", "c"}, tasks: []types.Task{
+	d := task("d", now, true, "RUNNING", true)
+	d.LastStatus = aws.String("PENDING")
+	f := &fakeECS{arns: []string{"a", "b", "c", "d"}, tasks: []types.Task{
 		task("a", now, false, "RUNNING", true),
 		task("b", now, true, "PENDING", true),
 		task("c", now, true, "", false),
+		d,
 	}}
 	_, err := Discover(context.Background(), f, Target{Cluster: "c", Service: "api"})
 	var nr *NotReadyError
-	if !errors.As(err, &nr) || len(nr.Reasons) != 3 {
-		t.Fatalf("want NotReadyError with 3 reasons, got %v", err)
+	if !errors.As(err, &nr) || len(nr.Reasons) != 4 {
+		t.Fatalf("want NotReadyError with 4 reasons, got %v", err)
+	}
+	found := false
+	for _, r := range nr.Reasons {
+		if strings.Contains(r, "not RUNNING yet") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want a reason containing %q, got %v", "not RUNNING yet", nr.Reasons)
+	}
+}
+
+func TestNotReadyErrorEmpty(t *testing.T) {
+	nr := &NotReadyError{}
+	if nr.Error() != "no attachable task (no running tasks matched)" {
+		t.Fatalf("got %q", nr.Error())
 	}
 }
 

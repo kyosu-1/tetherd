@@ -36,6 +36,9 @@ type NotReadyError struct {
 }
 
 func (e *NotReadyError) Error() string {
+	if len(e.Reasons) == 0 {
+		return "no attachable task (no running tasks matched)"
+	}
 	return "no attachable task:\n        " + strings.Join(e.Reasons, "\n        ")
 }
 
@@ -69,6 +72,7 @@ func Discover(ctx context.Context, api ECSAPI, t Target) (transport.Task, error)
 			continue
 		}
 		if aws.ToString(task.LastStatus) != "RUNNING" {
+			reasons = append(reasons, fmt.Sprintf("task %s: not RUNNING yet (currently %q)", id, aws.ToString(task.LastStatus)))
 			continue
 		}
 		if !task.EnableExecuteCommand {
