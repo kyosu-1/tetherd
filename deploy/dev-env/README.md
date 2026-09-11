@@ -15,7 +15,7 @@ aws s3api put-public-access-block --profile personal --bucket tetherd-tfstate-73
 
 ```
 aws login --profile personal                  # セッションが切れていたら
-eval "$(aws configure export-credentials --profile personal --format env)"   # S3 backend 用（aws login のセッションを backend は読めない）
+eval "$(aws configure export-credentials --profile personal --format env)"   # S3 backend 用（aws login のセッションを backend は読めない。AWS CLI v2 の新しめのバージョンが必要）
 cd deploy/dev-env
 terraform init
 terraform apply                               # 10〜15 分（RDS）

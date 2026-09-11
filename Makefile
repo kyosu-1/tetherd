@@ -4,6 +4,11 @@ LDFLAGS := -X github.com/kyosu-1/tetherd/internal/version.Version=$(shell git de
 
 ECR_REGISTRY ?=
 TAG ?= dev
+# Fargate tasks run on Graviton (ARM64) or X86_64, and the Dockerfiles
+# cross-compile the Go binary instead of emulating, so building both costs
+# little and the pushed manifest list serves either. Override for a single
+# arch, e.g. PLATFORMS=linux/arm64 (spec §5.5).
+PLATFORMS ?= linux/amd64,linux/arm64
 
 .PHONY: build test lint clean e2e-local push-images
 
@@ -31,5 +36,5 @@ e2e-local: build
 #        make push-images ECR_REGISTRY=738925651667.dkr.ecr.ap-northeast-1.amazonaws.com
 push-images:
 	@test -n "$(ECR_REGISTRY)" || { echo "ECR_REGISTRY is required"; exit 2; }
-	docker buildx build --platform linux/arm64 -f deploy/docker/agent.Dockerfile -t $(ECR_REGISTRY)/tetherd-agent:$(TAG) --push .
-	docker buildx build --platform linux/arm64 -f deploy/docker/sampleapp.Dockerfile -t $(ECR_REGISTRY)/tetherd-sampleapp:$(TAG) --push .
+	docker buildx build --platform $(PLATFORMS) -f deploy/docker/agent.Dockerfile -t $(ECR_REGISTRY)/tetherd-agent:$(TAG) --push .
+	docker buildx build --platform $(PLATFORMS) -f deploy/docker/sampleapp.Dockerfile -t $(ECR_REGISTRY)/tetherd-sampleapp:$(TAG) --push .
