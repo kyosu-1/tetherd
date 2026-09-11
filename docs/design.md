@@ -4,8 +4,8 @@
 ローカルのプロセスを、開発環境の ECS タスクの「中で動いているかのように」振る舞わせる CLI とサイドカー。
 
 - 実装: Go / 単一バイナリ（CLI）+ distroless イメージ（agent）
-- v1 対象: ALB + ECS Fargate + RDS
-- 次: Cloud Run（プロバイダとして追加）
+- v1 対象: **macOS** × ALB + ECS Fargate + RDS。詳細は [specs/2026-09-12-v1-macos-design.md](specs/2026-09-12-v1-macos-design.md)
+- 次: Linux（捕まえる層の追加）、Cloud Run（プロバイダとして追加）
 - 名前: `tetherd`（テザード）。tether = テザリング。タスクのネットワークと身元をラップトップに分けてもらう
 
 ---
@@ -19,11 +19,11 @@ $ tetherd run -- go run ./cmd/api
 これ一発で、ローカルの `go run ./cmd/api` が開発環境の `api` タスクの一部として振る舞う。
 
 - 環境変数とシークレットは、実行中の app コンテナから読んだ本物
-- そのプロセスが出す通信は、宛先が何であれ、DNS も含めて、タスクの ENI から出ていく
-- AWS SDK はタスクロールとして振る舞う
-- ALB に届いたリクエストのうち `X-Dev-User: shota` が付いたものだけがラップトップの `:8080` に流れてくる
+- そのプロセスが VPC 内に出す通信は、DNS も含めて、タスクの ENI から出ていく
+- AWS SDK はタスクロールとして振る舞う（VPC 外の S3 や DynamoDB に対しても）
+- ALB に届いたリクエストのうち `X-Dev-User: shota` とそのトークンが付いたものだけがラップトップの `:8080` に流れてくる
 
-> mirrord は syscall をフックして「プロセスの目を騙す」。tetherd はフックの代わりに **カーネルのネットワーク層で捕まえ、ユーザー空間のネットワークスタックで終端する**。透過度は mirrord と同等で、ランタイム（Go の静的バイナリ、JVM、Node、macOS の SIP）に一切依存しない。捨てるのはファイルシステムの透過だけ。
+> mirrord は syscall をフックして「プロセスの目を騙す」。tetherd はプロセスには何も仕込まず、**カーネルのネットワーク層で捕まえる**。v1（macOS）は pf で捕まえてカーネルの TCP でそのまま終端し、Linux は netns + TUN で捕まえる予定。どちらもランタイム（Go の静的バイナリ、JVM、Node、macOS の SIP）に一切依存しない。捨てるのはファイルシステムの透過だけ。
 
 ---
 
@@ -32,11 +32,10 @@ $ tetherd run -- go run ./cmd/api
 ### やること
 
 - app コンテナの **実行中の環境変数**（secrets 解決済み）を agent が読み取り、ローカルプロセスに注入する。開発者に Secrets Manager の権限は不要
-- 子プロセス（と子孫）の全 TCP / UDP / DNS をカーネル層で捕まえ、タスクの ENI から出す（透過 outgoing）
+- 子プロセス（と子孫）の VPC 内宛ての TCP をカーネル層で捕まえ、タスクの ENI から出す（透過 outgoing）。DNS は VPC 内ドメインだけ agent 側で解決する
 - タスクロールの認証情報エンドポイント（169.254.170.2）もそのまま通し、SDK をタスクロールとして動かす
-- ALB → サイドカー経由で、条件に合う HTTP リクエストを手元に引き込む（steal）
-- 条件に合うリクエストのコピーを手元にも流す（mirror、レスポンスは捨てる）
-- 以上を 1 本の制御チャネル（ECS Exec / SSM）に多重化する
+- ALB → サイドカー経由で、ユーザー名 + トークンが一致する HTTP リクエストを手元に引き込む（steal）
+- 以上を 1 本の制御チャネル（ECS Exec / SSM）に多重化する。タスクが複数あれば全部に繋ぐ
 
 ### やらないこと
 
@@ -45,13 +44,18 @@ $ tetherd run -- go run ./cmd/api
 - 本番環境への適用（設定とサイドカーの二重ガードで拒否）
 - 動いているタスクへの「後から差し込む」注入。サイドカーはタスク定義に最初から含める
 - HTTP 以外のプロトコルの steal（Fargate では NET_ADMIN / NET_RAW が取れない）
+- dev タスクを踏み台にしたインターネットへの egress（既定では VPC 内だけをリモートに回す）
+
+### v2 以降に送るもの
+
+mirror（共有 DB への二重書き込みの扱いを決めてから）、UDP / IPv6、`remote_localhost`（タスク側 localhost への到達）、env-rewrite モード、`init`、WebSocket / gRPC の steal、同一マシンでの複数セッション、Linux、Cloud Run。
 
 ---
 
 ## 3. 全体構成
 
 ```
- ┌──────────────┐  ① X-Dev-User: shota  ┌──────────────────────────────────────────┐
+ ┌──────────────┐  ① X-Dev-User + Token  ┌──────────────────────────────────────────┐
  │  ALB (dev)   │ ─────────────────────▶ │ ECS Task · dev/api · awsvpc              │
  └──────────────┘                        │  ┌────────────────┐      ┌────────────┐ │
                                          │  │ tetherd-agent  │ 通常時│ app        │ │
@@ -72,26 +76,28 @@ $ tetherd run -- go run ./cmd/api
                                                 ▼
  ┌──────────────────────────────────────────────────────────────┐
  │ Laptop                                                       │
- │  tetherd CLI ─ env 注入 / netstack(全 TCP·UDP·DNS → agent)   │
- │               / steal → :8080                                │
- │  go run ./cmd/api :8080  ← netns / pf group でスコープ        │
+ │  tetherd CLI ─ env 注入 / 透過プロキシ(VPC 宛 TCP → agent)    │
+ │               / DNS(VPC 内ドメイン → agent) / steal → :8080   │
+ │  tetherd-helper (root) ─ pf ルール · /etc/resolver · natlook  │
+ │  go run ./cmd/api :8080  ← gid tetherd でスコープ             │
  └──────────────────────────────────────────────────────────────┘
 ```
 
-部品は 2 つ。タスクに同居するサイドカー（agent）と、ラップトップの CLI。
+部品はラップトップに 3 つ、タスクに 1 つ。
 
 ### 3.1 tetherd-agent（サイドカー）
 
-- Go 製の単一バイナリ、distroless イメージ。タスク定義にコンテナを 1 つ足す
+- Go 製の単一バイナリ、distroless イメージ（`ghcr.io/kyosu-1/tetherd-agent`、arm64 / amd64）。タスク定義にコンテナを 1 つ足す
 - awsvpc モードではタスク内の全コンテナがネットワーク名前空間を共有するため、mirrord のエージェントと同じ立ち位置（同じ ENI、同じ SG、同じ IP）に立てる
-- `:8080` で ALB からのトラフィックを受け、開発者セッションが無ければ全て `:8081` の app へ素通し
-- セッション中だけルーティングテーブルを持ち、ヘッダーが一致したリクエストを該当ユーザーのラップトップへ流す
+- `:8080` で ALB からのトラフィックを受け、常に HTTP/1.1 リバースプロキシとして動く。ALB は接続を keep-alive で使い回すので振り分けはリクエスト単位。セッションが無ければ全リクエストが `:8081` の app へ
+- セッション中だけルーティングテーブルを持ち、ユーザー名とトークンが一致したリクエストを該当ユーザーのラップトップへ流す
 - `:9900` は制御ポート。`127.0.0.1` のみ bind（SSM フォワードは同一ネットワーク名前空間から来る）
-- `TETHERD_ENV=dev` が無ければ起動を拒否する
-- 既存のヘルスチェックパスはそのまま透過（agent はヘルスチェックを横取りしない）
+- `TETHERD_ENV` が無ければ起動を拒否する
+- 既存のヘルスチェックパスはそのまま透過（ヘッダーが無いので常に app へ）。WebSocket の upgrade も app へ素通し
 - セッションが切れたら即座に素通しに戻す（リクエスト途中のものは完了まで待つ）
-- AWS API は呼ばない。Linux capability は env 読み取りのための `SYS_PTRACE` のみ
-- listen ポート（8080 / 9900）は設定で変更可
+- AWS API は呼ばない。Linux capability は env 読み取りのための `SYS_PTRACE` のみ。root で動かす（capability を effective にするため）
+- 常時データパスにいるので `essential: true` と `restartPolicy` を推奨
+- listen ポート（8080 / 9900）は env で変更可
 
 ### 3.2 環境変数と secrets の取得 — 実行中のプロセスから読む
 
@@ -102,21 +108,14 @@ Fargate でこれを可能にするための設定が 2 つ:
 - タスク定義で `pidMode: task`（コンテナ間で PID 名前空間を共有。Fargate platform 1.4+）
 - agent コンテナの `linuxParameters.capabilities.add: ["SYS_PTRACE"]`（他ユーザーのプロセスの environ を読むのに必要。Fargate で追加を許されている唯一の capability）
 
-app コンテナの特定: タスクメタデータエンドポイント（`ECS_CONTAINER_METADATA_URI_V4/task`）で app コンテナの ID を得て、`/proc/*/environ` の中から `ECS_CONTAINER_METADATA_URI_V4` がその ID を指しているプロセスを探す。環境変数の値はプロセス起動時点のものになるが、これはコンテナの env の性質そのもの。
+app コンテナの特定: タスクメタデータエンドポイント（`ECS_CONTAINER_METADATA_URI_V4/task`）で app コンテナの ID を得て、`/proc/*/environ` の中から `ECS_CONTAINER_METADATA_URI_V4` がその ID を指しているプロセスを探し、その中で最も古い（= コンテナの init）プロセスの environ を採用する。entrypoint がシェルスクリプトでも「ECS が注入した env」が取れる。環境変数の値はプロセス起動時点のものになるが、これはコンテナの env の性質そのもの。`pidMode: task` が無ければ `welcome` でその旨を返し、CLI が修正方法を案内する。
 
-フォールバック（`pidMode: task` を入れたくない場合）:
+### 3.3 tetherd CLI とヘルパー（ラップトップ）
 
-- agent コンテナ定義に app と同じ `secrets` ブロックを複製する（ECS が agent 用にも解決してくれる。`init` が生成）
-- CLI がタスク定義 + Secrets Manager から自分で解決する（`env.source: api`。開発者に GetSecretValue が必要）
-
-既定は agent 経由。
-
-### 3.3 tetherd CLI（ラップトップ）
-
-- 依存は AWS CLI と session-manager-plugin、それに `brew install` 時に一度だけ入る特権ヘルパー（macOS のみ、§6）
-- `run` 一発で、タスク選択 → SSM ポートフォワード → yamux セッション（ここで agent から app の env を受け取る）→ 子プロセス用のネットワーク隔離を用意 → env を注入して `exec`、までを行う
-- 子プロセスの終了か Ctrl-C で隔離を片付け、agent に `bye` を送り、素通しに戻す
-- 中核は gVisor netstack（Go 製のユーザー空間 TCP/IP スタック）。捕まえた IP パケットを TCP / UDP のフローとして終端し、フローごとに agent へのストリームに変換する。この部分は OS に依存せず、「どうパケットを捕まえるか」（§6）とは完全に分離されている
+- 依存は session-manager-plugin と、`brew install` 時に一度だけ入る特権ヘルパー（macOS、§6）。AWS CLI は不要（`ssm:StartSession` は SDK で呼ぶ）
+- `run` 一発で、タスク選択 → SSM ポートフォワード → yamux セッション（ここで agent から app の env を受け取る）→ ルーティング集合の算出 → ヘルパーに pf ルール投入 → env を注入して子プロセスを起動、までを行う
+- 子プロセスの終了か Ctrl-C で pf ルールを片付け、agent に `bye` を送り、素通しに戻す。CLI が異常終了してもヘルパーが掃除する
+- 「どうパケットを捕まえるか」（§6）は `Capturer` インターフェースの裏に閉じ、「(元の宛先, 接続) を渡す」と定義する。v1 の macOS 実装は pf rdr でカーネルの TCP に終端させる。Linux で netns + TUN を足すときはユーザー空間スタック（gVisor netstack）で同じインターフェースに変換する
 
 ---
 
@@ -125,7 +124,7 @@ app コンテナの特定: タスクメタデータエンドポイント（`ECS_
 いちばん大事な性質は、**ラップトップが VPC に一切入らない**こと。VPN もリレーも ALB のルール追加も要らず、すべて SSM を中継点にした「双方向アウトバウンド」で成立する。
 
 ```
- Internet ── ① HTTPS (X-Dev-User: shota) ──▶ ALB · sg-alb (in 443 ← 0/0)     [public subnet]
+ Internet ── ① HTTPS (X-Dev-User + Token) ──▶ ALB · sg-alb (in 443 ← 0/0)     [public subnet]
                                               │ ② :8080 (target group を 8081 → 8080 に)
                                               ▼
    ┌──────────────────────────────────────────────────────────────┐ [private subnet]
@@ -152,20 +151,20 @@ SG の変更は sg-app のインバウンド 8081 → 8080 の 1 点だけ。RDS
 
 ## 5. 使い方
 
-サブコマンドは `run` が主役。ほかはトラブルシュートと導入補助の 4 つに絞り、それ以上増やさない。
+サブコマンドは `run` が主役。ほかはトラブルシュートと導入補助に絞り、それ以上増やさない。
 
 ```
 $ tetherd run -- go run ./cmd/api
-tetherd  dev/api  task 3f9c…  (started 12m ago)
+tetherd  dev/api  2 tasks (3f9c… primary, a17e…)  (started 12m ago)
   ✓ env      41 vars, 6 secrets resolved
-  ✓ network  transparent (macOS: utun3 + pf group tetherd) · DNS via VPC resolver
-  ✓ iam      task role arn:aws:iam::…:role/myapp-dev-api-task  (via 169.254.170.2)
-  ✓ steal    X-Dev-User: shota  → localhost:8080
+  ✓ network  transparent (pf rdr, gid tetherd) · remote: 10.0.0.0/16, 169.254.170.0/24 · DNS: local (+ myapp.internal via VPC)
+  ✓ iam      arn:aws:sts::…:assumed-role/myapp-dev-api-task/…  (via 169.254.170.2)
+  ✓ steal    X-Dev-User: shota (+ X-Dev-Token)  → localhost:8080
   ▶ go run ./cmd/api
 2026/09/11 10:12:03 listening on :8080
 2026/09/11 10:12:03 connected to postgres myapp-dev…rds.amazonaws.com:5432
   ...
-tetherd  ← GET  /api/orders/123   200   84ms   (from 10.0.3.21)
+tetherd  ← GET  /api/orders/123   200   84ms   (from 203.0.113.5)
 tetherd  ← POST /api/orders       500  1.2s   ← local error
 ```
 
@@ -176,21 +175,19 @@ tetherd  ← POST /api/orders       500  1.2s   ← local error
 tetherd run [flags] -- <command...>
   -s, --service    対象サービス（複数サービスのリポジトリ用）
       --as NAME    X-Dev-User の値を上書き（他人の代わりにデバッグ）
-      --mode       steal | mirror | off
-      --no-incoming
-      --network    transparent | env-rewrite | off   （既定 transparent。§6）
-      --local HOST,...   透過モードでもローカルから直接出す宛先（例: localhost, *.stripe.com）
-      --task ID    タスクを明示（既定は自動選択）
+      --task ID    タスクを明示（既定は RUNNING な全タスク）
+      --local-port N
+      --no-incoming / --no-network / --no-env
   -q, --quiet
 
 tetherd env [--format dotenv|json|shell] [--reveal]
     解決済み env を出力。eval "$(tetherd env --format shell)" で既存の起動に混ぜる。既定は secrets をマスク。
 tetherd status
-    今 dev/api の agent に誰が繋いでいるか、どんなルールか。
+    今 dev/api の各タスクの agent に誰が繋いでいるか、どんなルールか。
 tetherd doctor
-    ECS Exec 有効か / plugin があるか / agent 入りタスクが RUNNING か / IAM が通るか / (macOS) ヘルパーが応答するか。
-tetherd init
-    タスク定義を読んで .tetherd.yml の雛形を生成。remote_domains の候補を Cloud Map から提案。
+    ヘルパー / plugin / ECS Exec / pidMode / IAM / VPC CIDR とローカル LAN の重なり、などを検査して次の一手を出す。
+tetherd token rotate
+    steal 用の個人トークンを更新。
 ```
 
 ### 失敗の伝え方
@@ -207,84 +204,108 @@ tetherd  ✗ Another session for user "shota" is already attached (from 192.168.
         Use --as shota-2 to run in parallel, or stop the other session.
 
 tetherd  ✗ Refusing to attach: agent reports TETHERD_ENV=prod
-        tetherd never attaches to production. Check target.cluster in .tetherd.yml.
+        tetherd never attaches to production. Check target.env in .tetherd.yml.
 ```
 
-ブラウザからはヘッダーが必要なので、ModHeader 等の拡張で開発環境ドメインだけに `X-Dev-User` を付けるプロファイルをチームに配る。将来ホスト名ルーティングも欲しくなれば、agent の match に `host:` を足すだけで済む設計にしておく。
+ブラウザからはヘッダーが必要なので、ModHeader 等の拡張で開発環境ドメインだけに `X-Dev-User` と `X-Dev-Token` を付けるプロファイルをチームに配る。将来ホスト名ルーティングも欲しくなれば、agent の match に `host:` を足すだけで済む設計にしておく。
 
 ---
 
-## 6. 透過ネットワーク — カーネル層で捕まえ、ユーザー空間で終端する
+## 6. 透過ネットワーク — カーネル層で捕まえる
 
-透過性を得るための介入点は 3 つしかない。アプリ層（env 書き換え）は限界があり、syscall 層（mirrord のフック）はランタイムごとの地雷を踏み続ける。**カーネルのネットワーク層** はランタイムを一切見ないので、パケットを出す限り必ず捕まる。Tailscale・sshuttle・gVisor 系ツール（gvisor-tap-vsock、tun2socks）と同じ系統。
+透過性を得るための介入点は 3 つしかない。アプリ層（env 書き換え）は限界があり、syscall 層（mirrord のフック）はランタイムごとの地雷を踏み続ける。**カーネルのネットワーク層** はランタイムを一切見ないので、パケットを出す限り必ず捕まる。sshuttle・Tailscale・gVisor 系ツール（gvisor-tap-vsock、tun2socks）と同じ系統。
 
 ```
- 子プロセス（go run ./cmd/api）  connect("payment-svc:8080")   ← コード変更なし
+ 子プロセス（go run ./cmd/api）  connect("10.0.3.21:5432")   ← コード変更なし
         │
         ▼
- ① 捕まえる層（OS 依存）           ② 終端する層（OS 非依存）        ③ 運ぶ層
-   Linux: unshare(user+net)+TUN  ─▶  gVisor netstack in CLI   ─▶  SSM port-forward + yamux
-   macOS: utun + pf `group tetherd`   IP → TCP/UDP フロー            {"type":"dial","proto":"tcp",
-   プロセス単位。子孫も継承            フロー 1 本 = ストリーム 1 本      "addr":"payment-svc:8080"}
-                                                                          │
-                                                                          ▼
+ ① 捕まえる層（OS 依存）            ② 終端する層                 ③ 運ぶ層
+   macOS (v1): pf `group tetherd`   macOS (v1): カーネル TCP。     SSM port-forward + yamux
+     + rdr → 127.0.0.1:N              CLI が accept し natlook で   {"type":"dial",
+   Linux (v2): unshare(user+net)      元の宛先を復元                 "addr":"10.0.3.21:5432"}
+     + TUN                          Linux (v2): gVisor netstack       │
+   プロセス単位。子孫も継承            フロー 1 本 = ストリーム 1 本      ▼
                                                                  ④ 出す層 · tetherd-agent
                                                                    タスクの netns から dial / 名前解決
                                                                    送信元 = タスク IP · sg-app · VPC 経路
-                                                                   → RDS · Cloud Map · 内部 ALB · VPC endpoints · 169.254.170.2
+                                                                   → RDS · Cloud Map · 内部 ALB · 169.254.170.2
 ```
 
-①だけが OS ごとに変わる。②〜④は共通。
+①②が OS ごとに変わる。③④は共通。①②の境界は `Capturer` インターフェース（「(元の宛先, 接続) を渡す」）。
 
-### ① 捕まえる層
+### ① 捕まえる層（macOS、v1）
 
-**Linux** はいちばん綺麗で、`unshare` でユーザー名前空間 + ネットワーク名前空間を作り、中に TUN を一枚立て、そこで子プロセスを起動する。root 不要。そのプロセスの通信は物理的に TUN 以外に出口が無い（slirp4netns、rootless Docker と同じ）。
+**gid でプロセスをスコープする。** pf はソケット所有者の `group` でマッチできる。専用グループ `tetherd` を作り、子プロセスを **primary gid = tetherd** で起動する。子孫プロセスも gid を継承するので、`go run` がビルドして起動する子バイナリや、air のようなホットリロードツールが起動するプロセスも全部乗る。
 
-**macOS** には netns が無いので utun + pf を使う。pf はソケット所有者の `group` でマッチできるので、専用グループ `tetherd` を作り、子プロセスをその補助グループ付きで起動し、「group tetherd の TCP/UDP は utun へ route-to」の 1 ルールを入れる。子孫プロセスもグループを継承するので、`go run` がビルドして起動する子バイナリや、air のようなホットリロードツールが起動するプロセスも全部乗る。Linux で netns を使わない場合も iptables の `owner --gid-owner` で同じ形になり、両 OS で「gid でプロセスをスコープする」という一貫した考え方が取れる。
+- pf が見るのは **effective gid** なので、補助グループでは一致しない。effective だけ変えると bash が起動時に「rgid ≠ egid」を検知して egid を戻すため、**real と effective の両方**を `tetherd` にする（`setregid`）
+- 非 root プロセスは自分の所属グループにも `setgid` できないので、root 所有・setgid `tetherd` の小さなラッパー `tetherd-exec`（`setregid` → `exec` だけ）をヘルパーがインストール時に置く。CLI はそれ経由で子を起動するので、子は CLI の素直な子プロセスのまま（tty、シグナル、終了コードがそのまま）
+- setgid `tetherd` で増える権限は「pf に捕まる」ことだけ
 
-macOS の pf・utun・gid 付き起動には root が要る。Tailscale / Docker Desktop / OrbStack と同じく、`brew install` 時に小さな特権ヘルパーを LaunchDaemon として一度だけ入れ、CLI はそれに頼むだけにする。Network Extension（透過プロキシプロバイダ）は署名済みシステム拡張が要り配布が重く、pf で同じことが達成できる以上そこまで行く理由がない。
+**pf ルール**（ヘルパーがアンカー `com.tetherd` にメモリ上でロード。ディスクには書かない）
+
+```
+table <tetherd_remote> { 10.0.0.0/16, 169.254.170.0/24 }
+rdr pass on lo0 inet proto tcp from any to <tetherd_remote> -> 127.0.0.1 port 15300
+pass out route-to lo0 inet proto tcp from any to <tetherd_remote> group tetherd keep state
+```
+
+sshuttle が 2011 年から macOS で使っている形。group tetherd のプロセスが `<tetherd_remote>` 宛に出した TCP だけが lo0 に回され、rdr で CLI の透過ポートに落ちる。他プロセスの同じ宛先への通信は物理 IF からそのまま出る。CLI は accept した接続について、ヘルパーに `DIOCNATLOOK` で rdr 前の宛先を引いてもらい、agent に `dial` を頼む。終端はカーネルの TCP なので、ユーザー空間スタックの面倒（MTU、輻輳、状態管理）が無い。
+
+utun に `route-to` してユーザー空間スタックで終端する案は、macOS でプロセス単位に使った前例が無いので v1 では取らない。UDP はこの方式ではフロー単位の元宛先が取れないため v2（netstack）で扱う。
+
+**特権ヘルパー**: pf、`/etc/resolver`、`/dev/pf` には root が要る。Tailscale / Docker Desktop / OrbStack と同じく、`brew install` 時に小さな特権ヘルパーを LaunchDaemon として一度だけ入れ、CLI はそれに頼むだけにする。Network Extension（透過プロキシプロバイダ）は署名済みシステム拡張が要り配布が重く、pf で同じことが達成できる以上そこまで行く理由がない。
 
 ### macOS ヘルパーの配布と保守
 
 - 入れるのは root の LaunchDaemon 1 つ（Network Extension でも kext でもない）
-- 配布は Homebrew formula の `service` ブロックに `require_root true` を書き、`brew install tetherd && sudo brew services start tetherd`。Tailscale の OSS 版 CLI と同じ経路で、sudo はこの 1 回だけ
-- brew 経由のバイナリには quarantine 属性が付かないので署名・公証は必須ではないが、GitHub Releases 直接ダウンロード向けに Developer ID + GoReleaser + quill で CI から公証しておく
-- 依存 API は pf（Lion 以降、Apple 自身が使用、`pfctl` は現行 OS に健在）、utun（Tailscale / WireGuard-go が 10 年以上同じコード）、`setgroups` + `posix_spawn` の 3 つ。いずれも廃止の兆しは無い
-- pf の唯一の罠は `/etc/pf.conf` にアンカー参照を書くと OS 更新で消えること。そこで **ディスクには触らず**、起動時に現在のルールセットを読んで自分のアンカー参照を足したものをメモリ上でロードし、終了時に戻す（sshuttle が 2011 年から macOS でやっている方式）
+- 配布は Homebrew tap。formula の `service` ブロックに `require_root true` を書き、`brew install kyosu-1/tetherd/tetherd && sudo brew services start tetherd`。sudo はこの 1 回だけ。root が要る初期化（グループ作成、`tetherd-exec` の配置、残留ルールの掃除）はヘルパーが起動時に自分で行う
+- brew 経由のバイナリには quarantine 属性が付かないので署名・公証は v1 ではしない。GitHub Releases からの直接ダウンロードは Developer ID を取ってから
+- 依存 API は pf（Lion 以降、Apple 自身が使用、`pfctl` は現行 OS に健在）、`DIOCNATLOOK` / `DIOCCHANGERULE`（sshuttle が使用）、`setregid` の 3 つ。いずれも廃止の兆しは無い
+- pf の唯一の罠は `/etc/pf.conf` にアンカー参照を書くと OS 更新で消えること。そこで **ディスクには触らず**、`DIOCCHANGERULE` でメインルールセットにアンカー参照をメモリ上で挿入し、終了時に戻す。`pfctl -E` / `-X` の参照カウントで有効化する（`/etc/pf.conf` のコメントに書かれている作法）
 - Ventura 以降は LaunchDaemon 追加時に「バックグラウンド項目が追加されました」と通知が出てユーザーが無効化できるので、`doctor` がヘルパー無応答を検出して「システム設定 → 一般 → ログイン項目」を案内する
 - 新 macOS の初期リリースでファイアウォール周りが変わることがある（Sequoia 15.0 で一部 VPN が数週間通信不能になった例）ので、毎年夏のベータで動作確認する
-- ヘルパーは launchd のソケットアクティベーションで常駐させない
-- ヘルパーを入れられない端末向けには、env-rewrite モードか、OrbStack / Docker Desktop の Linux VM 内で netns 方式を使う逃げ道を用意する。後者は macOS 側に何も入れない
+- ヘルパーが受け付ける操作は `pf.apply` / `pf.clear` / `resolver.set` / `resolver.clear` / `natlook` の 5 つだけ。コマンドを起動する操作は無い。接続元は `admin` グループのユーザーに限定（UNIX ソケット + peer credential）
+- 同一マシンでの同時セッションは 1 つ（gid を共有する以上 pf が区別できない）。複数サービス同時接続は v2 でセッションごとに gid を分ける
+- ヘルパーを入れられない端末向けには、OrbStack / Docker Desktop の Linux VM 内で v2 の netns 方式を使う逃げ道を想定する
 
-### ② 終端する層
+### ルーティング方針 — 何をリモートに回すか
 
-CLI に gVisor netstack を組み込む。TUN から来た IP パケットを TCP / UDP のフローとして終端し、フロー 1 本ごとに agent へ yamux ストリームを 1 本開いて `dial` を頼む。UDP はフロー単位のストリームにデータグラムを長さ付きでフレーミング。この層は捕まえ方から完全に独立しているので、先に Linux の netns で固めてから macOS の捕まえ方を足せる。
+**宛先 IP で決める。既定は「VPC の中だけリモート、それ以外は全部ラップトップから」。** `<tetherd_remote>` の中身:
+
+1. 対象タスクが属する VPC の CIDR（`DescribeTasks` → ENI の subnet → `DescribeSubnets` → `DescribeVpcs`。セカンダリ含む。自動）
+2. `169.254.170.0/24`（タスクロールの認証情報 + タスクメタデータ）
+3. `network.remote_cidrs`（ピアリング先 VPC、Transit Gateway 越しのオンプレなど）
+4. `network.remote_services` に書いた AWS サービスの managed prefix list（S3 / DynamoDB）
+
+から `network.local_cidrs` を除く。インターネット、localhost、LAN は子プロセスからそのまま出る。`go run` のモジュール取得や `npm install`、外部 API はラップトップの回線で、dev タスクの ENI を踏み台にした egress は既定で存在しない。mirrord の「egress IP まで Pod」とは逆の側を取る。
+
+macOS の DNS は `mDNSResponder` が出すので pf の group マッチでは見えず、**ホスト名での振り分けは不可**。これが CIDR ベースにする理由でもある。VPC CIDR とラップトップの LAN が重なると、その範囲の LAN 宛通信（子プロセスのものだけ）がリモートに回るので、`run` が起動時に警告して `local_cidrs` を案内する。
+
+### VPC 外の AWS サービスとタスクロール
+
+S3 / DynamoDB / SQS / Secrets Manager / Bedrock など VPC 外のサービスは既定のままで動く。SDK は `169.254.170.2`（トンネル経由）から一時クレデンシャルを取り、以降は SigV4 署名でパブリックエンドポイントに直接送る。署名が正しければ送信元 IP がラップトップでも受け付けられる。
+
+動かないのは IAM / バケット / SCP / エンドポイントポリシーに **ネットワーク条件**（`aws:SourceVpc` / `aws:SourceVpce` / `aws:SourceIp`）がある場合。Interface endpoint（private DNS 有効）なら `remote_domains` にサービスのドメインを書けば agent 側でプライベート IP に解けて VPC CIDR に入る。Gateway endpoint（S3 / DynamoDB）は `remote_services` で prefix list をリモート集合に足す。条件が無い環境ではラップトップ経路のほうが緩く（NAT の無い VPC でもラップトップは自前で出られる）、CloudTrail の `sourceIPAddress` はラップトップの IP になる。
 
 ### DNS
 
-**Linux（netns）**: 名前空間内の `/etc/resolv.conf` を netstack 内のリゾルバに差し替える。`getaddrinfo` も Go の内蔵リゾルバもそこを読むので、既定で mirrord と同じく **全部 agent 側で解決**（タスクの resolv.conf、つまり VPC リゾルバ）。Cloud Map の名前、プライベートホストゾーン、RDS のエンドポイント名がコードを触らずに解ける。`network.local` のパターン（`localhost`、`*.stripe.com` など）だけラップトップで解決し、その宛先への通信もラップトップから直接出す。
+**macOS（v1）**: アプリ自身は UDP 53 を送らない。Go（既定）・Node の `dns.lookup`・JVM はいずれもシステムリゾルバ経由で、実際に問い合わせを送るのは root の `mDNSResponder` なので、pf の group マッチでは捕まらない。そこで `/etc/resolver/<domain>`（macOS 標準の per-domain リゾルバ設定。Docker Desktop や dnsmasq 利用者が長年使う仕組み）をヘルパーがセッション中だけ作り、`nameserver 127.0.0.1 port 53530` で tetherd のリゾルバに向け、agent 経由で VPC リゾルバに転送する。対象ドメインは `network.remote_domains`（Cloud Map の名前空間、プライベートホストゾーン）に列挙する。マシン単位の設定になるが、対象は「ラップトップでは元々解けない VPC 内ドメイン」に限られるので他プロセスに影響しない。RDS / ElastiCache / 内部 ALB のエンドポイント名はパブリック DNS でプライベート IP に解け、その IP が VPC CIDR に入るので、**典型構成では `remote_domains` 無しで動く**。Node の `dns.resolve*`（c-ares）と `dig` は `/etc/resolver` を見ない。
 
-**macOS**: アプリ自身は UDP 53 を送らない。Go（既定）・Node の `dns.lookup`・JVM はいずれもシステムリゾルバ経由で、実際に問い合わせを送るのは root の `mDNSResponder` なので、pf の group マッチでは捕まらない。そこで `/etc/resolver/<domain>`（macOS 標準の per-domain リゾルバ設定。Docker Desktop や dnsmasq 利用者が長年使う仕組み）をヘルパーがセッション中だけ作り、`nameserver 127.0.0.1 port 53530` で tetherd のリゾルバに向け、agent 経由で VPC リゾルバに転送する。対象ドメインは `network.remote_domains`（Cloud Map の名前空間、プライベートホストゾーン）に列挙し、`init` が候補を提案する。マシン単位の設定になるが、対象は「ラップトップでは元々解けない VPC 内ドメイン」に限られるので他プロセスに影響しない。RDS のエンドポイント名はパブリック DNS でプライベート IP に解けるため対象外でよい。「全ドメインをリモート解決」は macOS ではプロセス単位に実現できず、Linux 限定の挙動とする（Go アプリに限り `GODEBUG=netdns=go` を注入すれば内蔵リゾルバに切り替わり pf で捕まえられるが、Go 限定の裏技なので既定にしない）。
+**Linux（v2、netns）**: 名前空間内の `/etc/resolv.conf`（mount namespace も必要）をリゾルバに差し替え、既定で全部 agent 側で解決する。
 
 ### 副産物: タスクロールが自動で効く
 
-タスクの env には `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` が入っていて、SDK はそれを見て `169.254.170.2` に認証情報を取りに行く。透過モードではこの通信も捕まって agent 経由でタスク内の本物のエンドポイントに届くので、**追加実装なしで SDK がタスクロールとして振る舞う**。`ECS_CONTAINER_METADATA_URI_V4` も同様。
+タスクの env には `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` が入っていて、SDK はそれを見て `169.254.170.2` に認証情報を取りに行く。透過モードではこの通信も捕まって agent 経由でタスク内の本物のエンドポイントに届くので、**追加実装なしで SDK がタスクロールとして振る舞う**。`ECS_CONTAINER_METADATA_URI_V4` も同様。`run` は起動時に同じ経路でクレデンシャルを取り `sts:GetCallerIdentity` で確認して表示する。
 
-### タスク側 localhost への到達 — 他のサイドカー（otel collector など）との共存
+### v2 で扱うもの
 
-agent は他のサイドカーと独立に共存できる（ポートが重ならなければよい）。それに加えて、**ローカルプロセスから見た「localhost」の一部をタスク側の localhost に向ける** 例外を持たせる。app が `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317` で同居する collector に送っているなら、この env はそのまま注入され、4317 への通信がトンネル経由でタスク内の collector に届く。ALB から steal したリクエストは agent が `traceparent` / `X-Amzn-Trace-Id` を素通しするので、ALB → agent → ラップトップのアプリ → RDS が開発環境の可観測性基盤上で 1 本のトレースになる。
-
-- Linux の netns 方式では名前空間内の lo がホストと別なので netstack が自然に拾える
-- macOS では pf の既定ルールセットに `set skip on lo0` があるため、メモリ上でロードする自分のルールセットではこれを外し、group tetherd の lo0 宛 TCP で `remote_localhost` のポートだけを route-to する
-- collector が無いタスクでは `remote_localhost` を書かなければ従来どおり全 localhost がラップトップ側
-
-### フォールバック: env-rewrite モード
-
-特権ヘルパーを入れられない環境向けに `--network env-rewrite` を残す。env の値（`DATABASE_URL` など）から VPC 内の宛先を見つけ、宛先ごとにローカルポートを立てて agent へフォワードし、env の値を `localhost:15432` に書き換えて子プロセスへ渡す。env に載っていない宛先には届かず、タスクロールも効かないが、ALB + Fargate + RDS の典型構成では日常の大半をカバーする。
+- **タスク側 localhost への到達**（`remote_localhost`）: app が `localhost:4317` の otel collector に送っている場合に、その localhost ポートだけタスク側へ向ける。macOS では lo0 宛の group マッチが rdr の評価順序上まっすぐ書けないので、netstack 導入時に扱う
+- **env-rewrite モード**: 特権ヘルパーを入れられない環境向けに、env の値から VPC 内の宛先を見つけてローカルポートに書き換える方式
+- **Linux**: `unshare` でユーザー名前空間 + ネットワーク名前空間を作り、中に TUN を立てて gVisor netstack で終端する。root 不要（ただし Ubuntu 24.04 以降の unprivileged userns 制限と、netns 内の listen ポートにホストから届かない問題への対処が要る）
 
 ### mirrord との透過度の差
 
-ネットワーク（TCP / UDP / DNS / 任意の宛先）は同等。残る差はファイルシステムの透過（捨てる判断）と、agent 側が Fargate の制約で受信を L7 でしか扱えないこと（Fargate を使う限り誰にも越えられない線）の 2 点。
+TCP と DNS（任意の宛先）は同等。残る差は UDP（v2）、ファイルシステムの透過（捨てる判断）、agent 側が Fargate の制約で受信を L7 でしか扱えないこと（Fargate を使う限り誰にも越えられない線）。
 
 ---
 
@@ -302,43 +323,36 @@ target:
   cluster: myapp-dev
   service: api
   container: app                # env を読むコンテナ
+  env: dev                      # agent の TETHERD_ENV と照合
 
 env:
-  source: agent                 # agent | api（api は開発者に GetSecretValue が必要）
   override:
     PORT: "8080"
-  exclude:
-    - AWS_EXECUTION_ENV
+  exclude: []                   # PATH / HOME / HOSTNAME などは既定で除外済み
 
 network:
-  mode: transparent             # transparent | env-rewrite | off
-  local:                        # これだけはラップトップから直接出す（DNS もローカル）
-    - localhost
-    - "*.stripe.com"
-  remote_domains:               # macOS の /etc/resolver 対象。Linux では不要（全部リモート解決）
-    - "*.myapp.internal"
-  remote_localhost: [4317, 4318]  # この localhost ポートだけはタスク側へ（collector が無ければ書かない）
-  # env-rewrite モードで env に載らない宛先を足すとき
-  # forward: [{ local: 18080, remote: payment-svc.internal:8080 }]
-
-telemetry:
-  resource_attributes:          # OTEL_RESOURCE_ATTRIBUTES に追記。service.name は変えない
-    tetherd.user: "${user}"
+  remote_cidrs: []              # VPC CIDR は自動。ピアリング先などを足す
+  local_cidrs: []               # remote の中でラップトップから直接出す例外
+  remote_domains:               # /etc/resolver で agent 側解決にするドメイン
+    - myapp.internal
+  remote_services: []           # s3 | dynamodb（ネットワーク条件付きポリシーがある場合）
 
 incoming:
   local_port: 8080
-  mode: steal                   # steal | mirror | off
   match:
     header: X-Dev-User          # 値の既定は user（個人設定）
-  # mirror の例:  mode: mirror / match: { path_prefix: /api/orders, sample: 0.1 }
+    token_header: X-Dev-Token
 ```
 
 ```yaml
-# ~/.tetherd/config.yml — 個人
+# ~/.tetherd/config.yml — 個人。初回 run で生成
 user: shota
+token: <base64url 32 bytes>     # tetherd token rotate で更新
 aws:
   profile: myapp-dev-shota
 ```
+
+タスク env から既定で除外するもの: `PATH HOME HOSTNAME USER LOGNAME SHELL TMPDIR PWD OLDPWD TERM LANG LC_* SHLVL _ AWS_EXECUTION_ENV`。`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` と `ECS_CONTAINER_METADATA_URI_V4` は透過モードで必要なので残し、`--no-network` のときだけ除外する（残すと SDK が失敗する）。
 
 ---
 
@@ -348,42 +362,42 @@ aws:
 
 ```
 CLI (laptop)                         agent                          app / RDS
-  │── hello {user, incoming, forwards} ─▶│
-  │◀─ welcome {task, env:"dev",          │
-  │            app_env:{…41 vars},       │
-  │            others:["taro"]} ─────────│
-  │   ping / pong · 5 秒おき · 3 回落ちたら CLI が再接続
-  │                                      │
-  │  steal                               │◀── ALB → :8080  X-Dev-User: shota ──│
-  │◀─ new stream · {"type":"http", remote_addr} + raw HTTP/1.1 ──│
-  │   CLI は localhost:8080 に dial して双方向コピー
-  │   ラップトップが落ちていれば agent はそのリクエストだけ :8081 へフォールバック
-  │                                      │
-  │  dial                                │
-  │── new stream · {"type":"dial","proto":"tcp|udp","addr":"payment-svc:8080"} ─▶│
-  │                                      │── 名前解決 + dial（タスクの netns）──▶│
-  │   netstack のフロー 1 本 = ストリーム 1 本。UDP は長さ付きフレーム
-  │   DNS は {"type":"resolve"} で別に持つ
-  │                                      │
-  │── bye ──────────────────────────────▶│
+  │── hello {user, token, incoming} ─▶│
+  │◀─ welcome {task_arn, env:"dev",    │
+  │            app_env:{…41 vars},     │
+  │            others:["taro"]} ───────│
+  │   ping / pong · 5 秒おき · 3 回落ちたら破棄、CLI は再接続
+  │                                    │
+  │  steal                             │◀── ALB → :8080  X-Dev-User + X-Dev-Token ──│
+  │◀─ new stream · {"type":"http"} + HTTP/1.1 (keep-alive で複数リクエスト) ──│
+  │   CLI はストリームを http.Serve し localhost:8080 へ ReverseProxy
+  │   ラップトップが落ちていれば agent はそのリクエストだけ :8081 へフォールバック（ボディ 1 MiB まで）
+  │                                    │
+  │  dial                              │
+  │── new stream · {"type":"dial","addr":"10.0.3.21:5432"} ─▶│
+  │                                    │── dial（タスクの netns）──▶│
+  │   捕まえた接続 1 本 = ストリーム 1 本
+  │── new stream · {"type":"resolve","name":"api.myapp.internal"} ─▶│ → addrs
+  │                                    │
+  │── bye ────────────────────────────▶│
 ```
 
-- mirror は steal と同じだが agent はレスポンスを読み捨て、2 秒でタイムアウト
+- CLI は対象サービスの RUNNING な全タスクに同じ手順で繋ぐ。steal はどのタスクからでも受け、dial / resolve / env は primary（最も古いタスク）を使う。deploy 中のタスクの出入りは `ListTasks` のポーリングで追う
 - SSM 経由は接続確立に 2〜3 秒、帯域も細めで、フロー 1 本ごとにラップトップ ↔ SSM ↔ タスクの往復（数十 ms）が乗る。DB と HTTP には十分だが、N+1 が多いコードは体感で重くなる
-- 大きなファイルや低レイテンシが要る用途が出た時点で、③運ぶ層だけを Tailscale（タスクに tailscaled サイドカー、直接 P2P）に差し替えられる設計にしておく。①②④は変わらない。運ぶ層は最初からインターフェースを持つ
+- 大きなファイルや低レイテンシが要る用途が出た時点で、③運ぶ層だけを Tailscale（タスクに tailscaled サイドカー、直接 P2P）に差し替えられる設計にしておく。①②④は変わらない。運ぶ層は最初から `Transport` インターフェースを持ち、v1 は `ssm`（session-manager-plugin を子プロセスで起動）と `direct`（テスト用）の 2 実装
 - SSM セッションの最大継続時間を設定しているアカウントでは途中で切れるため、CLI の自動再接続が前提
 
 ---
 
 ## 9. インフラ側の変更（1 回だけ）
 
-1. 開発環境のタスク定義に `tetherd-agent` コンテナを追加し、app の listen ポートを 8081 に。`pidMode: task` と agent への `SYS_PTRACE` を設定。`TETHERD_ENV=dev` も入れる
+1. 開発環境のタスク定義に `tetherd-agent` コンテナを追加し、app の listen ポートを 8081 に。`pidMode: task` と agent への `SYS_PTRACE`、`essential: true`、`restartPolicy` を設定。`TETHERD_ENV=dev` も入れる
 2. ALB のターゲットグループのポートを 8080（agent）に向ける。sg-app のインバウンドも 8080 に
-3. サービスで `enableExecuteCommand: true`、タスクロールに SSM の権限（`ssmmessages:CreateControlChannel` / `CreateDataChannel` / `OpenControlChannel` / `OpenDataChannel`）。無ければ SSM の VPC Endpoint 3 つ
-4. 開発者の IAM に ECS の読み取りと `ssm:StartSession`（対象を dev クラスターのタスク ARN に限定）。Secrets Manager / SSM Parameter / KMS の権限は **不要**（env は agent が渡す）。`ecs:ExecuteCommand` も不要（ポートフォワードは StartSession を直接呼ぶ）
-5. 開発者のラップトップに `brew install tetherd`。macOS では特権ヘルパー（LaunchDaemon）が同時に入る。Linux は netns を使うので不要
+3. サービスで `enableExecuteCommand: true`、タスクロールに SSM の権限（`ssmmessages:CreateControlChannel` / `CreateDataChannel` / `OpenControlChannel` / `OpenDataChannel`）。無ければ SSM の VPC Endpoint 3 つか NAT
+4. 開発者の IAM に ECS / EC2 の読み取りと `ssm:StartSession`（対象を dev クラスターのタスク ARN に限定）。Secrets Manager / SSM Parameter / KMS の権限は **不要**（env は agent が渡す）。`ecs:ExecuteCommand` も不要（ポートフォワードは StartSession を直接呼ぶ）
+5. 開発者のラップトップに `brew install kyosu-1/tetherd/tetherd && sudo brew services start tetherd`
 
-ALB にルールを足す必要はない（agent が L7 で振り分ける）。本番のタスク定義には agent 自体を入れない。agent 側に AWS 権限は要らず、Linux capability は env 読み取りのための SYS_PTRACE のみ。
+ALB にルールを足す必要はない（agent が L7 で振り分ける）。本番のタスク定義には agent 自体を入れない。agent 側に AWS 権限は要らず、Linux capability は env 読み取りのための SYS_PTRACE のみ。インターネットに出られない VPC では agent イメージを ECR pull-through cache 経由で取る。`deploy/dev-env/`（Terraform）がこの手順の実例。
 
 ### 開発者に付ける IAM ポリシー
 
@@ -400,6 +414,17 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
         "ecs:DescribeServices",
         "ecs:ListServices",
         "ecs:DescribeTaskDefinition"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DiscoverNetwork",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeSubnets",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeManagedPrefixLists",
+        "ec2:GetManagedPrefixListEntries"
       ],
       "Resource": "*"
     },
@@ -428,7 +453,7 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 }
 ```
 
-- 認証は AWS SDK の標準チェーン（SSO プロファイル、アクセスキー、AssumeRole）をそのまま使う。tetherd が `ssm:StartSession` を呼んでストリーム URL とトークンを得て session-manager-plugin に渡す（AWS CLI と同じ手順）
+- 認証は AWS SDK の標準チェーン（SSO プロファイル、アクセスキー、AssumeRole）をそのまま使う。tetherd が `ssm:StartSession` を呼んでストリーム URL とトークンを得て session-manager-plugin に渡す（AWS CLI と同じ手順だが AWS CLI 自体は不要）
 - IAM Identity Center（SSO）では `${aws:username}` が無いので `OwnSessions` の Resource は `arn:aws:ssm:*:*:session/*` にする
 - 透過モードでは 169.254.170.2 が素通しになるので、開発者はローカルからタスクロールの権限を実質的に使える。「dev タスクができることは開発者もできる」という意味で dev では通常許容範囲だが、タスクロールが必要以上に広くないかは一度見ておく
 
@@ -438,27 +463,31 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 
 **本番への誤接続**
 
-- agent は `TETHERD_ENV` が dev 系でなければ起動しない
-- CLI は `welcome.env` を確認し、不一致なら切断
+- agent は `TETHERD_ENV` が無ければ起動しない
+- CLI は `welcome.env` を `target.env` と照合し、不一致なら切断
 - 本番タスク定義には agent を入れない（存在しなければ繋げない）
 
 **踏み台化・横取り**
 
-- agent の dial 先はタスクの SG と VPC 経路に従う（タスクが元々できることを超えない）。外向き（0.0.0.0/0）を agent 経由にするかは `network.local` の既定で外向きドメインをラップトップに向けて抑える
+- 外向きの既定は「VPC 内だけリモート」。dev タスクの ENI からインターネットに出る経路は既定で無い。`remote_cidrs: [0.0.0.0/0]` は `doctor` が警告する
+- agent の dial 先はタスクの SG と VPC 経路に従う（タスクが元々できることを超えない）
+- steal はユーザー名 + トークンの両方が一致したときだけ。公開 ALB でもユーザー名を知っているだけではラップトップに届かない
 - 同一ユーザー名の二重接続は拒否
-- 制御ポートは 127.0.0.1 のみ bind
+- 制御ポートは 127.0.0.1 のみ bind。無認証だが信頼境界は「タスク内」（同じタスクに入れるものは同じ権限を持つ）
 
 **特権ヘルパー（macOS）**
 
-- 受け付ける操作は「pf アンカーへのルール投入／削除」「指定 gid 付きで指定ユーザーとしてコマンド起動」「`/etc/resolver/` 配下の tetherd 管理ファイルの作成／削除」の 3 つだけ。任意コマンドの root 実行はできない
-- 接続元は同一ユーザーの tetherd CLI に限定（UNIX ソケット + peer credential 検証）
-- CLI が異常終了しても pf ルールや resolver ファイルが残らないよう、ヘルパーが CLI の生存を監視して掃除する
+- 受け付ける操作は `pf.apply` / `pf.clear` / `resolver.set` / `resolver.clear` / `natlook` の 5 つだけ。任意コマンドの root 実行はできず、コマンドを起動する操作も無い
+- 接続元は `admin` グループのユーザーの tetherd CLI に限定（UNIX ソケット + peer credential 検証）
+- CLI が異常終了しても pf ルールや resolver ファイルが残らないよう、ヘルパーが CLI の接続断で掃除する
+- setgid `tetherd` のラッパーで増える権限は「pf に捕まる」ことだけ
 
 **開発環境への影響**
 
 - 誰も繋いでいなければ完全な素通し
-- ラップトップ側が落ちたら 502 を返さず、そのリクエストだけ本流へフォールバック
+- ラップトップ側が落ちたら 502 を返さず、そのリクエストだけ本流へフォールバック（dial 失敗時のみ。ボディを送った後は戻せないので 502）
 - セッション切断で即時に素通しへ復帰
+- ローカルアプリは共有 dev DB に書く。ローカルブランチの auto-migrate が dev DB を変えうることを README で注意する
 
 **シークレット**
 
@@ -472,17 +501,18 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 | 観点 | mirrord | tetherd |
 |---|---|---|
 | 対象への介入 | 何も仕込まず、K8s API で後から注入 | dev 環境のタスク定義にサイドカーを事前に含める |
-| ローカルの透過性 | syscall フック。任意の宛先・DNS・ファイルが透過 | カーネル層で捕捉（netns / pf group）+ ユーザー空間 netstack。任意の宛先・DNS・UDP が透過。ファイルは対象外 |
+| ローカルの透過性 | syscall フック。任意の宛先・DNS・ファイルが透過 | カーネル層で捕捉（pf rdr / netns）。任意の宛先・DNS が透過。UDP は v2、ファイルは対象外 |
 | ランタイム依存 | あり（SIP 下の再署名、静的 Go、JVM / Node の独自スタック） | なし。パケットを出す限り捕まる |
-| 権限 | ローカルは不要。agent 側に特権が必要 | Linux は不要。macOS はインストール時に特権ヘルパー 1 回。agent 側は SYS_PTRACE のみ |
+| 権限 | ローカルは不要。agent 側に特権が必要 | macOS はインストール時に特権ヘルパー 1 回。agent 側は SYS_PTRACE のみ |
 | env / secrets | agent が Pod 内プロセスの /proc/pid/environ を読む | 同じ。agent が app の /proc/pid/environ を読む（pidMode: task）。開発者に Secrets Manager 権限は不要 |
 | 受信の取り方 | L4（iptables / raw socket）。任意 TCP | L7 リバースプロキシ。HTTP/1.1 中心、gRPC / WS は個別対応 |
+| 振り分けの粒度 | `connect()` 単位。`getaddrinfo` も見ているのでホスト名で local / remote を選べる | 宛先 CIDR。macOS の DNS は mDNSResponder が出すのでホスト名では見えない |
 | IAM の身元 | Pod の SA トークンが env / ファイル経由で効く | 169.254.170.2 が透過で通り、タスクロールが自動で効く |
 | 接続体験 | kube port-forward、1 秒未満 | SSM 中継、2〜3 秒。VPN 不要。運ぶ層は Tailscale に差し替え可 |
 | 複数人 | OSS 版は弱く、Operator（有償）で解決 | ユーザー名単位の多重接続とヘッダー振り分けが中核 |
 | 本番観察 | 読み取り専用で可能 | 意図的に禁止 |
 
-どちらも「ローカルのプロセスが、向こうで動いているように見える」。違いは見せ方で、mirrord はプロセスの目を騙し、tetherd はプロセスの足元の配線を替える。ネットワークの透過度は同等、ファイルシステムだけ tetherd は持たない。壊れる場所は mirrord がランタイムの数だけあるのに対し、tetherd は OS の数（2 つ）だけ。
+どちらも「ローカルのプロセスが、向こうで動いているように見える」。違いは見せ方で、mirrord はプロセスの目を騙し、tetherd はプロセスの足元の配線を替える。トレードオフは「ラップトップに root を 1 回入れる代わりに、ランタイム非依存とカーネル TCP を取る」。mirrord がフック方式の代償として払っているもの（SIP 再署名、Go の frida パッチ、ランタイムごとの known issues）を tetherd は払わず、代わりにヘルパーの保守と粒度の粗さを引き受ける。壊れる場所は mirrord がランタイムの数だけあるのに対し、tetherd は OS の数だけ。
 
 ### PR ごとの ECS 環境との比較
 
@@ -501,7 +531,7 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 | ecsta（fujiwara） | ECS | 1 ポートの SSM フォワード | なし | なし | ③運ぶ層の部品として同じ API を使う。`doctor` / タスク選択 UX の参考 |
 | Tailscale subnet router on Fargate | VPC 全体 | マシン単位で VPC に透過到達 | なし | なし | ネットワークだけなら最短の代替。プロセス単位でなく、env・IAM・steal は別途必要。将来の③の選択肢 |
 | amazon-ecs-local-container-endpoints | ローカル Docker | なし | なし | 169.254.170.2 をローカルで模倣（資格情報はラップトップのもの） | tetherd は透過経路で本物に届くので模倣が不要 |
-| sshuttle / tun2socks / gvisor-tap-vsock | 汎用 | 透過（pf/iptables + ユーザー空間スタック） | — | — | §6 の技術的前例 |
+| sshuttle / tun2socks / gvisor-tap-vsock | 汎用 | 透過（pf/iptables + ユーザー空間スタック） | — | — | §6 の技術的前例。v1 の pf rdr + `DIOCNATLOOK` は sshuttle の macOS 実装そのもの |
 | Cloud Code / `gcloud beta code dev`（Cloud Run） | ローカル Docker | なし | なし | ADC or SA 鍵 | Cloud Run 側には Copilot 相当の先行例すら無い |
 
 **評価**: 埋める価値がある空白。ECS Fargate は特に国内で利用者が多く、K8s 向けツール群は Fargate の制約のため原理的に移植できない。AWS 自身は Copilot で一度この方向に踏み出し、引き上げた（Copilot 全体が CDK と Express Mode に置き換えられたためで、ローカル開発体験が理由ではない。後継の Express Mode も CDK もローカル開発の接続体験は提供しない）。競合は「ツール」ではなく「間に合わせ」（docker compose + ローカル DB、Tailscale + ecsta + env ダンプの寄せ集め）で、tetherd の差分は (1) プロセス単位の透過で VPN 不要、(2) タスクロールが自動で効く、(3) ヘッダーによる受信 steal、(4) 1 コマンド。(2) と (3) は寄せ集めでは実現できない。
@@ -518,34 +548,51 @@ tetherd は「Kubernetes を使わないサーバーレスコンテナのため�
 |---|---|---|
 | agent の同居 | サイドカー。awsvpc で netns 共有 | マルチコンテナ。localhost 共有。agent を ingress コンテナにして app へ L7 プロキシ |
 | ③運ぶ層 | ECS Exec / SSM ポートフォワードで agent の lo:9900 へ | exec 相当が無い。(a) サービス URL に WebSocket を張り ingress の agent が制御チャネルとして受ける、または (b) agent がリレーへアウトバウンド接続 |
-| 複数インスタンス | タスクを 1 つ選んで繋ぐ | リクエストの着地インスタンスを制御できない。dev は min=max=1 なら (a) で足りる。それ以外は (b) のリレーが必要 |
+| 複数インスタンス | RUNNING な全タスクに繋ぐ | リクエストの着地インスタンスを制御できない。dev は min=max=1 なら (a) で足りる。それ以外は (b) のリレーが必要 |
 | CPU / スケール | 常時割り当て | リクエスト外は CPU スロットリング。(a) は WebSocket がリクエスト扱いで CPU が付くが 60 分で切れるので再接続。(b) は CPU 常時割り当てが必要。scale-to-zero を避けるため min=1 |
 | env | agent が /proc から | 同じ（マルチコンテナで PID 共有可否は要確認。不可なら Secret Manager 経由のフォールバック） |
 | IAM の透過 | 169.254.170.2（タスクロール） | metadata.google.internal（サービスアカウント） |
 | 認証 | IAM（ssm:StartSession） | Cloud Run IAM（invoker）+ ID トークン |
 
-**実装方針**: v1 ではプロバイダのインターフェースを切らず、ECS 固有部分を `internal/provider/ecs` に寄せるだけにする（実装が 1 つの段階で抽象を切ると ECS の都合に歪む）。ただし③運ぶ層は ECS 版の中で SSM と Tailscale の 2 択を想定しているので、ここだけは最初からインターフェースを持つ。Cloud Run を足すときに `provider/cloudrun` を書きながら共通インターフェースを抽出する。リレーサービスが必要になれば同じリポジトリのオプションコンポーネントとして置く。
+**実装方針**: v1 ではプロバイダのインターフェースを切らず、ECS 固有部分を `internal/provider/ecs` に寄せるだけにする（実装が 1 つの段階で抽象を切ると ECS の都合に歪む）。ただし③運ぶ層（`Transport`）と①捕まえる層（`Capturer`）は v1 から インターフェースを持つ。Cloud Run を足すときに `provider/cloudrun` を書きながら共通インターフェースを抽出する。リレーサービスが必要になれば同じリポジトリのオプションコンポーネントとして置く。
 
 ---
 
 ## 14. 未決事項
 
-- 外向き（インターネット宛）の通信を既定で agent 経由にするか、ラップトップから出すか。mirrord は前者（egress IP まで Pod）、開発体験としては後者のほうが速い。`network.local` の既定値の問題
-- macOS の pf は `route-to` で utun に向ける方式と、`rdr` でローカルポートに向けて元宛先を `DIOCNATLOOK` で引く方式のどちらが安定か
-- Linux の netns 方式で、子プロセスが localhost（ホスト側）のサービスに繋ぎたい場合の扱い（netns 内の lo はホストと別。`network.local` の localhost を netstack がホストの lo に橋渡しする）
-- IPv6 を netstack で扱うか、v0 では捨てるか
+- mirror の方針。共有 DB への二重書き込みをどう防ぐか（GET 限定、明示的な opt-in など）
+- Linux の netns 方式で、ホストから netns 内の listen ポート（steal の宛先、`curl localhost:8080`）にどう届けるか。rootlesskit の port driver と同じく CLI がホスト側 netns に `setns` したスレッドで listen して橋渡しする案が有力。逆方向（子 → ホストの localhost）も同様
+- Linux で unprivileged user namespace が使えない環境（Ubuntu 24.04 の AppArmor 制限など）の逃げ道
+- IPv6 を netstack で扱うか
 - WebSocket / SSE / gRPC(HTTP/2) の steal
-- agent イメージの配布先（ECR Public か GHCR か）
+- 同一マシンでの複数セッション（セッションごとに gid を分ける）
+- session-manager-plugin の埋め込み（`aws/session-manager-plugin` の datachannel を組み込んで依存ゼロにする）
 - Cloud Run のマルチコンテナで PID 名前空間の共有が可能か（env 取得方式に影響）
+
+決着済み: 外向き通信の既定（VPC 内だけリモート）、macOS の pf 方式（rdr + `DIOCNATLOOK`）、agent イメージの配布先（GHCR）。
 
 ---
 
-## 15. 最初に確認すべきこと（PoC の論点）
+## 15. 先に潰す検証
 
-順序や期間は決めないが、設計の妥当性を左右する検証点は次の通り。
+設計の妥当性を左右するものから。1〜4 は AWS 不要で、`hack/e2e-local.sh`（Docker ネットワーク上の agent + postgres に `direct` トランスポートで繋ぐ）で確認する。
 
-- Linux netns + gVisor netstack + SSM で、`psql -h <rds-endpoint>` がコード変更なしで通ること（②終端層の成立）
-- SSM 経由のレイテンシ（フロー確立と RTT）が DB クエリの体感として許容範囲か
-- `pidMode: task` + `SYS_PTRACE` で agent が app の `/proc/<pid>/environ` を読めること
-- 169.254.170.2 が透過で通り、ローカルの AWS SDK がタスクロールとして動くこと
-- macOS で pf `group` マッチ + utun `route-to` がプロセス単位で機能すること、`/etc/resolver/` による per-domain 転送が Go / Node / JVM で効くこと
+1. `tetherd-exec`（`setregid`）+ pf `group` + `rdr` で、bash / zsh / Go / Node の子プロセスの TCP が捕まり、他プロセスは捕まらないこと
+2. `DIOCNATLOOK` が現行 macOS で期待どおり元の宛先を返すこと
+3. `DIOCCHANGERULE` でメインルールセットにアンカー参照を挿入できること。無理なら `pfctl` の dump / reload に切り替える
+4. `/etc/resolver/<domain>` + `port` が Go / Node（`dns.lookup`）/ JVM の `getaddrinfo` で効くこと
+5. Fargate で `pidMode: task` + `SYS_PTRACE` + ECS Exec（ssm-agent 注入）が共存し、agent が app の environ を読めること
+6. `ssm:StartSession` + `AWS-StartPortForwardingSession` で `ecs:` ターゲットの `127.0.0.1:9900` に届くこと、フロー確立の所要時間と RTT
+
+---
+
+## 16. ロードマップ
+
+| | 内容 |
+|---|---|
+| v0.1 | ローカル e2e。helper + `tetherd-exec` + pf rdr + natlook + yamux + agent の `dial` を Docker ネットワーク相手に通す（§15 の 1〜3）。`psql -h 172.20.0.10` がコード変更なしで通る |
+| v0.2 | `deploy/dev-env`（Terraform）と agent の environ 読み取り、SSM トランスポート、env 注入、DNS、タスクロール確認（§15 の 4〜6）。`tetherd run -- psql -h <rds>` が通る |
+| v0.3 | steal（agent の L7 プロキシ、トークン、フォールバック）、全タスク接続と deploy 追従、`status` / `doctor` |
+| v0.4 | Homebrew tap、LaunchDaemon、GoReleaser、README。チームに配れる |
+| v1.0 | 上記の安定化 |
+| 以降 | Linux（netns + netstack）、mirror、UDP、`remote_localhost`、plugin 埋め込み、Tailscale トランスポート、Cloud Run |
