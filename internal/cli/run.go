@@ -98,6 +98,7 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 		}
 		defer hc.Close()
 		cap := pfrdr.New(hc)
+		cap.Logf = logf
 		if err := cap.Start(ctx, capture.Spec{RemoteCIDRs: cidrs}); err != nil {
 			var busy *helper.BusyError
 			if errors.As(err, &busy) {
@@ -105,9 +106,27 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 			}
 			return 1, err
 		}
-		defer cap.Close()
+		// cancel() must run before cap.Close(): Forwarder.Run only treats
+		// an Accept error as a benign shutdown when ctx is already done
+		// (see proxy.Forwarder.Run), so ctx has to be cancelled *before*
+		// closing cap's listener causes that Accept error — otherwise the
+		// goroutine below logs "✗ capture stopped" on every normal exit.
+		// `defer cancel()` above already guarantees cancel() fires even on
+		// the early returns in this block, so it is safe (and idempotent)
+		// to call it again here, ahead of cap.Close(), in one cleanup
+		// defer — defers are LIFO, so this defer (registered after the
+		// plain `defer cancel()` above) runs first, giving the order
+		// cancel() then cap.Close().
+		defer func() {
+			cancel()
+			cap.Close()
+		}()
 		fw := &proxy.Forwarder{Capturer: cap, Dial: sess.DialTCP, Logf: logf}
-		go fw.Run(ctx)
+		go func() {
+			if err := fw.Run(ctx); err != nil && ctx.Err() == nil {
+				logf("✗ capture stopped: %v", err)
+			}
+		}()
 		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s · redirect 127.0.0.1:%d", joinPrefixes(cidrs), cap.RedirectPort())
 	}
 
