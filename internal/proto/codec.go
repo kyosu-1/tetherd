@@ -30,6 +30,9 @@ func (e *Encoder) Encode(typ string, v any) error {
 		if err := json.Unmarshal(b, &fields); err != nil {
 			return fmt.Errorf("proto: payload must be a JSON object: %w", err)
 		}
+		if fields == nil {
+			fields = map[string]any{}
+		}
 	}
 	fields["type"] = typ
 	line, err := json.Marshal(fields)

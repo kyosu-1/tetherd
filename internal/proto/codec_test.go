@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -73,5 +75,45 @@ func TestReadHeaderDoesNotOverread(t *testing.T) {
 	rest, _ := io.ReadAll(b)
 	if string(rest) != "payload" {
 		t.Fatalf("rest = %q", rest)
+	}
+}
+
+func TestEncodeTypedNilPayload(t *testing.T) {
+	var buf bytes.Buffer
+	enc := NewEncoder(&buf)
+	if err := enc.Encode(TypeError, (*Error)(nil)); err != nil {
+		t.Fatal(err)
+	}
+	if buf.String() != "{\"type\":\"error\"}\n" {
+		t.Fatalf("got %q", buf.String())
+	}
+}
+
+func TestEncodeConcurrent(t *testing.T) {
+	var buf bytes.Buffer
+	enc := NewEncoder(&buf)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				if err := enc.Encode(TypePing, nil); err != nil {
+					t.Error(err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	if len(lines) != 800 {
+		t.Fatalf("expected 800 lines, got %d", len(lines))
+	}
+	expected := "{\"type\":\"ping\"}"
+	for i, line := range lines {
+		if line != expected {
+			t.Fatalf("line %d: expected %q, got %q", i, expected, line)
+		}
 	}
 }
