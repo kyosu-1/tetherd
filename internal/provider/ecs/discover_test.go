@@ -109,6 +109,28 @@ func TestDiscoverNotReadyReasons(t *testing.T) {
 	}
 }
 
+func TestDiscoverCollectsAllRuntimeIDsAgentFirst(t *testing.T) {
+	now := time.Now()
+	f := &fakeECS{arns: []string{"a"}, tasks: []types.Task{task("a", now, true, "RUNNING", true)}}
+	got, err := Discover(context.Background(), f, Target{Cluster: "c", Service: "api"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// task() builds containers in the order: app, then tetherd-agent.
+	want := []string{"a-rt", "a-app"}
+	if len(got.RuntimeIDs) != len(want) {
+		t.Fatalf("RuntimeIDs = %v, want %v", got.RuntimeIDs, want)
+	}
+	for i := range want {
+		if got.RuntimeIDs[i] != want[i] {
+			t.Fatalf("RuntimeIDs = %v, want %v (agent container first)", got.RuntimeIDs, want)
+		}
+	}
+	if got.RuntimeID != want[0] {
+		t.Fatalf("RuntimeID = %q, want the agent container's %q", got.RuntimeID, want[0])
+	}
+}
+
 func TestNotReadyErrorEmpty(t *testing.T) {
 	nr := &NotReadyError{}
 	if nr.Error() != "no attachable task (no running tasks matched)" {

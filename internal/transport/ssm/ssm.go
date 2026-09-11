@@ -7,16 +7,19 @@ package ssm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
+	smithy "github.com/aws/smithy-go"
 
 	"github.com/kyosu-1/tetherd/internal/transport"
 )
@@ -42,9 +45,36 @@ const (
 	startupWait = 20 * time.Second
 )
 
-// SessionTarget formats the ECS Exec target for StartSession.
+// SessionTargets formats the ECS Exec targets to try, in order. Every
+// container in the task is a candidate because awsvpc shares one network
+// namespace: whichever container's SSM agent terminates the session, the
+// forward still reaches the agent's control port on 127.0.0.1.
+func SessionTargets(task transport.Task) []string {
+	ids := task.RuntimeIDs
+	if len(ids) == 0 {
+		ids = []string{task.RuntimeID}
+	}
+	out := make([]string, 0, len(ids))
+	for _, rt := range ids {
+		out = append(out, fmt.Sprintf("ecs:%s_%s_%s", task.Cluster, task.ID, rt))
+	}
+	return out
+}
+
+// SessionTarget formats the first candidate (kept for callers that only
+// need the primary target).
 func SessionTarget(task transport.Task) string {
-	return fmt.Sprintf("ecs:%s_%s_%s", task.Cluster, task.ID, task.RuntimeID)
+	if ts := SessionTargets(task); len(ts) > 0 {
+		return ts[0]
+	}
+	return ""
+}
+
+// isTargetNotConnected reports whether SSM refused because that
+// container's ECS Exec agent has no control channel.
+func isTargetNotConnected(err error) bool {
+	var api smithy.APIError
+	return errors.As(err, &api) && api.ErrorCode() == "TargetNotConnected"
 }
 
 // PluginArgs builds session-manager-plugin's argv the way the AWS CLI does:
@@ -82,14 +112,29 @@ func (t *Transport) Dial(ctx context.Context, task transport.Task) (net.Conn, er
 	if err != nil {
 		return nil, err
 	}
-	in := &awsssm.StartSessionInput{
-		Target:       aws.String(SessionTarget(task)),
-		DocumentName: aws.String(document),
-		Parameters:   map[string][]string{"portNumber": {controlPort}, "localPortNumber": {strconv.Itoa(port)}},
+	targets := SessionTargets(task)
+	if len(targets) == 0 {
+		return nil, errors.New("ssm: task has no container runtime id to target")
 	}
-	out, err := t.API.StartSession(ctx, in)
-	if err != nil {
-		return nil, fmt.Errorf("ssm:StartSession for %s: %w", aws.ToString(in.Target), err)
+	var in *awsssm.StartSessionInput
+	var out *awsssm.StartSessionOutput
+	for i, target := range targets {
+		in = &awsssm.StartSessionInput{
+			Target:       aws.String(target),
+			DocumentName: aws.String(document),
+			Parameters:   map[string][]string{"portNumber": {controlPort}, "localPortNumber": {strconv.Itoa(port)}},
+		}
+		out, err = t.API.StartSession(ctx, in)
+		if err == nil {
+			break
+		}
+		if !isTargetNotConnected(err) {
+			return nil, fmt.Errorf("ssm:StartSession for %s: %w", target, err)
+		}
+		t.logf("ssm target %s is not connected; trying the next container in the task", target)
+		if i == len(targets)-1 {
+			return nil, fmt.Errorf("no container in task %s has a connected ECS Exec agent (tried %s): %w", task.ID, strings.Join(targets, ", "), err)
+		}
 	}
 	args, err := PluginArgs(out, in, t.Region, t.Profile)
 	if err != nil {

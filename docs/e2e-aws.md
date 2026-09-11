@@ -11,6 +11,7 @@ RUN="./bin/tetherd run --profile personal --cluster tetherd-dev --service api"
 
 `deploy/dev-env` の最初のタスク起動そのものが spec §12 の 5 番目の検証を兼ねる:
 `pidMode: task` + `SYS_PTRACE` + ECS Exec + `restartPolicy` が `RegisterTaskDefinition` に受理され、タスクが `RUNNING` になっていること（そうでなければ `tetherd run` 自体が「no attachable task」で失敗する）。
+なお agent コンテナ（distroless）の ECS Exec エージェントは SSM に接続できないことがあり、その場合 CLI は同じタスクの別コンテナ経由で転送する（§6.1）。`tetherd` の出力に `ssm target … is not connected; trying the next container` が出るのは正常。
 
 | # | コマンド | 期待 | 確認すること |
 |---|---|---|---|

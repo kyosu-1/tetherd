@@ -100,6 +100,20 @@ func Discover(ctx context.Context, api ECSAPI, t Target) (transport.Task, error)
 			continue
 		}
 		tt := transport.Task{Cluster: t.Cluster, ARN: aws.ToString(task.TaskArn), ID: id, RuntimeID: aws.ToString(agent.RuntimeId)}
+		// Collect every container's runtime id, the agent container first:
+		// any connected container's SSM agent can carry the forward
+		// (awsvpc shares the network namespace), and DescribeTasks cannot
+		// tell which ones SSM can actually reach.
+		tt.RuntimeIDs = []string{aws.ToString(agent.RuntimeId)}
+		for i := range task.Containers {
+			c := &task.Containers[i]
+			if aws.ToString(c.Name) == t.AgentContainer {
+				continue
+			}
+			if rt := aws.ToString(c.RuntimeId); rt != "" {
+				tt.RuntimeIDs = append(tt.RuntimeIDs, rt)
+			}
+		}
 		if task.StartedAt != nil {
 			tt.StartedAt = *task.StartedAt
 		}

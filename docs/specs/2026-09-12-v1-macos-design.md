@@ -237,7 +237,7 @@ type Transport interface {
 }
 ```
 
-- `ssm`: SDK で `ssm:StartSession`（Target `ecs:<cluster>_<taskId>_<runtimeId>`、DocumentName `AWS-StartPortForwardingSession`、Parameters `portNumber: ["9900"]`, `localPortNumber: ["<空きポート>"]`）。応答を `session-manager-plugin` に AWS CLI と同じ引数（セッション JSON、リージョン、`StartSession`、プロファイル、パラメータ JSON、エンドポイント）で渡して子プロセスとして起動し、`127.0.0.1:<port>` に dial。AWS CLI 自体には依存しない
+- `ssm`: SDK で `ssm:StartSession`（Target `ecs:<cluster>_<taskId>_<runtimeId>`、DocumentName `AWS-StartPortForwardingSession`、Parameters `portNumber: ["9900"]`, `localPortNumber: ["<空きポート>"]`）。**ターゲットの runtimeId はタスク内のどのコンテナでもよい**: awsvpc ではタスク内の全コンテナが同じネットワーク名前空間を共有するので、どのコンテナの ECS Exec エージェント経由で転送しても `127.0.0.1:9900` の agent に届く。`DescribeTasks` は SSM から実際には到達できないコンテナでも `ExecuteCommandAgent` を `RUNNING` と報告する（distroless の agent コンテナが実機でこれに該当し、`TargetNotConnected` になる）ため、CLI は候補（agent コンテナ → 他のコンテナ）を順に試し、`TargetNotConnected` なら次へ進む。応答を `session-manager-plugin` に AWS CLI と同じ引数（セッション JSON、リージョン、`StartSession`、プロファイル、パラメータ JSON、エンドポイント）で渡して子プロセスとして起動し、`127.0.0.1:<port>` に dial。AWS CLI 自体には依存しない
 - `direct`: 指定アドレスに TCP。ローカル e2e と結合テスト用。`run --transport direct --agent-addr host:port --remote-cidr ...` で使う
 - 再接続: yamux セッションが死んだら指数バックオフ（1s → 30s）で `StartSession` からやり直し、`hello` を再送。進行中の dial は切れる
 - plugin の埋め込み（`aws/session-manager-plugin` の datachannel を組み込んで依存ゼロにする）は v2 候補。`Transport` の実装として足せる
@@ -246,6 +246,7 @@ type Transport interface {
 
 - `ListTasks(cluster, serviceName, desiredStatus=RUNNING)` → `DescribeTasks`。`tetherd-agent` コンテナがあり、`enableExecuteCommand` が true で、`managedAgents[ExecuteCommandAgent].lastStatus == RUNNING` のものを対象に
 - 対象タスク**全部**に SSM + yamux + `hello`。steal はどのタスクからでも受ける
+- タスクごとの SSM ターゲットは「そのタスクのコンテナのうち exec エージェントが繋がっているもの」。§6.1 のとおり候補を順に試す
 - `dial` / `resolve` / env は primary（起動が最も古いタスク）を使う。primary が落ちたら次に古いものへ
 - 10 秒おきに `ListTasks` を再実行し、新しいタスクには接続、消えたタスクは片付ける（rolling deploy の追従）
 - `--task ID` で明示した場合はそのタスクだけ
