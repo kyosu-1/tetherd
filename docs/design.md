@@ -241,7 +241,7 @@ tetherd  ✗ Refusing to attach: agent reports TETHERD_ENV=prod
 - 非 root プロセスは自分の所属グループにも `setgid` できないので、root 所有・setgid `tetherd` の小さなラッパー `tetherd-exec`（`setregid` → `exec` だけ）をヘルパーがインストール時に置く。CLI はそれ経由で子を起動するので、子は CLI の素直な子プロセスのまま（tty、シグナル、終了コードがそのまま）
 - setgid `tetherd` で増える権限は「pf に捕まる」ことだけ
 
-**pf ルール**（ヘルパーがアンカー `com.tetherd` にメモリ上でロード。ディスクには書かない）
+**pf ルール**（ヘルパーが `com.apple/900.tetherd` 子アンカーにメモリ上でロード。ディスクには書かない）
 
 ```
 table <tetherd_remote> { 10.0.0.0/16, 169.254.170.0/24 }
@@ -261,8 +261,8 @@ utun に `route-to` してユーザー空間スタックで終端する案は、
 - 配布は Homebrew tap。`brew install kyosu-1/tetherd/tetherd && sudo tetherd-helper install`。sudo はこの 1 回だけで、グループ作成、`tetherd-exec` の配置、LaunchDaemon の plist 生成と登録を行う
 - **ヘルパーは常駐しない。** launchd がソケットを保持し、最初の接続で root プロセスを起動するソケットアクティベーション。接続が無くなれば終了し、クラッシュ時だけ launchd が再起動して起動時の掃除で残留ルールを消す。プロセスの寿命がセッションに一致する
 - brew 経由のバイナリには quarantine 属性が付かないので署名・公証は v1 ではしない。GitHub Releases からの直接ダウンロードは Developer ID を取ってから
-- 依存 API は pf（Lion 以降、Apple 自身が使用、`pfctl` は現行 OS に健在）、`DIOCNATLOOK` / `DIOCCHANGERULE`（sshuttle が使用）、`setregid` の 3 つ。いずれも廃止の兆しは無い
-- pf の唯一の罠は `/etc/pf.conf` にアンカー参照を書くと OS 更新で消えること。そこで **ディスクには触らず**、`DIOCCHANGERULE` でメインルールセットにアンカー参照をメモリ上で挿入し、終了時に戻す。`pfctl -E` / `-X` の参照カウントで有効化する（`/etc/pf.conf` のコメントに書かれている作法）
+- 依存 API は pf（Lion 以降、Apple 自身が使用、`pfctl` は現行 OS に健在）、`DIOCNATLOOK`、`setregid` の 3 つ。いずれも廃止の兆しは無い
+- pf の唯一の罠は `/etc/pf.conf` にアンカー参照を書くと OS 更新で消えること。そこで **ディスクには触らず**、既定の `/etc/pf.conf` がすでに持つワイルドカード参照 `rdr-anchor "com.apple/*"` / `anchor "com.apple/*"` に乗る子アンカー `com.apple/900.tetherd` にルールをロードする。メインルールセットには一切手を入れない。`pfctl -E` / `-X` の参照カウントで有効化する（`/etc/pf.conf` のコメントに書かれている作法）
 - Ventura 以降は LaunchDaemon 追加時に「バックグラウンド項目が追加されました」と通知が出てユーザーが無効化できるので、`doctor` がヘルパー無応答を検出して「システム設定 → 一般 → ログイン項目」を案内する
 - 新 macOS の初期リリースでファイアウォール周りが変わることがある（Sequoia 15.0 で一部 VPN が数週間通信不能になった例）ので、毎年夏のベータで動作確認する
 - ヘルパーが受け付ける操作は `pf.apply` / `pf.clear` / `resolver.set` / `resolver.clear` / `natlook` の 5 つだけ。コマンドを起動する操作は無い。接続元は `admin` グループのユーザーに限定（UNIX ソケット + peer credential）

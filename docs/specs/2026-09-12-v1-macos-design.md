@@ -90,7 +90,7 @@ design.md の 4 層で言うと、②「終端する層」がカーネル TCP �
 
 ### 3.2 pf ルール
 
-helper がアンカー `com.tetherd` にロードする。ディスクには書かない。
+実機検証は `make e2e-local` の結果で確定。helper は `/etc/pf.conf` に一切触れず、既定の `/etc/pf.conf` が持つワイルドカード参照 `rdr-anchor "com.apple/*"` / `anchor "com.apple/*"` に乗る**子アンカー** `com.apple/900.tetherd` にルールをロードする（`set skip on lo0` が無いことも含め、手元の macOS 26 で確認済み）。ディスクには書かない。
 
 ```
 table <tetherd_remote> { 10.0.0.0/16, 169.254.170.0/24, ... }
@@ -100,10 +100,10 @@ pass out route-to lo0 inet proto tcp from any to <tetherd_remote> group tetherd 
 
 - `group tetherd` のプロセスが `<tetherd_remote>` 宛に出した TCP だけが lo0 に回り、rdr で CLI の透過ポートに落ちる。他プロセスの同じ宛先への通信は物理 IF から出る
 - macOS の既定 `/etc/pf.conf` には `set skip on lo0` は**無い**（design.md の記述は OpenBSD の既定との混同。手元の macOS 26 で確認済み）
-- メインルールセットへのアンカー参照（`rdr-anchor "com.tetherd"` / `anchor "com.tetherd"`）は `DIOCCHANGERULE` ioctl でメモリ上に挿入する（sshuttle の `pf_add_anchor_rule` と同じ）。`pfctl -sr` → 加工 → `pfctl -f -` の dump/reload 方式は Apple のシステムサービスが動的に挿すアンカーと競合しうるので取らない。ioctl の構造体定義が手間なら、dump/reload を暫定の代替にしてよいが、v1 リリースまでに ioctl に寄せる
-- アンカー内のルールは `pfctl -a com.tetherd -f -` で stdin からロード
+- メインルールセットには一切手を入れない。既定の `/etc/pf.conf` がすでに持つ `rdr-anchor "com.apple/*"` / `anchor "com.apple/*"` のワイルドカード参照が、名前が `com.apple/` で始まる子アンカーをそのまま拾う。`900.` は Apple 自身の子アンカー（`250.ApplicationFirewall` など）より後に評価される名前。専用アンカー `com.tetherd` を `DIOCCHANGERULE` ioctl でメインルールセットに挿す方式（sshuttle の `pf_add_anchor_rule` と同じ）は、この子アンカー方式で実機検証済みのため不要と判断し、以降は計画しない
+- アンカー内のルールは `pfctl -a com.apple/900.tetherd -f -` で stdin からロード
 - `pf.apply` で `pfctl -E`（参照カウント。stderr の `Token : N` を保持）、`pf.clear` と終了時に `pfctl -X N`。セッションの外では pf を有効化した状態すら残さない。`/etc/pf.conf` のコメントにある作法そのもの
-- helper 起動時に `com.tetherd` アンカーが残っていれば空にする（前回の異常終了対策）
+- helper 起動時に `com.apple/900.tetherd` アンカーが残っていれば空にする（前回の異常終了対策）
 
 ### 3.3 元の宛先の復元
 
@@ -351,7 +351,7 @@ design.md §8 のとおり yamux + JSON Lines。ストリーム 0 が制御。
 
 **CLI が開くストリーム**（1 行目が JSON ヘッダー、以降は生バイト）
 
-- `{"type":"dial","addr":"10.0.3.21:5432"}` → `{"ok":true}` または `{"ok":false,"error":"..."}` → 双方向コピー
+- `{"type":"dial","addr":"10.0.3.21:5432"}` → `{"type":"dial","ok":true}` または `{"type":"dial","ok":false,"error":"..."}`（コーデックが常に `type` を付与する）→ 双方向コピー
 - `{"type":"resolve","name":"api.myapp.internal","qtype":"A"}` → `{"ok":true,"addrs":[...],"ttl":30}` → close
 
 **agent が開くストリーム**
@@ -476,6 +476,7 @@ design.md §10 に加えて:
 - setgid `tetherd` の権限は pf に捕まることだけ
 - `:9900` は無認証だが lo にしか bind せず、信頼境界は「タスク内」。design.md に明記する
 - ローカルアプリは共有 dev DB に書く。ローカルブランチの auto-migrate が dev DB を変えうることを README で注意する
+- セッション中は `tetherd-exec` が誰でも実行可能（mode `2755`、setgid `tetherd`）なので、同じマシンの他のローカルユーザーも gid `tetherd` でコマンドを起動しトンネルに到達できる。シングルユーザーのラップトップでは許容するが、その前提であることを明記する
 
 ---
 
