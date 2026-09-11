@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -93,6 +94,35 @@ func LocalOverlaps(cidrs []netip.Prefix, addrs []net.Addr) []string {
 	return out
 }
 
+// resolveTaskEnv decides what env the child should get from the welcome
+// message and returns a status line to log alongside it. It implements the
+// same four branches Run always has: --no-env, an EnvError tolerated only
+// over direct (no agent-side guarantees there), an EnvError that must stop
+// ssm (the operator asked for the real task and didn't get it), or the
+// task's app env.
+func resolveTaskEnv(w proto.Welcome, opts RunOptions) (map[string]string, string, error) {
+	switch {
+	case opts.NoEnv:
+		return nil, "env      skipped (--no-env)", nil
+	case w.EnvError != "" && opts.Transport == "direct":
+		return nil, fmt.Sprintf("env      unavailable: %s", w.EnvError), nil
+	case w.EnvError != "":
+		return nil, "", fmt.Errorf("env: %s\n        Use --no-env to run without the task's environment", w.EnvError)
+	default:
+		return w.AppEnv, fmt.Sprintf("✓ env      %d vars from the task", len(w.AppEnv)), nil
+	}
+}
+
+// checkTargetEnv refuses to attach when the agent's TETHERD_ENV doesn't
+// match what the operator asked for. It only applies to ssm: direct is a
+// local e2e harness with no environment guarantees to check.
+func checkTargetEnv(w proto.Welcome, opts RunOptions) error {
+	if opts.Transport == "ssm" && w.Env != opts.TargetEnv {
+		return fmt.Errorf("refusing to attach: agent reports TETHERD_ENV=%q, expected %q\n        tetherd never attaches to an environment it was not pointed at; check --env / --cluster", w.Env, opts.TargetEnv)
+	}
+	return nil
+}
+
 // Run connects to the agent, installs capture, runs the command and cleans
 // up. It returns the child's exit code.
 func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
@@ -139,7 +169,11 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 		if err != nil {
 			return 1, err
 		}
-		logf("%s/%s  task %s  (started %s ago)", opts.Cluster, opts.Service, short(task.ID), time.Since(task.StartedAt).Round(time.Minute))
+		if task.StartedAt.IsZero() {
+			logf("%s/%s  task %s", opts.Cluster, opts.Service, short(task.ID))
+		} else {
+			logf("%s/%s  task %s  (started %s ago)", opts.Cluster, opts.Service, short(task.ID), time.Since(task.StartedAt).Round(time.Minute))
+		}
 		if !opts.NoNetwork {
 			vpc, err := ecsprov.VPCCIDRs(ctx, awsec2.NewFromConfig(awscfg), task.SubnetID)
 			if err != nil {
@@ -152,7 +186,21 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 		return 2, fmt.Errorf("unknown transport %q (ssm | direct)", opts.Transport)
 	}
 
-	// 2. session
+	// 2. helper + exec shim, before the SSM session: a busy/missing helper
+	// must not cost a StartSession call.
+	var hc *helper.Client
+	if !opts.NoNetwork {
+		if _, err := os.Stat(opts.ExecPath); err != nil {
+			return 1, fmt.Errorf("%s not found; is tetherd-helper running? (%w)", opts.ExecPath, err)
+		}
+		hc, err = helper.Dial(opts.HelperSocket)
+		if err != nil {
+			return 1, err
+		}
+		defer hc.Close()
+	}
+
+	// 3. session
 	conn, err := tr.Dial(ctx, task)
 	if err != nil {
 		return 1, fmt.Errorf("connect to agent: %w", err)
@@ -164,24 +212,16 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 	}
 	defer sess.Close()
 	w := sess.Welcome()
-	if opts.Transport == "ssm" && w.Env != opts.TargetEnv {
-		return 1, fmt.Errorf("refusing to attach: agent reports TETHERD_ENV=%q, expected %q\n        tetherd never attaches to an environment it was not pointed at; check --env / --cluster", w.Env, opts.TargetEnv)
+	if err := checkTargetEnv(w, opts); err != nil {
+		return 1, err
 	}
-	taskEnv := w.AppEnv
-	switch {
-	case opts.NoEnv:
-		taskEnv = nil
-		logf("env      skipped (--no-env)")
-	case w.EnvError != "" && opts.Transport == "direct":
-		taskEnv = nil
-		logf("env      unavailable: %s", w.EnvError)
-	case w.EnvError != "":
-		return 1, fmt.Errorf("env: %s\n        Use --no-env to run without the task's environment", w.EnvError)
-	default:
-		logf("✓ env      %d vars from the task", len(taskEnv))
+	taskEnv, envStatus, err := resolveTaskEnv(w, opts)
+	if err != nil {
+		return 1, err
 	}
+	logf("%s", envStatus)
 
-	// 3. capture (helper + pf)
+	// 4. capture (helper + pf)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if !opts.NoNetwork {
@@ -190,11 +230,6 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 				logf("⚠ remote CIDR overlaps this machine's network: %s (that part of the LAN is routed through the agent for the child)", o)
 			}
 		}
-		hc, err := helper.Dial(opts.HelperSocket)
-		if err != nil {
-			return 1, err
-		}
-		defer hc.Close()
 		cap := pfrdr.New(hc)
 		cap.Logf = logf
 		if err := cap.Start(ctx, capture.Spec{RemoteCIDRs: cidrs}); err != nil {
@@ -217,7 +252,7 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 		}()
 		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s", joinPrefixes(cidrs))
 
-		// 4. task role: fetch credentials the way the child's SDK will.
+		// 5. task role: fetch credentials the way the child's SDK will.
 		if uri := taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]; uri != "" {
 			ictx, icancel := context.WithTimeout(ctx, 15*time.Second)
 			creds, err := awsid.FetchContainerCredentials(ictx, sess.DialTCP, uri)
@@ -234,18 +269,28 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 		}
 	}
 
-	// 5. child
+	// 6. child
 	var child *exec.Cmd
 	if opts.NoNetwork {
 		child = exec.CommandContext(ctx, opts.Command[0], opts.Command[1:]...)
 	} else {
-		if _, err := os.Stat(opts.ExecPath); err != nil {
-			return 1, fmt.Errorf("%s not found; is tetherd-helper running? (%w)", opts.ExecPath, err)
-		}
 		child = exec.CommandContext(ctx, opts.ExecPath, append([]string{"--"}, opts.Command...)...)
 	}
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
-	child.Env = env.Merge(os.Environ(), taskEnv, env.Options{DropAWSContainer: opts.NoNetwork})
+	mergeOpts := env.Options{DropAWSContainer: opts.NoNetwork}
+	if !opts.NoNetwork && taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "" {
+		mergeOpts.StripLocal = env.LocalAWSCredentialVars
+		var found []string
+		for _, name := range env.LocalAWSCredentialVars {
+			if _, ok := os.LookupEnv(name); ok {
+				found = append(found, name)
+			}
+		}
+		if len(found) > 0 {
+			logf("✓ env      local AWS credentials (%s) removed so the task role applies", strings.Join(found, ", "))
+		}
+	}
+	child.Env = env.Merge(os.Environ(), taskEnv, mergeOpts)
 	child.Cancel = func() error { return child.Process.Signal(os.Interrupt) }
 	child.WaitDelay = 5 * time.Second
 	logf("▶ %s", joinArgs(opts.Command))

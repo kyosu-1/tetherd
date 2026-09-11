@@ -9,6 +9,8 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+
+	"github.com/kyosu-1/tetherd/internal/proto"
 )
 
 func TestParseRemoteCIDRs(t *testing.T) {
@@ -166,6 +168,52 @@ func TestExitCodeMapping(t *testing.T) {
 		}
 		if IsChildExit(err) {
 			t.Fatal("IsChildExit = true, want false")
+		}
+	})
+}
+
+func TestResolveTaskEnv(t *testing.T) {
+	t.Run("no-env", func(t *testing.T) {
+		env, status, err := resolveTaskEnv(proto.Welcome{AppEnv: map[string]string{"X": "1"}}, RunOptions{NoEnv: true})
+		if err != nil || env != nil || status != "env      skipped (--no-env)" {
+			t.Fatalf("env=%v status=%q err=%v", env, status, err)
+		}
+	})
+	t.Run("env error over direct is tolerated", func(t *testing.T) {
+		env, status, err := resolveTaskEnv(proto.Welcome{EnvError: "boom"}, RunOptions{Transport: "direct"})
+		if err != nil || env != nil || !strings.Contains(status, "boom") {
+			t.Fatalf("env=%v status=%q err=%v", env, status, err)
+		}
+	})
+	t.Run("env error over ssm is fatal", func(t *testing.T) {
+		env, _, err := resolveTaskEnv(proto.Welcome{EnvError: "boom"}, RunOptions{Transport: "ssm"})
+		if env != nil || err == nil || !strings.Contains(err.Error(), "boom") || !strings.Contains(err.Error(), "--no-env") {
+			t.Fatalf("env=%v err=%v", env, err)
+		}
+	})
+	t.Run("app env", func(t *testing.T) {
+		env, status, err := resolveTaskEnv(proto.Welcome{AppEnv: map[string]string{"A": "1", "B": "2"}}, RunOptions{Transport: "ssm"})
+		if err != nil || len(env) != 2 || !strings.Contains(status, "2 vars") {
+			t.Fatalf("env=%v status=%q err=%v", env, status, err)
+		}
+	})
+}
+
+func TestCheckTargetEnv(t *testing.T) {
+	t.Run("ssm mismatch", func(t *testing.T) {
+		err := checkTargetEnv(proto.Welcome{Env: "dev"}, RunOptions{Transport: "ssm", TargetEnv: "prod"})
+		if err == nil || !strings.Contains(err.Error(), "refusing to attach") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("ssm match", func(t *testing.T) {
+		if err := checkTargetEnv(proto.Welcome{Env: "dev"}, RunOptions{Transport: "ssm", TargetEnv: "dev"}); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("direct mismatch is not checked", func(t *testing.T) {
+		if err := checkTargetEnv(proto.Welcome{Env: "dev"}, RunOptions{Transport: "direct", TargetEnv: "prod"}); err != nil {
+			t.Fatalf("err = %v", err)
 		}
 	})
 }
