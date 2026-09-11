@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -96,6 +97,44 @@ func TestReadErrors(t *testing.T) {
 	r.MetadataURL = "http://127.0.0.1:1/v4/abc"
 	if _, _, err := r.Read(context.Background()); err == nil {
 		t.Fatal("want metadata error")
+	}
+}
+
+// roundTripFunc adapts a function to http.RoundTripper for tests.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestReadStopsWhenContextCancelled ensures the /proc scan loop, not just
+// the metadata HTTP request, honours ctx cancellation so Hello's timeout is
+// actually enforced even when the scan itself would otherwise run long.
+func TestReadStopsWhenContextCancelled(t *testing.T) {
+	srv := metadata(t, `{"DockerId":"app123","Name":"app"}`)
+	defer srv.Close()
+
+	procs := map[int]struct{ env, starttime string }{}
+	for i := 1; i <= 50; i++ {
+		procs[i] = struct{ env, starttime string }{env: "", starttime: "100"}
+	}
+	root := writeProc(t, procs)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &ProcEnvReader{
+		MetadataURL:  srv.URL + "/v4/abc",
+		ProcRoot:     root,
+		AppContainer: "app",
+		HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			resp, err := http.DefaultTransport.RoundTrip(req)
+			// Cancel only after the metadata call has been served, so the
+			// cancellation is observed inside the /proc scan loop.
+			cancel()
+			return resp, err
+		})},
+	}
+	_, _, err := r.Read(ctx)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("want error wrapping context.Canceled, got %v", err)
 	}
 }
 

@@ -84,8 +84,10 @@ func (r *ProcEnvReader) Read(ctx context.Context) (map[string]string, string, er
 	var bestStart uint64
 	found := false
 	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || !e.IsDir() {
+		if err := ctx.Err(); err != nil {
+			return nil, "", fmt.Errorf("scan %s: %w", r.ProcRoot, err)
+		}
+		if _, err := strconv.Atoi(e.Name()); err != nil || !e.IsDir() {
 			continue
 		}
 		raw, err := os.ReadFile(filepath.Join(r.ProcRoot, e.Name(), "environ"))
@@ -107,7 +109,6 @@ func (r *ProcEnvReader) Read(ctx context.Context) (map[string]string, string, er
 		if !found || start < bestStart {
 			bestEnv, bestStart, found = env, start, true
 		}
-		_ = pid
 	}
 	if !found {
 		return nil, "", fmt.Errorf("no process of container %q is visible from the agent; is pidMode \"task\" set on the task definition (and SYS_PTRACE added to the agent)?", r.AppContainer)

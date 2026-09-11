@@ -24,7 +24,7 @@ func TestConfigFromEnv(t *testing.T) {
 		}
 		return ""
 	})
-	if err != nil || cfg.Env != "dev" || cfg.Control != "127.0.0.1:9900" {
+	if err != nil || cfg.Env != "dev" || cfg.Control != "127.0.0.1:9900" || cfg.AppContainer != "app" {
 		t.Fatalf("cfg = %+v, err = %v", cfg, err)
 	}
 }
