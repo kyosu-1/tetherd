@@ -23,6 +23,7 @@ type SessionInfo struct {
 type Agent struct {
 	cfg  Config
 	logf func(string, ...any)
+	env  EnvReader // nil outside ECS
 
 	mu       sync.Mutex
 	sessions map[string]SessionInfo
@@ -33,8 +34,15 @@ func New(cfg Config, logf func(string, ...any)) *Agent {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &Agent{cfg: cfg, logf: logf, sessions: map[string]SessionInfo{}}
+	a := &Agent{cfg: cfg, logf: logf, sessions: map[string]SessionInfo{}}
+	if cfg.MetadataURL != "" {
+		a.env = &ProcEnvReader{MetadataURL: cfg.MetadataURL, ProcRoot: "/proc", AppContainer: cfg.AppContainer}
+	}
+	return a
 }
+
+// SetEnvReader replaces the env source (tests).
+func (a *Agent) SetEnvReader(r EnvReader) { a.env = r }
 
 // ListenAndServe listens on cfg.Control and serves until ctx is done.
 func (a *Agent) ListenAndServe(ctx context.Context) error {
@@ -128,12 +136,25 @@ func (h *handler) Hello(hello proto.Hello, remote string) (proto.Welcome, *proto
 	}
 	h.user = hello.User
 	h.a.logf("user %q attached from %s", hello.User, remote)
-	return proto.Welcome{
-		Version: proto.Version,
-		TaskARN: h.a.cfg.TaskARN,
-		Env:     h.a.cfg.Env,
-		Others:  h.a.others(hello.User),
-	}, nil
+	w := proto.Welcome{Version: proto.Version, TaskARN: h.a.cfg.TaskARN, Env: h.a.cfg.Env, Others: h.a.others(hello.User)}
+	if h.a.env == nil {
+		w.EnvError = "no ECS metadata endpoint (agent is not running in ECS)"
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		env, arn, err := h.a.env.Read(ctx)
+		cancel()
+		if err != nil {
+			w.EnvError = err.Error()
+			h.a.logf("env for %q: %v", hello.User, err)
+		} else {
+			w.AppEnv = env
+			if arn != "" {
+				w.TaskARN = arn
+			}
+			h.a.logf("env for %q: %d vars from container %q", hello.User, len(env), h.a.cfg.AppContainer)
+		}
+	}
+	return w, nil
 }
 
 func (h *handler) Dial(ctx context.Context, addr string) (net.Conn, error) {
