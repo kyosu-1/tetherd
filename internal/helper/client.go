@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+// callTimeout bounds how long a single request/reply round trip may take
+// before Client.call gives up on a wedged helper. Overridable in tests.
+var callTimeout = 10 * time.Second
+
 // Client talks to the helper over its UNIX socket. Methods are serialized.
 type Client struct {
 	mu   sync.Mutex
@@ -103,6 +107,10 @@ func (c *Client) call(req request) (response, error) {
 	defer c.mu.Unlock()
 	c.next++
 	req.ID = c.next
+	if err := c.conn.SetDeadline(time.Now().Add(callTimeout)); err != nil {
+		return response{}, fmt.Errorf("helper: set deadline: %w", err)
+	}
+	defer c.conn.SetDeadline(time.Time{})
 	if err := c.enc.Encode(req); err != nil {
 		return response{}, fmt.Errorf("helper: send %s: %w", req.Op, err)
 	}

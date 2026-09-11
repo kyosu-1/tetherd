@@ -56,12 +56,15 @@ func (p Pfctl) LoadAnchor(anchor, rules string) error {
 }
 
 // FlushAnchor removes the anchor's filter rules, translation rules and
-// tables. States are deliberately not flushed: they are global.
+// tables. States are deliberately not flushed: they are global. All three
+// flushes are attempted even if one fails, so a stuck table (say) does not
+// leave stale rdr/pass rules behind; the first error, if any, is returned.
 func (p Pfctl) FlushAnchor(anchor string) error {
+	var firstErr error
 	for _, what := range []string{"rules", "nat", "Tables"} {
-		if _, err := p.Run([]string{"-a", anchor, "-F", what}, ""); err != nil {
-			return err
+		if _, err := p.Run([]string{"-a", anchor, "-F", what}, ""); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	return nil
+	return firstErr
 }

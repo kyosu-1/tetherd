@@ -84,7 +84,12 @@ func InstallExec(src, dir string, gid int) (string, error) {
 	if err := out.Close(); err != nil {
 		return "", err
 	}
-	if err := os.Chown(tmp, os.Getuid(), gid); err != nil { // root when run by the helper
+	// os.Getuid() here is root when this runs under sudo or as the launchd
+	// helper daemon (the real deployment path), so the owner ends up
+	// root:gid as intended. Using the caller's own uid rather than a
+	// hardcoded 0 is what lets this function run unprivileged in tests
+	// (chowning a file to yourself needs no special permission).
+	if err := os.Chown(tmp, os.Getuid(), gid); err != nil {
 		return "", err
 	}
 	if err := os.Chmod(tmp, 0o755|os.ModeSetgid); err != nil {

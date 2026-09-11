@@ -1,5 +1,5 @@
 // Package pf generates the packet-filter rules for one tetherd session and
-// drives /sbin/pfctl (rules and pfctl wrapper are added in a later task).
+// drives /sbin/pfctl.
 package pf
 
 import "net/netip"
