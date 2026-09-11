@@ -493,6 +493,20 @@ design.md §10 に加えて:
 
 ---
 
+### 検証結果（2026-09-12、macOS 26.6.2 / Apple Silicon、`make e2e-local`）
+
+1〜3 は **通った**（`passed=7 failed=0`、全チェックで `from 192.0.2.10`）。
+
+| # | 結果 |
+|---|---|
+| 1 | `tetherd-exec`（`setregid`）+ pf `group` + `rdr` で curl / bash / zsh / `go run` / node の子プロセスの TCP が捕まり、agent 経由で届いた。bash の子でも捕まるので real gid の変更が効いている。グループ `tetherd` は gid 309 で自動作成 |
+| 2 | `DIOCNATLOOK`（84 バイト、`0xC0544417`）が元の宛先を正しく返した |
+| 3 | `DIOCCHANGERULE` は不要。既定 `/etc/pf.conf` の `com.apple/*` に子アンカー `com.apple/900.tetherd` で乗り、セッションごとの `pfctl -E`/`-X` と `-F rules/nat/Tables` で終了後のアンカーは空 |
+| 4 | 未検証（`remote_domains` を使う v0.2 で） |
+| 5, 6 | 未検証（AWS。v0.2） |
+
+---
+
 ## 13. design.md に反映する変更
 
 この spec の承認後、design.md を以下の方針で改訂し、HTML 版（artifact）を再生成する。

@@ -576,7 +576,7 @@ tetherd は「Kubernetes を使わないサーバーレスコンテナのため�
 
 ## 15. 先に潰す検証
 
-設計の妥当性を左右するものから。1〜4 は AWS 不要で、`hack/e2e-local.sh`（Docker ネットワーク上の agent + postgres に `direct` トランスポートで繋ぐ）で確認する。
+設計の妥当性を左右するものから。1〜4 は AWS 不要で、`hack/e2e-local.sh`（Docker ネットワーク上の agent + postgres に `direct` トランスポートで繋ぐ）で確認する。**1〜3 は 2026-09-12 に macOS 26 で確認済み**（spec §12 の検証結果）。
 
 1. `tetherd-exec`（`setregid`）+ pf `group` + `rdr` で、bash / zsh / Go / Node の子プロセスの TCP が捕まり、他プロセスは捕まらないこと
 2. `DIOCNATLOOK` が現行 macOS で期待どおり元の宛先を返すこと
