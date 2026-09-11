@@ -24,7 +24,7 @@ check() { # check <name> <expected-substring> <cmd...>
 
 cleanup() {
   set +e
-  if [[ -n "${HELPER_PID:-}" ]]; then sudo kill "$HELPER_PID" 2>/dev/null; wait "$HELPER_PID" 2>/dev/null; fi
+  if [[ -n "${HELPER_PID:-}" ]]; then sudo kill "$HELPER_PID" 2>/dev/null; wait "$SUDO_PID" 2>/dev/null; fi
   docker compose -f hack/docker-compose.yml down -v >/dev/null 2>&1
 }
 trap cleanup EXIT
@@ -33,12 +33,15 @@ echo "== build"
 make build >/dev/null
 echo "== containers"
 docker compose -f hack/docker-compose.yml up -d --build --wait
+for _ in $(seq 1 50); do nc -z 127.0.0.1 9900 2>/dev/null && break; sleep 0.1; done
 echo "== helper (sudo)"
 sudo -v
 sudo ./bin/tetherd-helper --socket "$SOCK" --exec-src "$PWD/bin/tetherd-exec" &
-HELPER_PID=$!
+SUDO_PID=$!
 for _ in $(seq 1 50); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
 [[ -S "$SOCK" ]] || { echo "helper socket did not appear"; exit 1; }
+HELPER_PID=$(pgrep -n -f "bin/tetherd-helper --socket $SOCK" || true)
+[[ -n "$HELPER_PID" ]] || HELPER_PID=$SUDO_PID
 
 echo "== checks"
 if curl -s --max-time 2 "$URL" >/dev/null 2>&1; then

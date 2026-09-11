@@ -17,6 +17,7 @@ services:
   postgres:
     image: postgres:16-alpine
     environment: { POSTGRES_PASSWORD: tetherd }
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U postgres"], interval: 2s, timeout: 2s, retries: 15 }
     networks: { tethernet: { ipv4_address: 192.0.2.12 } }
 networks:
   tethernet:
