@@ -102,7 +102,7 @@ pass out route-to lo0 inet proto tcp from any to <tetherd_remote> group tetherd 
 - macOS の既定 `/etc/pf.conf` には `set skip on lo0` は**無い**（design.md の記述は OpenBSD の既定との混同。手元の macOS 26 で確認済み）
 - メインルールセットへのアンカー参照（`rdr-anchor "com.tetherd"` / `anchor "com.tetherd"`）は `DIOCCHANGERULE` ioctl でメモリ上に挿入する（sshuttle の `pf_add_anchor_rule` と同じ）。`pfctl -sr` → 加工 → `pfctl -f -` の dump/reload 方式は Apple のシステムサービスが動的に挿すアンカーと競合しうるので取らない。ioctl の構造体定義が手間なら、dump/reload を暫定の代替にしてよいが、v1 リリースまでに ioctl に寄せる
 - アンカー内のルールは `pfctl -a com.tetherd -f -` で stdin からロード
-- helper は起動時に `pfctl -E`（参照カウント。stderr の `Token : N` を保持）、終了時に `pfctl -X N`。`/etc/pf.conf` のコメントにある作法そのもの
+- `pf.apply` で `pfctl -E`（参照カウント。stderr の `Token : N` を保持）、`pf.clear` と終了時に `pfctl -X N`。セッションの外では pf を有効化した状態すら残さない。`/etc/pf.conf` のコメントにある作法そのもの
 - helper 起動時に `com.tetherd` アンカーが残っていれば空にする（前回の異常終了対策）
 
 ### 3.3 元の宛先の復元
@@ -364,15 +364,17 @@ design.md §8 のとおり yamux + JSON Lines。ストリーム 0 が制御。
 
 ```
 brew install kyosu-1/tetherd/tetherd
-sudo brew services start tetherd      # sudo はこの 1 回
+sudo tetherd-helper install        # sudo はこの 1 回
 tetherd doctor
 ```
 
 - tap `kyosu-1/homebrew-tetherd`。GoReleaser がタグ push で GitHub Release（darwin arm64 / amd64）、GHCR の agent と sampleapp イメージ、tap の formula 更新を行う
-- formula は 3 バイナリを prefix に置き、`service` ブロックに `require_root true` と `keep_alive true`
-- brew はインストール時に root の処理を実行できないので、root が要る初期化は helper が**起動のたびに**行う: グループ `tetherd` の作成、`tetherd-exec` の `/usr/local/libexec/tetherd/` へのコピー（`root:tetherd`、`2755`）、残留アンカーの掃除、ソケットの listen。`brew upgrade tetherd && sudo brew services restart tetherd` で追従する
+- formula は 3 バイナリを prefix に置くだけ。`service` ブロックは使わない（launchd の登録は helper 自身が行う）
+- brew はインストール時に root の処理を実行できないので、root が要る初期化は `sudo tetherd-helper install` が行う: グループ `tetherd` の作成、`tetherd-exec` の `/usr/local/libexec/tetherd/` へのコピー（`root:tetherd`、`2755`）、`/Library/LaunchDaemons/dev.tetherd.helper.plist` の生成と `launchctl bootstrap`。`brew upgrade tetherd` の後は `sudo tetherd-helper install` を再実行する（冪等。`doctor` がバージョン不一致を検出して案内する）
+- **helper は常駐しない。** plist の `Sockets` で launchd が `/var/run/tetherd.sock` を保持し、最初の接続で helper を root で起動する（ソケットアクティベーション。`launch_activate_socket()` は cgo を使わず `purego` で呼ぶ）。helper は接続が無くなって 30 秒でアイドル終了する。`KeepAlive: {SuccessfulExit: false}` で、クラッシュ時だけ launchd が再起動し、起動時の掃除で残留ルールが消える
+- helper は起動のたびに残留アンカーと resolver ファイルを掃除してから listen する
 - 署名・公証は v1 ではしない。GitHub Releases からの直接ダウンロードは非サポートと明記
-- アンインストール: `sudo brew services stop tetherd` → `sudo tetherd-helper uninstall`（グループとディレクトリの削除）→ `brew uninstall tetherd`
+- アンインストール: `sudo tetherd-helper uninstall`（`launchctl bootout`、plist、グループ、`/usr/local/libexec/tetherd` の削除）→ `brew uninstall tetherd`
 - Ventura 以降の「バックグラウンド項目が追加されました」で無効化されたら `doctor` が案内。毎年の macOS メジャーリリースで動作確認
 
 ---

@@ -258,7 +258,8 @@ utun に `route-to` してユーザー空間スタックで終端する案は、
 ### macOS ヘルパーの配布と保守
 
 - 入れるのは root の LaunchDaemon 1 つ（Network Extension でも kext でもない）
-- 配布は Homebrew tap。formula の `service` ブロックに `require_root true` を書き、`brew install kyosu-1/tetherd/tetherd && sudo brew services start tetherd`。sudo はこの 1 回だけ。root が要る初期化（グループ作成、`tetherd-exec` の配置、残留ルールの掃除）はヘルパーが起動時に自分で行う
+- 配布は Homebrew tap。`brew install kyosu-1/tetherd/tetherd && sudo tetherd-helper install`。sudo はこの 1 回だけで、グループ作成、`tetherd-exec` の配置、LaunchDaemon の plist 生成と登録を行う
+- **ヘルパーは常駐しない。** launchd がソケットを保持し、最初の接続で root プロセスを起動するソケットアクティベーション。接続が無くなれば終了し、クラッシュ時だけ launchd が再起動して起動時の掃除で残留ルールを消す。プロセスの寿命がセッションに一致する
 - brew 経由のバイナリには quarantine 属性が付かないので署名・公証は v1 ではしない。GitHub Releases からの直接ダウンロードは Developer ID を取ってから
 - 依存 API は pf（Lion 以降、Apple 自身が使用、`pfctl` は現行 OS に健在）、`DIOCNATLOOK` / `DIOCCHANGERULE`（sshuttle が使用）、`setregid` の 3 つ。いずれも廃止の兆しは無い
 - pf の唯一の罠は `/etc/pf.conf` にアンカー参照を書くと OS 更新で消えること。そこで **ディスクには触らず**、`DIOCCHANGERULE` でメインルールセットにアンカー参照をメモリ上で挿入し、終了時に戻す。`pfctl -E` / `-X` の参照カウントで有効化する（`/etc/pf.conf` のコメントに書かれている作法）
@@ -395,7 +396,7 @@ CLI (laptop)                         agent                          app / RDS
 2. ALB のターゲットグループのポートを 8080（agent）に向ける。sg-app のインバウンドも 8080 に
 3. サービスで `enableExecuteCommand: true`、タスクロールに SSM の権限（`ssmmessages:CreateControlChannel` / `CreateDataChannel` / `OpenControlChannel` / `OpenDataChannel`）。無ければ SSM の VPC Endpoint 3 つか NAT
 4. 開発者の IAM に ECS / EC2 の読み取りと `ssm:StartSession`（対象を dev クラスターのタスク ARN に限定）。Secrets Manager / SSM Parameter / KMS の権限は **不要**（env は agent が渡す）。`ecs:ExecuteCommand` も不要（ポートフォワードは StartSession を直接呼ぶ）
-5. 開発者のラップトップに `brew install kyosu-1/tetherd/tetherd && sudo brew services start tetherd`
+5. 開発者のラップトップに `brew install kyosu-1/tetherd/tetherd && sudo tetherd-helper install`
 
 ALB にルールを足す必要はない（agent が L7 で振り分ける）。本番のタスク定義には agent 自体を入れない。agent 側に AWS 権限は要らず、Linux capability は env 読み取りのための SYS_PTRACE のみ。インターネットに出られない VPC では agent イメージを ECR pull-through cache 経由で取る。`deploy/dev-env/`（Terraform）がこの手順の実例。
 
