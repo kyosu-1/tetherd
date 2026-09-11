@@ -176,6 +176,11 @@ tetherd run [flags] -- <command...>
   -s, --service    対象サービス（複数サービスのリポジトリ用）
       --as NAME    X-Dev-User の値を上書き（他人の代わりにデバッグ）
       --task ID    タスクを明示（既定は RUNNING な全タスク）
+      --profile / --region   AWS プロファイルとリージョン
+      --cluster / --service  対象の ECS サービス（v0.2b で .tetherd.yml から）
+      --env NAME   agent の TETHERD_ENV と照合（既定 dev）
+      --no-env     タスクの env を注入しない
+      --transport  ssm（既定）| direct（ローカル e2e 用）
       --local-port N
       --no-incoming / --no-network / --no-env
   -q, --quiet

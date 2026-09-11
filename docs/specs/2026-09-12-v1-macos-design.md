@@ -503,7 +503,7 @@ design.md §10 に加えて:
 | 2 | `DIOCNATLOOK`（84 バイト、`0xC0544417`）が元の宛先を正しく返した |
 | 3 | `DIOCCHANGERULE` は不要。既定 `/etc/pf.conf` の `com.apple/*` に子アンカー `com.apple/900.tetherd` で乗り、セッションごとの `pfctl -E`/`-X` と `-F rules/nat/Tables` で終了後のアンカーは空 |
 | 4 | 未検証（`remote_domains` を使う v0.2 で） |
-| 5, 6 | 未検証（AWS。v0.2） |
+| 5, 6 | v0.2a の docs/e2e-aws.md で検証（結果は実行後に追記） |
 
 ---
 
