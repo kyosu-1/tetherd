@@ -2,7 +2,11 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"io"
+	"net"
+	"net/netip"
 	"strings"
 	"testing"
 )
@@ -20,7 +24,7 @@ func TestParseRemoteCIDRs(t *testing.T) {
 	}
 }
 
-func TestRunCommandParsesFlagsAndCommand(t *testing.T) {
+func TestRunCommandDirectFlags(t *testing.T) {
 	var captured RunOptions
 	runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
 	t.Cleanup(func() { runFn = defaultRun })
@@ -39,6 +43,48 @@ func TestRunCommandParsesFlagsAndCommand(t *testing.T) {
 	}
 	if len(captured.Command) != 3 || captured.Command[0] != "curl" {
 		t.Fatalf("command = %v", captured.Command)
+	}
+}
+
+func TestRunCommandParsesFlagsAndCommand(t *testing.T) {
+	var captured RunOptions
+	runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+	t.Cleanup(func() { runFn = defaultRun })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"run", "--profile", "personal", "--region", "ap-northeast-1", "--cluster", "tetherd-dev", "--service", "api",
+		"--env", "dev", "--remote-cidr", "10.1.0.0/16", "--user", "shota", "--no-env",
+		"--", "psql", "-h", "db"})
+	var stderr bytes.Buffer
+	root.SetErr(&stderr)
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if captured.Transport != "ssm" || captured.Profile != "personal" || captured.Cluster != "tetherd-dev" || captured.Service != "api" || captured.TargetEnv != "dev" || !captured.NoEnv {
+		t.Fatalf("opts = %+v", captured)
+	}
+	if len(captured.RemoteCIDRs) != 1 || captured.RemoteCIDRs[0] != "10.1.0.0/16" || len(captured.Command) != 3 || captured.Command[0] != "psql" {
+		t.Fatalf("opts = %+v", captured)
+	}
+}
+
+func TestLocalOverlaps(t *testing.T) {
+	cidrs := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16"), netip.MustParsePrefix("169.254.170.0/24")}
+	addrs := []net.Addr{
+		&net.IPNet{IP: net.ParseIP("10.0.5.7"), Mask: net.CIDRMask(24, 32)},
+		&net.IPNet{IP: net.ParseIP("192.168.1.20"), Mask: net.CIDRMask(24, 32)},
+		&net.IPNet{IP: net.ParseIP("fe80::1"), Mask: net.CIDRMask(64, 128)},
+	}
+	got := LocalOverlaps(cidrs, addrs)
+	if len(got) != 1 || !strings.Contains(got[0], "10.0.0.0/16") || !strings.Contains(got[0], "10.0.5.7") {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestRunSSMRequiresClusterAndService(t *testing.T) {
+	code, err := Run(context.Background(), RunOptions{Transport: "ssm", Command: []string{"true"}}, io.Discard)
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "--cluster") {
+		t.Fatalf("code %d err %v", code, err)
 	}
 }
 
