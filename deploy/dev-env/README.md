@@ -5,8 +5,17 @@ tetherd の検証用 dev 環境。design.md §9 の「インフラ側の変更�
 
 ## 立てる
 
+state は S3 バケット `tetherd-tfstate-738925651667`（`versions.tf` の backend）。バケットは一度だけ手で作る:
+
+```
+aws s3api create-bucket --profile personal --region ap-northeast-1 --bucket tetherd-tfstate-738925651667 --create-bucket-configuration LocationConstraint=ap-northeast-1
+aws s3api put-bucket-versioning --profile personal --bucket tetherd-tfstate-738925651667 --versioning-configuration Status=Enabled
+aws s3api put-public-access-block --profile personal --bucket tetherd-tfstate-738925651667 --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+```
+
 ```
 aws login --profile personal                  # セッションが切れていたら
+eval "$(aws configure export-credentials --profile personal --format env)"   # S3 backend 用（aws login のセッションを backend は読めない）
 cd deploy/dev-env
 terraform init
 terraform apply                               # 10〜15 分（RDS）
