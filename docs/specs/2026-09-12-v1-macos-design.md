@@ -405,7 +405,7 @@ Go の HTTP サーバー。`/healthz`、`/`（hostname と `TETHERD_ENV`）、`/
 
 1. **ユニット**（CI）: pf ルール生成、env 合成、設定、ヘッダー一致、`/proc` 走査（fixture）、helper プロトコル
 2. **AWS なし・root なしの結合**（CI）: agent + CLI を `direct` で接続し、steal / dial / resolve / ping 断の復帰 / 二重接続拒否。environ 読み取りは Linux コンテナで `--pid` 共有して実機検証
-3. **AWS なし・root ありの macOS e2e**（`hack/e2e-local.sh`）: `docker compose` で agent + postgres + sampleapp を Mac から直接届かない Docker ネットワーク（`172.20.0.0/16`）に立て、agent の `:9900` だけ公開。`tetherd run --transport direct --agent-addr 127.0.0.1:9900 --remote-cidr 172.20.0.0/16 -- psql -h 172.20.0.10` が通れば pf / gid / rdr / natlook / yamux / dial が本物で検証できる。bash / zsh / Go / Node の子プロセスからそれぞれ確認する
+3. **AWS なし・root ありの macOS e2e**（`hack/e2e-local.sh`）: `docker compose` で agent + postgres + sampleapp を Mac から直接届かない Docker ネットワーク（`192.0.2.0/24`）に立て、agent の `:9900` だけ公開。`tetherd run --transport direct --agent-addr 127.0.0.1:9900 --remote-cidr 192.0.2.0/24 -- psql -h 192.0.2.10` が通れば pf / gid / rdr / natlook / yamux / dial が本物で検証できる。bash / zsh / Go / Node の子プロセスからそれぞれ確認する
 4. **AWS e2e**（手動チェックリスト）: RDS へ psql、`/whoami` がタスクロール、ALB 経由の steal（ヘッダーあり → ローカル、なし → タスク）、フォールバック、`desired_count = 2` での取りこぼしゼロ、`force-new-deployment` 中の再接続、Cloud Map 名の解決
 
 CI: Linux で 1・2 + lint、macOS runner で build + 1。GoReleaser snapshot を PR で回す。

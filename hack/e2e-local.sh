@@ -6,9 +6,9 @@ cd "$(dirname "$0")/.."
 
 SOCK=/tmp/tetherd-e2e.sock
 AGENT=127.0.0.1:9900
-URL=http://172.20.0.11:8081/
+URL=http://192.0.2.11:8081/
 EXEC=/usr/local/libexec/tetherd/tetherd-exec
-RUN=(./bin/tetherd run --transport direct --agent-addr "$AGENT" --remote-cidr 172.20.0.0/16
+RUN=(./bin/tetherd run --transport direct --agent-addr "$AGENT" --remote-cidr 192.0.2.0/24
      --helper-socket "$SOCK" --exec-path "$EXEC" --user e2e --)
 
 pass=0; fail=0
@@ -42,17 +42,17 @@ for _ in $(seq 1 50); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
 
 echo "== checks"
 if curl -s --max-time 2 "$URL" >/dev/null 2>&1; then
-  echo "  ! $URL is reachable without tetherd on this Docker; relying on 'from 172.20.0.10' checks"
+  echo "  ! $URL is reachable without tetherd on this Docker; relying on 'from 192.0.2.10' checks"
 fi
-check "curl via agent"        "from 172.20.0.10" "${RUN[@]}" curl -s --max-time 5 "$URL"
-check "bash child inherits"   "from 172.20.0.10" "${RUN[@]}" bash -c "curl -s --max-time 5 $URL"
-check "zsh child inherits"    "from 172.20.0.10" "${RUN[@]}" zsh -c "curl -s --max-time 5 $URL"
-check "go child (go run)"     "from 172.20.0.10" "${RUN[@]}" go run ./hack/e2echeck "$URL"
+check "curl via agent"        "from 192.0.2.10" "${RUN[@]}" curl -s --max-time 5 "$URL"
+check "bash child inherits"   "from 192.0.2.10" "${RUN[@]}" bash -c "curl -s --max-time 5 $URL"
+check "zsh child inherits"    "from 192.0.2.10" "${RUN[@]}" zsh -c "curl -s --max-time 5 $URL"
+check "go child (go run)"     "from 192.0.2.10" "${RUN[@]}" go run ./hack/e2echeck "$URL"
 if command -v node >/dev/null; then
-  check "node child" "from 172.20.0.10" "${RUN[@]}" node -e "fetch('$URL').then(r=>r.text()).then(t=>process.stdout.write(t))"
+  check "node child" "from 192.0.2.10" "${RUN[@]}" node -e "fetch('$URL').then(r=>r.text()).then(t=>process.stdout.write(t))"
 fi
 if command -v psql >/dev/null; then
-  check "psql to postgres" "1 row" "${RUN[@]}" psql "postgres://postgres:tetherd@172.20.0.12/postgres" -c 'select 1'
+  check "psql to postgres" "1 row" "${RUN[@]}" psql "postgres://postgres:tetherd@192.0.2.12/postgres" -c 'select 1'
 fi
 rc=0; "${RUN[@]}" sh -c 'exit 7' || rc=$?
 if [[ $rc -eq 7 ]]; then echo "  ✓ exit code propagates"; pass=$((pass+1)); else echo "  ✗ exit code propagates (rc=$rc)"; fail=$((fail+1)); fi

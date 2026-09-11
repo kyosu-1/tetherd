@@ -591,7 +591,7 @@ tetherd は「Kubernetes を使わないサーバーレスコンテナのため�
 
 | | 内容 |
 |---|---|
-| v0.1 | ローカル e2e。helper + `tetherd-exec` + pf rdr + natlook + yamux + agent の `dial` を Docker ネットワーク相手に通す（§15 の 1〜3）。`psql -h 172.20.0.10` がコード変更なしで通る |
+| v0.1 | ローカル e2e。helper + `tetherd-exec` + pf rdr + natlook + yamux + agent の `dial` を Docker ネットワーク相手に通す（§15 の 1〜3）。`psql -h 192.0.2.10` がコード変更なしで通る |
 | v0.2 | `deploy/dev-env`（Terraform）と agent の environ 読み取り、SSM トランスポート、env 注入、DNS、タスクロール確認（§15 の 4〜6）。`tetherd run -- psql -h <rds>` が通る |
 | v0.3 | steal（agent の L7 プロキシ、トークン、フォールバック）、全タスク接続と deploy 追従、`status` / `doctor` |
 | v0.4 | Homebrew tap、LaunchDaemon、GoReleaser、README。チームに配れる |
