@@ -2,7 +2,7 @@ BIN := bin
 PKGS := ./...
 LDFLAGS := -X github.com/kyosu-1/tetherd/internal/version.Version=$(shell git describe --tags --always --dirty)
 
-.PHONY: build test lint clean
+.PHONY: build test lint clean e2e-local
 
 build:
 	mkdir -p $(BIN)
@@ -19,3 +19,6 @@ lint:
 
 clean:
 	rm -rf $(BIN)
+
+e2e-local: build
+	bash hack/e2e-local.sh

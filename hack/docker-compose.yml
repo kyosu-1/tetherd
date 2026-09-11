@@ -1,0 +1,24 @@
+# Local e2e: everything lives on 172.20.0.0/16, which the Mac cannot reach
+# directly (Docker Desktop). Only the agent's control port is published.
+name: tetherd-e2e
+services:
+  agent:
+    build: { context: .., dockerfile: deploy/docker/agent.Dockerfile }
+    environment:
+      TETHERD_ENV: dev
+      TETHERD_CONTROL: 0.0.0.0:9900   # published below; in ECS this stays 127.0.0.1
+      TETHERD_TASK_ARN: local-e2e
+    ports: ["127.0.0.1:9900:9900"]
+    networks: { tethernet: { ipv4_address: 172.20.0.10 } }
+  sampleapp:
+    build: { context: .., dockerfile: deploy/docker/sampleapp.Dockerfile }
+    environment: { TETHERD_ENV: dev }
+    networks: { tethernet: { ipv4_address: 172.20.0.11 } }
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_PASSWORD: tetherd }
+    networks: { tethernet: { ipv4_address: 172.20.0.12 } }
+networks:
+  tethernet:
+    driver: bridge
+    ipam: { config: [{ subnet: 172.20.0.0/16 }] }
