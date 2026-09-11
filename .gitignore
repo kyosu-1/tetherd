@@ -18,3 +18,7 @@ coverage.*
 .DS_Store
 .idea/
 *.swp
+
+# Claude Code worktrees
+.claude/worktrees/
+.superpowers/
