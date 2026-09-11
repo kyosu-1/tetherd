@@ -1,8 +1,10 @@
 # Binaries
 /bin/
 /dist/
-tetherd
-tetherd-agent
+/tetherd
+/tetherd-agent
+/tetherd-helper
+/tetherd-exec
 
 # Go
 *.test
