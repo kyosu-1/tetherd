@@ -2742,7 +2742,7 @@ func TestCheckHelper(t *testing.T) {
 
 func TestCheckExecSetgid(t *testing.T) {
 	const g = 309
-	if r := CheckExecSetgid("/usr/local/libexec/tetherd/tetherd-exec", 0o2755|fs.ModeSetgid, g, g, true, nil); r.Status != OK {
+	if r := CheckExecSetgid("/usr/local/libexec/tetherd/tetherd-exec", 0o755|fs.ModeSetgid, g, g, true, nil); r.Status != OK {
 		t.Errorf("a 2755 root:tetherd binary is fine: %+v", r)
 	}
 	// The whole capture depends on the setgid bit: without it the child runs
@@ -2751,7 +2751,7 @@ func TestCheckExecSetgid(t *testing.T) {
 	if r.Status != Fail || !strings.Contains(r.Detail, "setgid") {
 		t.Errorf("got %+v", r)
 	}
-	if r := CheckExecSetgid("/x", 0o2755|fs.ModeSetgid, 20, g, true, nil); r.Status != Fail {
+	if r := CheckExecSetgid("/x", 0o755|fs.ModeSetgid, 20, g, true, nil); r.Status != Fail {
 		t.Errorf("the wrong group must fail: %+v", r)
 	}
 	if r := CheckExecSetgid("/x", 0, 0, 0, false, nil); r.Status != Fail || !strings.Contains(r.Detail, "group") {
