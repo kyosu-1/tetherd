@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -12,9 +13,161 @@ import (
 	"github.com/kyosu-1/tetherd/internal/session"
 )
 
+// nopOpener stands in for a CLI's stream opener. It fails rather than
+// returning a nil net.Conn with a nil error: a test that actually tries to
+// open a stream should see an error it can report, not a nil connection
+// that panics three frames later.
 type nopOpener struct{}
 
-func (nopOpener) OpenStream() (net.Conn, error) { return nil, nil }
+func (nopOpener) OpenStream() (net.Conn, error) {
+	return nil, errors.New("nopOpener: this test session has no stream")
+}
+
+// TestASessionNeverPrintsItsToken is the containment invariant, measured.
+// Unexported fields keep encoding/json out but not fmt, which reads them by
+// reflection: %+v on a *Session would otherwise put a plaintext token into
+// the agent's stdout, which is CloudWatch, which colleagues can read - and
+// the token is the only thing between the public ALB and a laptop. The
+// natural log line in the proxy is p.Logf("... %v", s).
+func TestASessionNeverPrintsItsToken(t *testing.T) {
+	a := New(Config{Env: "dev"}, nil)
+	h := proto.Hello{Version: proto.Version, User: "shota", Token: "s3cret-token",
+		Incoming: proto.Incoming{Enabled: true, Header: "X-Dev-User", TokenHeader: "X-Dev-Token"}}
+	if e := a.register(h, "10.0.0.1:5000", nopOpener{}); e != nil {
+		t.Fatal(e)
+	}
+	s := a.Match(hdr(map[string]string{"X-Dev-User": "shota", "X-Dev-Token": "s3cret-token"}))
+	if s == nil {
+		t.Fatal("the registered session must be matchable")
+	}
+	subjects := map[string]any{
+		"Session":    *s,
+		"*Session":   s,
+		"[]*Session": []*Session{s},
+	}
+	for _, verb := range []string{"%v", "%s", "%+v", "%#v"} {
+		for shape, arg := range subjects {
+			out := fmt.Sprintf(verb, arg)
+			if strings.Contains(out, "s3cret-token") {
+				t.Errorf("%s of %s discloses the token: %s", verb, shape, out)
+			}
+			// A redacted rendering is only useful if it still names the
+			// session, otherwise the next person prints the struct fields
+			// by hand to get something readable.
+			if !strings.Contains(out, "shota") {
+				t.Errorf("%s of %s says nothing about the session: %s", verb, shape, out)
+			}
+		}
+	}
+}
+
+// TestMatchRequestSuppliesACaseInsensitiveLookup covers the entry point the
+// proxy uses. MatchRequest exists so that no caller picks the lookup: a
+// direct r.Header[name] index works for canonically spelled configured
+// names and silently stops matching a lowercase incoming.match.header,
+// which internal/config accepts verbatim, and the failure would first
+// appear on a real ALB as a request quietly served by the application.
+func TestMatchRequestSuppliesACaseInsensitiveLookup(t *testing.T) {
+	a := New(Config{Env: "dev"}, nil)
+	lowerCfg := proto.Hello{Version: proto.Version, User: "shota", Token: "tok-shota",
+		Incoming: proto.Incoming{Enabled: true, Header: "x-dev-user", TokenHeader: "x-dev-token"}}
+	if e := a.register(lowerCfg, "10.0.0.1:5000", nopOpener{}); e != nil {
+		t.Fatal(e)
+	}
+	canonicalWire := parseRequest(t, "GET /orders HTTP/1.1\r\nHost: dev.example.com\r\nX-Dev-User: shota\r\nX-Dev-Token: tok-shota\r\n\r\n")
+	if got := a.MatchRequest(canonicalWire); got == nil {
+		t.Error("a lowercase configured header name must match what the wire canonicalises to")
+	}
+	lowerWire := parseRequest(t, "GET /orders HTTP/1.1\r\nHost: dev.example.com\r\nx-dev-user: shota\r\nx-dev-token: tok-shota\r\n\r\n")
+	if got := a.MatchRequest(lowerWire); got == nil {
+		t.Error("a lowercase header on the wire must match too")
+	}
+	// And the security property survives the convenience wrapper.
+	wrongToken := parseRequest(t, "GET /orders HTTP/1.1\r\nHost: dev.example.com\r\nX-Dev-User: shota\r\nX-Dev-Token: guess\r\n\r\n")
+	if got := a.MatchRequest(wrongToken); got != nil {
+		t.Errorf("a wrong token must not steal through MatchRequest: %v", got)
+	}
+	health := parseRequest(t, "GET /healthz HTTP/1.1\r\nHost: 10.0.1.23:8080\r\nUser-Agent: ELB-HealthChecker/2.0\r\n\r\n")
+	if got := a.MatchRequest(health); got != nil {
+		t.Errorf("a health check must not steal through MatchRequest: %v", got)
+	}
+}
+
+// TestRegisterWarnsWhenIncomingCannotWork covers the silent misconfiguration:
+// incoming.match has no defaults, so a developer can attach successfully,
+// see an "attached" line, and have every request go to the application with
+// nothing naming the cause.
+func TestRegisterWarnsWhenIncomingCannotWork(t *testing.T) {
+	full := proto.Incoming{Enabled: true, Header: "X-Dev-User", TokenHeader: "X-Dev-Token"}
+	cases := []struct {
+		name  string
+		hello proto.Hello
+		warn  string
+	}{
+		{"no token", proto.Hello{User: "shota", Incoming: full}, "no token"},
+		{"no header", proto.Hello{User: "shota", Token: "tok-shota",
+			Incoming: proto.Incoming{Enabled: true, TokenHeader: "X-Dev-Token"}}, "incoming.match.header is empty"},
+		{"no token header", proto.Hello{User: "shota", Token: "tok-shota",
+			Incoming: proto.Incoming{Enabled: true, Header: "X-Dev-User"}}, "incoming.match.token_header is empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var lines strings.Builder
+			a := New(Config{Env: "dev"}, func(f string, args ...any) { lines.WriteString(fmt.Sprintf(f, args...) + "\n") })
+			if e := a.register(tc.hello, "10.0.0.1:5000", nopOpener{}); e != nil {
+				t.Fatal(e)
+			}
+			got := lines.String()
+			if !strings.Contains(got, tc.warn) || !strings.Contains(got, "shota") {
+				t.Errorf("want a warning naming %q and the user, got:\n%s", tc.warn, got)
+			}
+			if strings.Contains(got, "tok-shota") {
+				t.Errorf("the warning must not carry the token:\n%s", got)
+			}
+		})
+	}
+	// A usable session says nothing, and a disabled one says nothing even
+	// though it has no token: --no-incoming is a choice, not a mistake.
+	for _, h := range []proto.Hello{
+		{User: "shota", Token: "tok-shota", Incoming: full},
+		{User: "shota", Incoming: proto.Incoming{Enabled: false}},
+	} {
+		var lines strings.Builder
+		a := New(Config{Env: "dev"}, func(f string, args ...any) { lines.WriteString(fmt.Sprintf(f, args...) + "\n") })
+		if e := a.register(h, "10.0.0.1:5000", nopOpener{}); e != nil {
+			t.Fatal(e)
+		}
+		if strings.Contains(lines.String(), "cannot receive incoming requests") {
+			t.Errorf("hello %+v must not be warned about:\n%s", h.Incoming, lines.String())
+		}
+	}
+}
+
+// TestSessionsAreSortedByUser pins the order, which others() turns into
+// Welcome.Others: unsorted, the welcome a developer sees would differ from
+// one attach to the next for no reason.
+func TestSessionsAreSortedByUser(t *testing.T) {
+	a := New(Config{Env: "dev"}, nil)
+	in := []string{"yuki", "taro", "shota", "rin", "mei", "ken", "hanako", "akira"}
+	for _, u := range in {
+		h := proto.Hello{Version: proto.Version, User: u, Token: "tok-" + u,
+			Incoming: proto.Incoming{Enabled: true, Header: "X-Dev-User", TokenHeader: "X-Dev-Token"}}
+		if e := a.register(h, "10.0.0.1:5000", nopOpener{}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	want := []string{"akira", "hanako", "ken", "mei", "rin", "shota", "taro", "yuki"}
+	var got []string
+	for _, s := range a.Sessions() {
+		got = append(got, s.User)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("Sessions() = %v, want %v", got, want)
+	}
+	if others := a.others("shota"); len(others) != len(want)-1 || others[0] != "akira" {
+		t.Errorf("others(\"shota\") = %v", others)
+	}
+}
 
 func TestRegisterKeepsTheTokenOutOfTheVisibleView(t *testing.T) {
 	a := New(Config{Env: "dev"}, nil)

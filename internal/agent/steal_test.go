@@ -2,6 +2,9 @@ package agent
 
 import (
 	"bufio"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"os"
 	"strings"
@@ -10,16 +13,29 @@ import (
 	"github.com/kyosu-1/tetherd/internal/proto"
 )
 
-func sess(user, token string, enabled bool) *Session {
+func sess(user, tok string, enabled bool) *Session {
 	return &Session{
 		User:     user,
-		token:    token,
+		token:    tok,
+		open:     nopOpener{},
 		Incoming: proto.Incoming{Enabled: enabled, Header: "X-Dev-User", TokenHeader: "X-Dev-Token"},
 	}
 }
 
 func hdr(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
+}
+
+// parseRequest returns a request read off the wire, so that tests see the
+// header names as net/http actually presents them rather than as a map
+// literal spells them.
+func parseRequest(t *testing.T, raw string) *http.Request {
+	t.Helper()
+	r, err := http.ReadRequest(bufio.NewReader(strings.NewReader(raw)))
+	if err != nil {
+		t.Fatalf("parsing the request: %v", err)
+	}
+	return r
 }
 
 // requestLookup builds the lookup the real proxy hands MatchSession:
@@ -31,11 +47,7 @@ func hdr(m map[string]string) func(string) string {
 // these tests and then fail on the ALB.
 func requestLookup(t *testing.T, raw string) func(string) string {
 	t.Helper()
-	r, err := http.ReadRequest(bufio.NewReader(strings.NewReader(raw)))
-	if err != nil {
-		t.Fatalf("parsing the request: %v", err)
-	}
-	return r.Header.Get
+	return parseRequest(t, raw).Header.Get
 }
 
 func TestMatchSessionNeedsBothUserAndToken(t *testing.T) {
@@ -64,6 +76,55 @@ func TestMatchSessionNeedsBothUserAndToken(t *testing.T) {
 	// installed and not configured, not a match.
 	if got := MatchSession(all, hdr(map[string]string{"X-Dev-User": "", "X-Dev-Token": ""})); got != nil {
 		t.Errorf("empty headers must not steal: %v", got)
+	}
+}
+
+// TestMatchSessionRejectsAPrefixOrExtensionOfTheToken pins the length half
+// of the comparison. A regression that compares only as far as the shorter
+// string pays an attacker who learns a prefix: they would then steal with
+// <prefix> plus anything.
+func TestMatchSessionRejectsAPrefixOrExtensionOfTheToken(t *testing.T) {
+	s := sess("shota", "tok-shota", true)
+	for _, presented := range []string{"tok-shotaX", "tok-shota ", "tok-sho", "tok", "", "tok-shotatok-shota"} {
+		if got := MatchSession([]*Session{s}, hdr(map[string]string{"X-Dev-User": "shota", "X-Dev-Token": presented})); got != nil {
+			t.Errorf("token %q must not match %q: %v", presented, "tok-shota", got)
+		}
+	}
+}
+
+// TestMatchSessionIsCaseSensitiveAboutTheUserName keeps the name comparison
+// exact. Folding it is not a hole by itself - the token is still required -
+// but "Shota" and "shota" are two distinct registry keys, so a folding
+// match would make routing between two legitimately attached sessions
+// depend on map iteration order.
+func TestMatchSessionIsCaseSensitiveAboutTheUserName(t *testing.T) {
+	s := sess("shota", "tok-shota", true)
+	for _, name := range []string{"Shota", "SHOTA", "sHoTa"} {
+		if got := MatchSession([]*Session{s}, hdr(map[string]string{"X-Dev-User": name, "X-Dev-Token": "tok-shota"})); got != nil {
+			t.Errorf("user %q must not match session %q: %v", name, s.User, got)
+		}
+	}
+	// Same over the wire, where only the header *name* is canonicalised.
+	wire := requestLookup(t, "GET / HTTP/1.1\r\nHost: dev.example.com\r\nX-Dev-User: Shota\r\nX-Dev-Token: tok-shota\r\n\r\n")
+	if got := MatchSession([]*Session{s}, wire); got != nil {
+		t.Errorf("a differently cased user name must not match on the wire: %v", got)
+	}
+}
+
+// TestMatchSessionSkipsASessionWithNoOpener covers the session the proxy
+// could not serve anyway: without an Opener there is no stream to push the
+// request down, so claiming the request would turn into a nil-interface
+// panic on the ALB path instead of a quiet fallback to the application.
+func TestMatchSessionSkipsASessionWithNoOpener(t *testing.T) {
+	s := sess("shota", "tok-shota", true)
+	s.open = nil
+	if got := MatchSession([]*Session{s}, hdr(map[string]string{"X-Dev-User": "shota", "X-Dev-Token": "tok-shota"})); got != nil {
+		t.Errorf("a session with no opener cannot be served and must not match: %v", got)
+	}
+	// It must not shadow a session that can be served either.
+	ok := sess("shota", "tok-shota", true)
+	if got := MatchSession([]*Session{s, ok}, hdr(map[string]string{"X-Dev-User": "shota", "X-Dev-Token": "tok-shota"})); got != ok {
+		t.Errorf("an openerless session must not shadow a serviceable one: %v", got)
 	}
 }
 
@@ -167,21 +228,182 @@ func TestMatchSessionOverARealRequest(t *testing.T) {
 	}
 }
 
-// TestTokenComparisonIsConstantTime guards the one property of this file
-// that no amount of behavioural testing can observe: an equal/unequal
-// answer is identical whether it came from subtle.ConstantTimeCompare or
-// from ==, so the difference is only visible in the source. The token is
-// the only thing between a public ALB and a developer's laptop, and a
-// byte-by-byte comparison leaks its prefix to anyone who can time the ALB.
-func TestTokenComparisonIsConstantTime(t *testing.T) {
-	src, err := os.ReadFile("steal.go")
+// TestTheTokenIsOnlyEverComparedInConstantTime guards the one property of
+// this package that no behavioural test can observe: == and
+// subtle.ConstantTimeCompare return the same answers, so the difference
+// lives in the source and only a structural check can see it.
+//
+// It reads the package directory rather than a named file, so moving the
+// comparison to another file neither passes nor fails it for the wrong
+// reason, and it asserts a rule instead of a spelling: every syntactic
+// reference to a session's token field must be an argument to tokenEqual
+// (or to len, which leaks nothing), and tokenEqual itself must compare with
+// crypto/subtle and nothing else.
+func TestTheTokenIsOnlyEverComparedInConstantTime(t *testing.T) {
+	fset, files := productionFiles(t)
+
+	allowed := map[token.Pos]bool{}  // may see the token at all
+	compared := map[token.Pos]bool{} // actually compares it, in constant time
+	var refs []token.Pos
+	tokenEqualSeen := false
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.CallExpr:
+				maySee, comparison := calleeAllowsTheToken(x.Fun)
+				if maySee {
+					for _, arg := range x.Args {
+						if pos, ok := tokenFieldPos(arg); ok {
+							allowed[pos] = true
+							if comparison {
+								compared[pos] = true
+							}
+						}
+					}
+				}
+			case *ast.SelectorExpr:
+				if x.Sel.Name == "token" {
+					refs = append(refs, x.Pos())
+				}
+			case *ast.FuncDecl:
+				if x.Name.Name == "tokenEqual" {
+					tokenEqualSeen = true
+					checkConstantTimeHelper(t, fset, x)
+				}
+			}
+			return true
+		})
+	}
+
+	if !tokenEqualSeen {
+		t.Fatal("no tokenEqual helper: the token comparison must live in one constant-time function")
+	}
+	if len(refs) == 0 {
+		t.Fatal("no reference to a session's token field was found; this test has stopped checking anything")
+	}
+	comparisons := 0
+	for _, pos := range refs {
+		if !allowed[pos] {
+			t.Errorf("%s: the token field is used outside a constant-time comparison "+
+				"(it may only be an argument to tokenEqual or len)", fset.Position(pos))
+			continue
+		}
+		if compared[pos] {
+			comparisons++
+		}
+	}
+	if comparisons == 0 {
+		t.Error("the token field is never passed to tokenEqual; nothing compares it in constant time")
+	}
+}
+
+// productionFiles parses every non-test file of this package.
+func productionFiles(t *testing.T) (*token.FileSet, []*ast.File) {
+	t.Helper()
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(src), "subtle.ConstantTimeCompare") {
-		t.Error("the token comparison must use crypto/subtle.ConstantTimeCompare")
+	var files []*ast.File
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, f)
 	}
-	if strings.Contains(string(src), "got == s.token") || strings.Contains(string(src), "s.token == got") {
-		t.Error("the token must not be compared with ==")
+	if len(files) < 2 {
+		t.Fatalf("parsed %d files: the package directory was not read", len(files))
+	}
+	return fset, files
+}
+
+// calleeAllowsTheToken reports whether a call may be handed the token
+// field, and whether that call is a comparison of it. The constant-time
+// helper and crypto/subtle compare it; len only sees its length, which is
+// how the "no empty token" guard is written and leaks nothing.
+func calleeAllowsTheToken(fun ast.Expr) (maySee, comparison bool) {
+	switch f := fun.(type) {
+	case *ast.Ident:
+		if f.Name == "tokenEqual" {
+			return true, true
+		}
+		return f.Name == "len", false
+	case *ast.SelectorExpr:
+		if pkg, ok := f.X.(*ast.Ident); ok && pkg.Name == "subtle" {
+			return true, true
+		}
+	}
+	return false, false
+}
+
+// tokenFieldPos returns the position of a `x.token` selector, seeing
+// through a []byte(...) conversion.
+func tokenFieldPos(e ast.Expr) (token.Pos, bool) {
+	switch x := e.(type) {
+	case *ast.SelectorExpr:
+		if x.Sel.Name == "token" {
+			return x.Pos(), true
+		}
+	case *ast.CallExpr:
+		if _, isConversion := x.Fun.(*ast.ArrayType); isConversion && len(x.Args) == 1 {
+			return tokenFieldPos(x.Args[0])
+		}
+	}
+	return 0, false
+}
+
+// checkConstantTimeHelper asserts that the helper every token comparison
+// goes through compares with crypto/subtle and with nothing else - the
+// rule above is worth nothing if tokenEqual's own body says got == want.
+func checkConstantTimeHelper(t *testing.T, fset *token.FileSet, fn *ast.FuncDecl) {
+	t.Helper()
+	params := map[string]bool{}
+	for _, field := range fn.Type.Params.List {
+		for _, name := range field.Names {
+			params[name.Name] = true
+		}
+	}
+	constantTime := false
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.CallExpr:
+			sel, ok := x.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, ok := sel.X.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			if pkg.Name == "subtle" && sel.Sel.Name == "ConstantTimeCompare" {
+				constantTime = true
+			}
+			switch pkg.Name + "." + sel.Sel.Name {
+			case "bytes.Equal", "strings.Compare", "strings.EqualFold", "strings.Contains", "strings.HasPrefix", "strings.HasSuffix":
+				t.Errorf("%s: %s compares the token with %s.%s, which is not constant time",
+					fset.Position(x.Pos()), fn.Name.Name, pkg.Name, sel.Sel.Name)
+			}
+		case *ast.BinaryExpr:
+			if x.Op != token.EQL && x.Op != token.NEQ {
+				return true
+			}
+			for _, side := range []ast.Expr{x.X, x.Y} {
+				if id, ok := side.(*ast.Ident); ok && params[id.Name] {
+					t.Errorf("%s: %s compares %s with %s, which is not constant time",
+						fset.Position(x.Pos()), fn.Name.Name, id.Name, x.Op)
+				}
+			}
+		}
+		return true
+	})
+	if !constantTime {
+		t.Errorf("%s: %s must compare with crypto/subtle.ConstantTimeCompare",
+			fset.Position(fn.Pos()), fn.Name.Name)
 	}
 }
