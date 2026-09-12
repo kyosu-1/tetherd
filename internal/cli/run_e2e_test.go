@@ -2798,6 +2798,56 @@ func TestAttachGivesUpOnADuplicateUserRefusalWithAnActionableError(t *testing.T)
 	}
 }
 
+// TestAttachUsesTheDefaultBudgetWhenNothingInjectsOne pins the wiring,
+// which is a different claim from "the retry works". Production does the
+// opposite of what the two tests above do: run.go, env.go, status.go and
+// doctor.go each build a Deps that names no budget, so what those four get
+// is DefaultAttachRetryBudget - and nothing was reading it. Measured on
+// this branch: `const DefaultAttachRetryBudget = 0 * time.Second` compiled,
+// was gofmt-clean, and left `go test -race ./internal/cli/` green while
+// disabling the retry for every real command.
+func TestAttachUsesTheDefaultBudgetWhenNothingInjectsOne(t *testing.T) {
+	// The brief's two seconds, asserted in one place: long enough to cover
+	// the window the agent's unregister leaves open, short enough that a
+	// genuine conflict is still reported promptly.
+	if DefaultAttachRetryBudget != 2*time.Second {
+		t.Errorf("DefaultAttachRetryBudget = %s, want 2s", DefaultAttachRetryBudget)
+	}
+
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	attachAs(t, ag.addr, "tester") // held for the whole test: a genuine conflict
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 1 }, "the conflicting session to register")
+
+	tr := &countingTransport{addr: ag.addr}
+	task := transport.Task{ID: "t1", SubnetID: "subnet-a"}
+	p := &fakeProvider{region: "r", task: task, tr: tr}
+	// Deps{}.withDefaults() and nothing else - the Deps every command hands
+	// dialAgent. Naming a budget here is the one thing that would make this
+	// test unable to fail.
+	d := Deps{}.withDefaults()
+
+	start := time.Now()
+	o := <-backgroundAttach(context.Background(), stealingOpts("true"), d, p, task)
+	elapsed := time.Since(start)
+	if o.err == nil {
+		o.sess.Close()
+		t.Fatal("a second steal session for the same user must still be refused")
+	}
+	wantDuplicateUser(t, o.err)
+	if n := tr.dials(); n < 2 {
+		t.Errorf("dials = %d, want an attach that injected no budget to retry anyway", n)
+	}
+	// Against literals, not against the constant: `elapsed >=
+	// DefaultAttachRetryBudget` is satisfied by a constant of zero, which
+	// is the mutation this test exists to catch.
+	if elapsed < 1500*time.Millisecond {
+		t.Errorf("gave up after %s; with nothing injected the wait is the default two seconds", elapsed)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("waited %s, far longer than a refused developer should", elapsed)
+	}
+}
+
 // TestReadOnlyAttachIsNotRetried pins the scope of the retry. `tetherd
 // status` and `tetherd doctor` attach read-only, which the agent does not
 // register and so never refuses for being a second session; a refusal they
