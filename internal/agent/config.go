@@ -17,10 +17,32 @@ type Config struct {
 	// default - the ALB reaches the task over the VPC network.
 	Proxy string
 	// AppAddr is the application the proxy passes everything through to:
-	// TETHERD_APP_ADDR, default 127.0.0.1:8081. The app container listens
+	// TETHERD_APP_ADDR, default defaultAppAddr. The app container listens
 	// on 8081 and only the agent listens on 8080, which is the swap that
 	// puts the agent on the ALB's data path (spec §5.1).
 	AppAddr string
+}
+
+// defaultAppAddr is where the proxy passes requests through to when nothing
+// says otherwise. One constant for the two paths that must agree -
+// ConfigFromEnv and Config.withDefaults - because the copy that drifts is
+// the one no task definition mentions.
+const defaultAppAddr = "127.0.0.1:8081"
+
+// withDefaults fills in what a Config built by hand would otherwise hand on
+// empty. New applies it, so the paths that do not go through ConfigFromEnv
+// (tests today, an embedded agent later) get the documented behaviour.
+//
+// Only AppAddr, because it is the one that fails quietly: Control and Proxy
+// are listen addresses, so an empty one is a startup error naming the port
+// (see Run), while an empty AppAddr is a dial target the proxy carries
+// forward - every request through it then fails against an address nobody
+// typed, several layers away from the empty field that caused it.
+func (c Config) withDefaults() Config {
+	if c.AppAddr == "" {
+		c.AppAddr = defaultAppAddr
+	}
+	return c
 }
 
 // ConfigFromEnv builds Config from getenv (os.Getenv in main).
@@ -46,8 +68,8 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	if cfg.Proxy == "" {
 		cfg.Proxy = "0.0.0.0:8080"
 	}
-	if cfg.AppAddr == "" {
-		cfg.AppAddr = "127.0.0.1:8081"
-	}
-	return cfg, nil
+	// The last default comes from withDefaults rather than from a literal
+	// here, so that the environment path and New's cannot disagree about
+	// where the application is.
+	return cfg.withDefaults(), nil
 }

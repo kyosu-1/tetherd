@@ -28,7 +28,7 @@ func New(cfg Config, logf func(string, ...any)) *Agent {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	a := &Agent{cfg: cfg, logf: logf, sessions: map[string]*Session{}}
+	a := &Agent{cfg: cfg.withDefaults(), logf: logf, sessions: map[string]*Session{}}
 	if cfg.MetadataURL != "" {
 		a.env = &ProcEnvReader{MetadataURL: cfg.MetadataURL, ProcRoot: "/proc", AppContainer: cfg.AppContainer}
 	}

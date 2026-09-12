@@ -1529,6 +1529,40 @@ func TestRunRefusesToStartWithoutBothPorts(t *testing.T) {
 	}
 }
 
+// TestNewDefaultsAppAddrForAConfigBuiltByHand pins the app address outside
+// ConfigFromEnv. New takes a Config, and the paths that build one directly
+// - every test in this package, and an embedded agent later - used to hand
+// an empty AppAddr straight to the Proxy, where it is a dial target: every
+// request through the proxy then fails against an address nobody typed,
+// several layers away from the empty field that caused it.
+func TestNewDefaultsAppAddrForAConfigBuiltByHand(t *testing.T) {
+	byHand := New(Config{Env: "dev"}, nil)
+	if byHand.cfg.AppAddr == "" {
+		t.Fatal("New must not pass an empty AppAddr on to the proxy: an empty dial target fails obscurely at the first request")
+	}
+	// The same default as the environment path, from the same constant.
+	// Two copies drift, and the copy that drifts is the one no ECS task
+	// definition mentions; what the value *is* is pinned by
+	// TestConfigDefaultsForTheProxyAndTheApp below.
+	fromEnv, err := ConfigFromEnv(func(k string) string {
+		if k == "TETHERD_ENV" {
+			return "dev"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byHand.cfg.AppAddr != fromEnv.AppAddr {
+		t.Errorf("New defaults the app to %q and ConfigFromEnv to %q; there is one default", byHand.cfg.AppAddr, fromEnv.AppAddr)
+	}
+	// And an address the caller did give is still theirs - the tests in
+	// this file that point the proxy at their own listener depend on it.
+	if kept := New(Config{Env: "dev", AppAddr: "127.0.0.1:3000"}, nil); kept.cfg.AppAddr != "127.0.0.1:3000" {
+		t.Errorf("New overwrote the AppAddr it was given: %q", kept.cfg.AppAddr)
+	}
+}
+
 // TestConfigDefaultsForTheProxyAndTheApp pins the two addresses the ECS
 // task definition and the ALB target group depend on. Getting either wrong
 // is a task that comes up and serves nothing.
