@@ -83,7 +83,9 @@ type Deps struct {
 	// LookupGroup returns the gid of a local group and whether it exists,
 	// plus any failure of the lookup itself - "there is no tetherd group"
 	// and "the group database could not be asked" are different problems.
-	LookupGroup func(name string) (gid int, found bool, err error)
+	// It takes a context because the production implementation shells out
+	// to dscl, which a wedged opendirectoryd hangs indefinitely.
+	LookupGroup func(ctx context.Context, name string) (gid int, found bool, err error)
 	// StatFile returns a file's mode and owning gid. The mode is Go's, so
 	// the setgid bit survives in fs.ModeSetgid.
 	StatFile func(path string) (fs.FileMode, int, error)
@@ -108,7 +110,11 @@ func (d Deps) withDefaults() Deps {
 		}
 	}
 	if d.LookupGroup == nil {
-		d.LookupGroup = func(name string) (int, bool, error) { return helper.GroupGID(runCommand, name) }
+		d.LookupGroup = func(ctx context.Context, name string) (int, bool, error) {
+			return helper.GroupGID(func(cmd string, args ...string) (string, error) {
+				return runCommand(ctx, cmd, args...)
+			}, name)
+		}
 	}
 	if d.StatFile == nil {
 		d.StatFile = statGID
@@ -122,9 +128,13 @@ func (d Deps) withDefaults() Deps {
 	return d
 }
 
-// runCommand is what helper.GroupGID shells out with (dscl on macOS).
-func runCommand(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).Output()
+// runCommand is what helper.GroupGID shells out with (dscl on macOS). It is
+// context-aware because dscl talks to opendirectoryd, which can wedge - and
+// when it does, `id` and `dscl` hang with it. Without the context a hung
+// lookup would take the whole doctor report with it, printing nothing at
+// all, not even the rows that had already passed.
+func runCommand(ctx context.Context, name string, args ...string) (string, error) {
+	out, err := exec.CommandContext(ctx, name, args...).Output()
 	return string(out), err
 }
 

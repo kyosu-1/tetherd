@@ -207,6 +207,42 @@ func TestCheckPIDModeTellsUnreadableFromWrong(t *testing.T) {
 	}
 }
 
+func TestCheckAgentSession(t *testing.T) {
+	if r := CheckAgentSession("1", "dev", "dev", nil); r.Status != OK || !strings.Contains(r.Detail, "protocol 1") {
+		t.Errorf("a completed handshake is fine: %+v", r)
+	}
+	// A task ECS calls healthy can still hold an agent that never came up;
+	// the dial error is the only thing that says so, so it must survive.
+	r := CheckAgentSession("", "", "dev", errors.New("connect to agent: dial tcp 10.0.1.5:7000: connection refused"))
+	if r.Status != Fail || !strings.Contains(r.Detail, "connection refused") {
+		t.Errorf("got %+v", r)
+	}
+	if strings.Contains(r.Next, "Cloud Map") || strings.Contains(r.Next, "remote_domains") {
+		t.Errorf("an unreachable agent is not a DNS problem: %q", r.Next)
+	}
+	if !strings.Contains(r.Next, "tetherd-agent") {
+		t.Errorf("the next step must point at the sidecar: %q", r.Next)
+	}
+	// run refuses to attach across environments, so doctor must report the
+	// mismatch rather than leave it to be discovered by run.
+	m := CheckAgentSession("1", "prod", "dev", nil)
+	if m.Status != Fail || !strings.Contains(m.Detail, "prod") || !strings.Contains(m.Detail, "dev") {
+		t.Errorf("a TETHERD_ENV mismatch must fail and name both: %+v", m)
+	}
+	if !strings.Contains(m.Next, "--env") {
+		t.Errorf("the next step must name the flag that fixes it: %q", m.Next)
+	}
+	// The mismatch and the dial failure are different problems.
+	if m.Next == r.Next {
+		t.Errorf("both failures give the same advice: %q", m.Next)
+	}
+	// The protocol is reported, never compared: rejecting a version is the
+	// agent's job, and arrives as dialErr.
+	if odd := CheckAgentSession("7", "dev", "dev", nil); odd.Status != OK || !strings.Contains(odd.Detail, "7") {
+		t.Errorf("got %+v", odd)
+	}
+}
+
 func TestCheckOverlapAndRemoteCIDRs(t *testing.T) {
 	if r := CheckOverlap(nil); r.Status != OK {
 		t.Errorf("got %+v", r)
@@ -381,6 +417,8 @@ func TestEveryFailureNamesAnActionTheDeveloperCanTake(t *testing.T) {
 		{"task", CheckTask(transport.Task{}, errors.New("no attachable task")), "ECS Exec"},
 		{"pidMode unreadable", CheckPIDMode("", errors.New("AccessDenied")), "ecs:DescribeTaskDefinition"},
 		{"pidMode wrong", CheckPIDMode("host", nil), `"pidMode": "task"`},
+		{"agent unreachable", CheckAgentSession("", "", "dev", errors.New("connection refused")), "tetherd-agent"},
+		{"agent env mismatch", CheckAgentSession("1", "prod", "dev", nil), "--env"},
 		{"overlap", CheckOverlap([]string{"en0 10.0.3.14/24 overlaps 10.0.0.0/16"}), "local_cidrs"},
 		{"wide cidr", CheckRemoteCIDRs([]netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}), "remote_cidrs"},
 		{"domain", CheckDomains([]string{"x.internal"}, map[string]error{"x.internal": errors.New("NXDOMAIN")}), "remote_domains"},
@@ -407,6 +445,7 @@ func TestEveryFailureNamesAnActionTheDeveloperCanTake(t *testing.T) {
 		CheckIdentity("arn:aws:sts::1:assumed-role/dev/me", nil),
 		CheckTask(transport.Task{ID: "abc"}, nil),
 		CheckPIDMode("task", nil),
+		CheckAgentSession("1", "dev", "dev", nil),
 		CheckOverlap(nil),
 		CheckRemoteCIDRs([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}),
 		CheckDomains(nil, nil),
@@ -435,6 +474,7 @@ func TestCheckNamesAreStableAndDistinct(t *testing.T) {
 		"AWS identity":           CheckIdentity("arn", nil),
 		"attachable task":        CheckTask(transport.Task{ID: "abc"}, nil),
 		"pidMode":                CheckPIDMode("task", nil),
+		"agent session":          CheckAgentSession("1", "dev", "dev", nil),
 		"local addresses":        CheckOverlap(nil),
 		"remote CIDRs":           CheckRemoteCIDRs(nil),
 		"remote domains":         CheckDomains(nil, nil),

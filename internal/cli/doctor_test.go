@@ -27,15 +27,23 @@ type doctorRow struct {
 	mark   string
 	name   string
 	detail string
+	next   string
 }
 
-// parseDoctorRows reads the rows Render printed. Continuation lines (the
-// indented "→ next step") start with a space, so they are skipped.
+// parseDoctorRows reads the rows Render printed. A row line starts with its
+// mark; the indented "→ next step" continuation that may follow belongs to
+// the row above it.
 func parseDoctorRows(out string) []doctorRow {
 	var rows []doctorRow
 	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
 		mark, rest, ok := strings.Cut(line, " ")
-		if !ok || (mark != "✓" && mark != "!" && mark != "✗") {
+		if !ok {
+			continue
+		}
+		if mark != "✓" && mark != "!" && mark != "✗" {
+			if _, next, isNext := strings.Cut(line, "→ "); isNext && len(rows) > 0 {
+				rows[len(rows)-1].next = strings.TrimSpace(next)
+			}
 			continue
 		}
 		name, detail, _ := strings.Cut(rest, "  ")
@@ -72,6 +80,7 @@ var everyDoctorRow = []string{
 	"AWS identity",
 	"attachable task",
 	"pidMode",
+	"agent session",
 	"remote CIDRs",
 	"local addresses",
 	"remote domains",
@@ -135,13 +144,24 @@ func healthyProvider(agentAddr string) *fakeProvider {
 func healthyDoctorDeps(p *fakeProvider) Deps {
 	d := depsFor(p)
 	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
-	d.LookupGroup = func(string) (int, bool, error) { return 309, true, nil }
+	d.LookupGroup = func(context.Context, string) (int, bool, error) { return 309, true, nil }
 	d.StatFile = func(string) (fs.FileMode, int, error) { return 0o755 | fs.ModeSetgid, 309, nil }
 	d.LookPath = func(string) (string, error) { return "/opt/homebrew/bin/session-manager-plugin", nil }
 	d.InterfaceAddrs = func() ([]net.Addr, error) {
 		return []net.Addr{&net.IPNet{IP: net.ParseIP("192.168.1.20"), Mask: net.CIDRMask(24, 32)}}, nil
 	}
 	return d
+}
+
+// countSessions makes d record how many AWS sessions doctor opens, so a test
+// can pin that it opens exactly one: the identity row needs a session of its
+// own to attribute failures correctly, and that same session is handed to
+// discoverTask rather than letting it build a second.
+func countSessions(d *Deps, p *fakeProvider, sessions *int) {
+	d.NewAWSProvider = func(context.Context, RunOptions) (awsProvider, error) {
+		*sessions++
+		return p, nil
+	}
 }
 
 func doctorOpts() DoctorOptions {
@@ -159,6 +179,8 @@ func TestDoctorPrintsEveryRowAndExitsOnAFailure(t *testing.T) {
 	p := healthyProvider(ag.addr)
 	d := healthyDoctorDeps(p)
 	d.DialHelper = func(string) (HelperClient, error) { return nil, errNoHelperForTest }
+	sessions := 0
+	countSessions(&d, p, &sessions)
 
 	var out strings.Builder
 	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
@@ -176,10 +198,19 @@ func TestDoctorPrintsEveryRowAndExitsOnAFailure(t *testing.T) {
 		"AWS identity":           "✓",
 		"attachable task":        "✓",
 		"pidMode":                "✓",
+		"agent session":          "✓",
 		"remote CIDRs":           "✓",
 		"local addresses":        "✓",
 		"remote domains":         "✓",
 	})
+	if s := findRow(t, rows, "agent session").detail; !strings.Contains(s, "handshake ok") || !strings.Contains(s, "TETHERD_ENV=dev") {
+		t.Errorf("the agent session row must report the handshake it completed, got %q", s)
+	}
+	// One AWS session for the whole report: the identity row's session is
+	// the one discoverTask uses.
+	if sessions != 1 {
+		t.Errorf("doctor opened %d AWS sessions, want exactly 1", sessions)
+	}
 	if d := findRow(t, rows, "AWS identity").detail; d != "arn:aws:sts::1:assumed-role/dev/me" {
 		t.Errorf("the identity row must print who the caller is, got %q", d)
 	}
@@ -260,16 +291,23 @@ func TestDoctorKeepsCheckingWhenAWSIsUnreachable(t *testing.T) {
 		"setgid tetherd-exec":    "✓",
 		"session-manager-plugin": "✓",
 		// Failed, with the reason.
-		"AWS identity":    "✗",
-		"attachable task": "✗",
+		"AWS identity": "✗",
 		// Not checkable, and never reported as healthy.
+		"attachable task": "!",
 		"pidMode":         "!",
+		"agent session":   "!",
 		"remote CIDRs":    "!",
 		"local addresses": "!",
 		"remote domains":  "!",
 	})
 	if d := findRow(t, rows, "AWS identity").detail; !strings.Contains(d, "no valid credential sources") {
 		t.Errorf("the reason must survive to the identity row, got %q", d)
+	}
+	// The credentials are the problem and the identity row above says so
+	// with the action; the task row must not restate it as a failure whose
+	// fix is to go and edit the ECS service.
+	if r := findRow(t, rows, "attachable task"); strings.Contains(r.next, "ECS Exec") {
+		t.Errorf("a session failure must not be dressed up as a task problem: %q → %q", r.detail, r.next)
 	}
 	// A name the agent was never asked about must not be reported as
 	// resolving; CheckDomains can only tell those apart if doctor leaves
@@ -306,6 +344,146 @@ func TestDoctorBlamesTheRightRowWhenDiscoveryFails(t *testing.T) {
 	if d := findRow(t, rows, "attachable task").detail; !strings.Contains(d, "no RUNNING tasks") {
 		t.Errorf("the discovery reason must survive, got %q", d)
 	}
+	// A task ECS rejected *is* the case CheckTask's advice is written for.
+	if n := findRow(t, rows, "attachable task").next; !strings.Contains(n, "ECS Exec") {
+		t.Errorf("a real discovery failure must keep the ECS advice, got %q", n)
+	}
+}
+
+// TestDoctorBlamesTheRightRowWhenCredentialsExpire: LoadDefaultConfig
+// succeeds for a profile whose SSO token has expired and the failure only
+// appears when something actually calls AWS. That is the commonest AWS
+// failure there is, and it is exactly what the separate Identity call exists
+// to attribute: without it the report reads "✓ AWS identity" above an
+// ExpiredToken blamed on the ECS service.
+func TestDoctorBlamesTheRightRowWhenCredentialsExpire(t *testing.T) {
+	p := healthyProvider("127.0.0.1:1")
+	p.identity, p.identityErr = "", errors.New("operation error STS: GetCallerIdentity, ExpiredToken: the security token included in the request is expired")
+	p.discErr = errors.New("operation error ECS: ListTasks, ExpiredToken")
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, healthyDoctorDeps(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	rows := wantRowSet(t, out.String())
+	r := findRow(t, rows, "AWS identity")
+	if r.mark != "✗" || !strings.Contains(r.detail, "ExpiredToken") {
+		t.Fatalf("expired credentials must fail the identity row with the reason: %q %q", r.mark, r.detail)
+	}
+	if !strings.Contains(r.next, "aws sso login") {
+		t.Errorf("the next step must be to authenticate, got %q", r.next)
+	}
+}
+
+// TestDoctorReportsAnUnreadableTaskDefinition: a role without
+// ecs:DescribeTaskDefinition cannot be told to go and set pidMode on the
+// task definition - that is an IAM problem, and the two have different
+// fixes. The judgement already separates them; this pins that doctor hands
+// it the error instead of dropping it.
+func TestDoctorReportsAnUnreadableTaskDefinition(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	p := healthyProvider(ag.addr)
+	p.pidMode, p.pidModeErr = "", errors.New("AccessDeniedException: not authorized to perform ecs:DescribeTaskDefinition")
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, healthyDoctorDeps(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	r := findRow(t, wantRowSet(t, out.String()), "pidMode")
+	if r.mark != "✗" || !strings.Contains(r.detail, "ecs:DescribeTaskDefinition") {
+		t.Fatalf("an unreadable task definition must report itself: %q %q", r.mark, r.detail)
+	}
+	if strings.Contains(r.next, `"pidMode": "task"`) {
+		t.Errorf("an IAM problem must not be answered with an infrastructure edit: %q", r.next)
+	}
+}
+
+// TestDoctorReportsAMissingTetherdGroup: no tetherd group at all is the
+// state of every machine where `tetherd-helper install` was never run - the
+// first machine doctor ever runs on. It must be reported as the missing
+// group, not as a gid mismatch against a group that does not exist.
+func TestDoctorReportsAMissingTetherdGroup(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	d := healthyDoctorDeps(healthyProvider(ag.addr))
+	d.LookupGroup = func(context.Context, string) (int, bool, error) { return 0, false, nil }
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	r := findRow(t, wantRowSet(t, out.String()), "setgid tetherd-exec")
+	if r.mark != "✗" || !strings.Contains(r.detail, "group does not exist") {
+		t.Fatalf("a missing tetherd group must be named as such: %q %q", r.mark, r.detail)
+	}
+	if !strings.Contains(r.next, "tetherd-helper install") {
+		t.Errorf("the next step must be to install: %q", r.next)
+	}
+}
+
+// TestDoctorWarnsWhenItCannotListLocalAddresses: with no interface list
+// there is no way to know whether the LAN overlaps the captured set, and
+// silence there is what lets a developer's home /24 be routed into the VPC
+// without warning. It is a warning, not a failure: tetherd still works.
+func TestDoctorWarnsWhenItCannotListLocalAddresses(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	d := healthyDoctorDeps(healthyProvider(ag.addr))
+	d.InterfaceAddrs = func() ([]net.Addr, error) { return nil, errors.New("route ioctl: operation not permitted") }
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := findRow(t, wantRowSet(t, out.String()), "local addresses")
+	if r.mark != "!" || !strings.Contains(r.detail, "operation not permitted") {
+		t.Fatalf("local addresses = %q %q, want a warning carrying the reason", r.mark, r.detail)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0: not knowing is a warning, not a failure\n%s", code, out.String())
+	}
+}
+
+// TestDoctorNamesTheMissingTargetFlags: `tetherd doctor` with no config and
+// no flags is a first invocation, not a broken dev service. It must name the
+// flags it needs rather than send the developer to enable ECS Exec on a
+// service it was never told about - and the local rows, which are exactly
+// what a first invocation wants to know, must still be checked.
+func TestDoctorNamesTheMissingTargetFlags(t *testing.T) {
+	opts := doctorOpts()
+	opts.Cluster, opts.Service = "", ""
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider("127.0.0.1:1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	rows := wantRowSet(t, out.String())
+	r := findRow(t, rows, "attachable task")
+	if r.mark != "✗" || !strings.Contains(r.detail, "--cluster") {
+		t.Fatalf("attachable task = %q %q, want the missing flags named", r.mark, r.detail)
+	}
+	if strings.Contains(r.next, "ECS Exec") {
+		t.Errorf("a missing flag is not a misconfigured service: %q", r.next)
+	}
+	if !strings.Contains(r.next, "--cluster") && !strings.Contains(r.next, "target.cluster") {
+		t.Errorf("the next step must say how to name the service: %q", r.next)
+	}
+	wantMarks(t, rows, map[string]string{"helper": "✓", "setgid tetherd-exec": "✓", "session-manager-plugin": "✓", "AWS identity": "✓"})
 }
 
 // TestStatGIDKeepsTheSetgidBit pins the one fact the setgid row turns on.
@@ -424,6 +602,184 @@ func TestDoctorBoundsAWedgedHelper(t *testing.T) {
 	wantMarks(t, rows, map[string]string{"helper": "✗", "attachable task": "✓"})
 }
 
+// TestDoctorBoundsAWedgedGroupLookup: the local probes run before any row
+// is printed, so a hang in one of them produces no report at all - not even
+// the rows that already passed. A wedged opendirectoryd (which hangs `id`
+// and `dscl` with it) is the real-world version of this, and it is strictly
+// worse than a wedged helper: the developer learns nothing.
+func TestDoctorBoundsAWedgedGroupLookup(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	d := healthyDoctorDeps(healthyProvider(ag.addr))
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	d.LookupGroup = func(ctx context.Context, _ string) (int, bool, error) {
+		// dscl is a subprocess: a context can kill it, but only if one is
+		// passed. Answering eventually keeps this test from hanging.
+		select {
+		case <-time.After(8 * time.Second):
+		case <-ctx.Done():
+			return 0, false, ctx.Err()
+		case <-release:
+		}
+		return 309, true, nil
+	}
+
+	opts := doctorOpts()
+	opts.Timeout = 150 * time.Millisecond
+	var out strings.Builder
+	start := time.Now()
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, d)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("a wedged group lookup blocked doctor for %s", elapsed)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	// Every other row still printed, which is the whole point.
+	rows := wantRowSet(t, out.String())
+	wantMarks(t, rows, map[string]string{"setgid tetherd-exec": "✗", "helper": "✓", "agent session": "✓"})
+	if d := findRow(t, rows, "setgid tetherd-exec").detail; !strings.Contains(d, "did not answer") {
+		t.Errorf("the row must say the lookup never answered, got %q", d)
+	}
+}
+
+// TestBoundedNeverReportsAnAnsweredCheckAsTimedOut pins the invariant that
+// makes the bounds safe to apply to every check: a call that answered must
+// come back as its answer, always. The way to get this wrong is subtle and
+// was caught only by repetition - if the goroutine running the call cancels
+// the bound's context as it finishes, then for a call that answers before
+// the caller reaches its select, *both* select cases are ready, and Go picks
+// between ready cases at random. A healthy machine would then be told, a
+// fraction of the time and differently on every run, that something "did not
+// answer". The loop is what makes that visible: one iteration proves nothing
+// about a coin flip.
+func TestBoundedNeverReportsAnAnsweredCheckAsTimedOut(t *testing.T) {
+	// Honest note on this test's teeth: the interleaving needs the call's
+	// goroutine to finish before the caller reaches its select, which takes
+	// real contention for the cores - this loop reliably caught the
+	// regression under `go test -race -count=5` over several packages at
+	// once, and does not catch it when run alone. What actually rules the
+	// bug out is structural (bounded selects on a timer, never on f's own
+	// context, and re-checks for a result before giving up); this loop is
+	// the regression net, not the proof.
+	const runs = 2000
+	for i := range runs {
+		got, err := bounded(context.Background(), time.Minute, "probe",
+			func(context.Context) (int, error) { return 42, nil }, nil)
+		if err != nil {
+			t.Fatalf("run %d of %d: a call that answered was reported as failed: %v", i, runs, err)
+		}
+		if got != 42 {
+			t.Fatalf("run %d: got %d, want the value the call returned", i, got)
+		}
+	}
+}
+
+// TestBoundedCancelsTheCallItAbandons: the point of the bound is to stop
+// waiting, and the point of cancelling is that whatever was being waited on
+// (a dscl subprocess, an AWS request) stops too. A bound that returned while
+// leaving the work running would pile up a process per wedged check.
+//
+// It also pins the wording: the abandoned call here answers, immediately,
+// with our own cancellation. Reporting that as the answer would make the row
+// read "context deadline exceeded" instead of "did not answer within …" -
+// and, worse, hide the timeout from the callers that check for it to avoid
+// giving a wedged lookup advice meant for a missing install.
+func TestBoundedCancelsTheCallItAbandons(t *testing.T) {
+	cancelled := make(chan struct{})
+	_, err := bounded(context.Background(), 50*time.Millisecond, "probe",
+		func(c context.Context) (int, error) {
+			<-c.Done()
+			close(cancelled)
+			return 0, c.Err()
+		}, nil)
+	if err == nil || !isCheckTimeout(err) {
+		t.Fatalf("err = %v, want a check timeout", err)
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the abandoned call was never cancelled, so whatever it started keeps running")
+	}
+}
+
+// TestDefaultGroupLookupIsCancellable pins the production probe, not an
+// injected one: the real LookupGroup shells out to dscl, and bounding the
+// call is worth nothing if the subprocess it starts ignores the context and
+// keeps the report's goroutine (and a dscl process) alive for as long as
+// opendirectoryd is wedged. An already-cancelled context must come back as
+// an error without running anything.
+func TestDefaultGroupLookupIsCancellable(t *testing.T) {
+	d := Deps{}.withDefaults()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := d.LookupGroup(ctx, "tetherd")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a cancelled lookup must report the cancellation, not succeed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the default group lookup ignored a cancelled context")
+	}
+}
+
+// TestDoctorStopsAtTheOverallBudget: each row being bounded still leaves a
+// worst case of minutes once several remote_domains are configured. The
+// budget caps the report as a whole, and what it cuts short is reported as
+// unchecked rather than dropped.
+func TestDoctorStopsAtTheOverallBudget(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	d := healthyDoctorDeps(healthyProvider(ag.addr))
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	d.LookPath = func(string) (string, error) {
+		select {
+		case <-time.After(8 * time.Second):
+		case <-release:
+		}
+		return "/opt/homebrew/bin/session-manager-plugin", nil
+	}
+
+	opts := doctorOpts()
+	// Deliberately generous per check, so only the overall budget can be
+	// what ends the report.
+	opts.Timeout = 5 * time.Second
+	opts.Budget = 300 * time.Millisecond
+	var out strings.Builder
+	start := time.Now()
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, d)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("the overall budget did not apply: doctor took %s", elapsed)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	rows := wantRowSet(t, out.String())
+	r := findRow(t, rows, "session-manager-plugin")
+	if r.mark != "✗" {
+		t.Errorf("the row the budget cut short must fail, not pass: %q %q", r.mark, r.detail)
+	}
+	// CheckPlugin reads any error as "not on PATH" and answers it with
+	// "brew install"; a lookup that never came back is neither.
+	if strings.Contains(r.detail, "not on PATH") || strings.Contains(r.next, "brew install") {
+		t.Errorf("a check that ran out of time must not be reported as a missing install: %q → %q", r.detail, r.next)
+	}
+}
+
 // TestDoctorBoundsASilentAgent: an agent that accepts TCP and then says
 // nothing must fail the domains row within the bound. Without a deadline on
 // the session handshake this blocks for session.Dial's own 15s default, and
@@ -460,10 +816,85 @@ func TestDoctorBoundsASilentAgent(t *testing.T) {
 		t.Fatalf("a silent agent blocked doctor for %s", elapsed)
 	}
 	if code != 1 {
-		t.Fatalf("code = %d, want 1 (the domains could not be resolved)\n%s", code, out.String())
+		t.Fatalf("code = %d, want 1 (the handshake never completed)\n%s", code, out.String())
 	}
 	rows := wantRowSet(t, out.String())
-	wantMarks(t, rows, map[string]string{"remote domains": "✗", "attachable task": "✓"})
+	// The handshake is what failed, and the domains were never asked - so
+	// they must not be reported as broken DNS records.
+	wantMarks(t, rows, map[string]string{"agent session": "✗", "attachable task": "✓", "remote domains": "!"})
+	if d := findRow(t, rows, "remote domains").detail; !strings.Contains(d, "not checked") {
+		t.Errorf("remote domains = %q, want it named as not checked", d)
+	}
+	// The handshake never completed, so there is no TETHERD_ENV to compare
+	// and the row must not pretend there was one.
+	if d := findRow(t, rows, "agent session").detail; strings.Contains(d, "TETHERD_ENV") {
+		t.Errorf("a handshake that never finished is not an environment mismatch: %q", d)
+	}
+}
+
+// TestDoctorFailsWhenTheAgentIsUnreachable is the bug the agent session row
+// exists for. ECS reports the task as attachable (that is all CheckTask can
+// see), but the sidecar is not answering - a crashed agent container, the
+// wrong port, a build too old to speak this protocol. `tetherd run` fails
+// immediately at dialAgent, so a doctor that printed only green rows would
+// be worse than useless. With no remote_domains configured - a perfectly
+// legal config - there is nothing else in the report that would ever notice.
+func TestDoctorFailsWhenTheAgentIsUnreachable(t *testing.T) {
+	// A port nothing listens on: the dial is refused rather than timing
+	// out, so this test is fast and needs no bound at all.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := ln.Addr().String()
+	ln.Close()
+
+	opts := doctorOpts()
+	if len(opts.RemoteDomains) != 0 {
+		t.Fatal("this test is about a config with no remote_domains")
+	}
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(dead)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("an unreachable agent must exit 1, got %d\n%s", code, out.String())
+	}
+	rows := wantRowSet(t, out.String())
+	r := findRow(t, rows, "agent session")
+	if r.mark != "✗" || !strings.Contains(r.detail, "connect to agent") {
+		t.Fatalf("agent session = %q %q, want a failure naming the connection", r.mark, r.detail)
+	}
+	if strings.Contains(r.next, "Cloud Map") {
+		t.Errorf("an unreachable agent is not a DNS problem: %q", r.next)
+	}
+	// Everything ECS could see is still fine, which is exactly why this row
+	// is needed.
+	wantMarks(t, rows, map[string]string{"attachable task": "✓", "pidMode": "✓", "remote CIDRs": "✓"})
+}
+
+// TestDoctorFailsOnAnEnvironmentMismatch: run refuses to attach when the
+// agent's TETHERD_ENV is not what the operator pointed at, so a developer
+// aimed at the wrong environment must learn it from doctor rather than from
+// a refusal later.
+func TestDoctorFailsOnAnEnvironmentMismatch(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil) // the agent is TETHERD_ENV=dev
+	opts := doctorOpts()
+	opts.TargetEnv = "prod"
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(ag.addr)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	r := findRow(t, wantRowSet(t, out.String()), "agent session")
+	if r.mark != "✗" || !strings.Contains(r.detail, `"dev"`) || !strings.Contains(r.detail, `"prod"`) {
+		t.Fatalf("agent session = %q %q, want the mismatch with both environments", r.mark, r.detail)
+	}
 }
 
 // TestDoctorResolvesEachRemoteDomainThroughTheAgent pins that the domains
@@ -558,7 +989,9 @@ func TestDoctorReportsEachLocalProblemSeparately(t *testing.T) {
 
 	// A group lookup that fails outright is not the same problem as a group
 	// that is absent, and must not be reported as one.
-	d.LookupGroup = func(string) (int, bool, error) { return 0, false, errors.New("dscl: connection refused") }
+	d.LookupGroup = func(context.Context, string) (int, bool, error) {
+		return 0, false, errors.New("dscl: connection refused")
+	}
 	out.Reset()
 	if _, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d); err != nil {
 		t.Fatal(err)
@@ -587,6 +1020,50 @@ func TestDoctorRefusesTransportDirect(t *testing.T) {
 	if out.String() != "" {
 		t.Errorf("nothing should be printed: %q", out.String())
 	}
+	// And the refusal has to say what to do about it.
+	if !strings.Contains(err.Error(), "without --transport direct") {
+		t.Errorf("the refusal must name the way past it: %v", err)
+	}
+}
+
+// TestDoctorRejectsAnUnknownTransportLikeRunDoes: a typo is not the same
+// thing as a deliberate --transport direct, and must not be answered with
+// prose about AWS sessions and the SSM plugin. It reads the way run's does.
+func TestDoctorRejectsAnUnknownTransportLikeRunDoes(t *testing.T) {
+	opts := doctorOpts()
+	opts.Transport = "bogus"
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider("127.0.0.1:1")))
+	if code != 2 || err == nil {
+		t.Fatalf("code = %d err = %v, want the usage exit code", code, err)
+	}
+	if err.Error() != `unknown transport "bogus" (ssm | direct)` {
+		t.Errorf("doctor = %q, want run's own wording", err.Error())
+	}
+	if out.String() != "" {
+		t.Errorf("nothing should be printed: %q", out.String())
+	}
+}
+
+// TestDoctorDefaultsAnEmptyTransport: an in-process caller handing over a
+// zero RunOptions means "the default", not "--transport \"\"" - nobody can
+// type an empty transport, because the cobra flag defaults to ssm. Refusing
+// it with a usage error about a flag the caller never set would make
+// DoctorRun unusable outside the command.
+func TestDoctorDefaultsAnEmptyTransport(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	opts := DoctorOptions{RunOptions: RunOptions{Cluster: "c", Service: "api", User: "tester"}, Timeout: 2 * time.Second}
+	opts.TargetEnv = "dev"
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(ag.addr)))
+	if err != nil {
+		t.Fatalf("a zero transport must be treated as ssm: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	}
+	wantRowSet(t, out.String())
 }
 
 // TestDoctorCommandAppliesConfigAndMapsTheExitCode covers the wiring cobra

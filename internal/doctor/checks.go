@@ -126,6 +126,41 @@ func CheckPIDMode(mode string, err error) Result {
 	return r
 }
 
+// CheckAgentSession reports whether the tetherd-agent sidecar actually
+// answered: the transport opened, the control stream came up and the agent
+// sent its welcome. This is a different fact from CheckTask, which only
+// reflects what ECS believes about the task - a task whose ExecuteCommandAgent
+// is RUNNING can still hold an agent container that crashed at startup, is
+// listening on the wrong port, or is a build too old to speak this protocol,
+// and `tetherd run` would fail on the very next step. Without this row a
+// developer with no remote_domains configured would see a table of green rows
+// for a service they cannot attach to at all.
+//
+// agentEnv is the TETHERD_ENV the agent reports and wantEnv what the operator
+// pointed at: `tetherd run` refuses to attach when they differ, so doctor has
+// to say so too rather than let the mismatch surface as a refusal later.
+//
+// Like CheckHelper, the protocol version is reported but not compared: the
+// agent and session.Dial are what reject a version they cannot speak, and
+// that rejection arrives here as dialErr.
+func CheckAgentSession(protocol, agentEnv, wantEnv string, dialErr error) Result {
+	r := Result{Name: "agent session"}
+	if dialErr != nil {
+		r.Status = Fail
+		r.Detail = dialErr.Error()
+		r.Next = "check the tetherd-agent sidecar is running in the task and listening on its control port (see docs/dev-env.md)"
+		return r
+	}
+	if agentEnv != wantEnv {
+		r.Status = Fail
+		r.Detail = fmt.Sprintf("the agent reports TETHERD_ENV=%q, expected %q", agentEnv, wantEnv)
+		r.Next = "point tetherd at the environment the agent is in (--env / target.env in .tetherd.yml), or check --cluster"
+		return r
+	}
+	r.Detail = fmt.Sprintf("handshake ok, protocol %s, TETHERD_ENV=%s", protocol, agentEnv)
+	return r
+}
+
 // CheckOverlap reports local interfaces whose addresses fall inside the
 // captured set: traffic to those addresses would go to the VPC instead of the
 // LAN (spec §11). tetherd still runs, so this is a warning.
