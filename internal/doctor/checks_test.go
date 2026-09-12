@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kyosu-1/tetherd/internal/proto"
 	"github.com/kyosu-1/tetherd/internal/transport"
 )
 
@@ -271,6 +272,141 @@ func TestCheckTaskEnv(t *testing.T) {
 	}
 }
 
+// The task role row is the child's AWS identity, and it has three outcomes
+// that are not one: the credentials never arrived (the child would have
+// none), they arrived but STS could not be asked whose they are (nothing is
+// wrong), and no role is advertised at all (also nothing is wrong, and a
+// different sentence). `tetherd run` reports all three; a report that folded
+// them together would either fail a laptop with no route to STS or pass one
+// whose child has no identity.
+func TestCheckCredentialEndpoint(t *testing.T) {
+	const addr = "127.0.0.1:51234"
+	const path = "/v2/credentials/abc"
+	const arn = "arn:aws:sts::1:assumed-role/tetherd-dev-task/abc"
+	cases := []struct {
+		name   string
+		got    Result
+		status Status
+		want   []string
+	}{
+		{"no role advertised", CheckCredentialEndpoint("", "", "", nil, nil), OK, []string{"no role"}},
+		{"the role arrived", CheckCredentialEndpoint(addr, path, arn, nil, nil), OK, []string{arn, addr}},
+		{
+			"the credentials did not arrive",
+			CheckCredentialEndpoint(addr, path, "", errors.New("task credentials endpoint: HTTP 502"), nil),
+			Fail,
+			[]string{"HTTP 502", addr},
+		},
+		{
+			"sts could not be asked",
+			CheckCredentialEndpoint(addr, path, "", nil, errors.New("dial tcp: i/o timeout")),
+			Unknown,
+			[]string{"i/o timeout", "GetCallerIdentity", addr},
+		},
+	}
+	seen := map[string]string{}
+	for _, c := range cases {
+		if c.got.Status != c.status {
+			t.Errorf("%s: status %v, want %v (%+v)", c.name, c.got.Status, c.status, c.got)
+		}
+		for _, want := range c.want {
+			if !strings.Contains(c.got.Detail, want) {
+				t.Errorf("%s: detail %q does not mention %q", c.name, c.got.Detail, want)
+			}
+		}
+		if prev, dup := seen[c.got.Detail]; dup {
+			t.Errorf("%s and %s share the detail %q", prev, c.name, c.got.Detail)
+		}
+		seen[c.got.Detail] = c.name
+		if c.status == OK && c.got.Next != "" {
+			t.Errorf("%s: nothing to do, so nothing to say: %q", c.name, c.got.Next)
+		}
+		if c.status != OK && c.got.Next == "" {
+			t.Errorf("%s: a row that is not green must say what to do", c.name)
+		}
+		if c.got.Name != "task role" {
+			t.Errorf("%s: row name %q", c.name, c.got.Name)
+		}
+	}
+	// The ARN comes before the address it was fetched through, the way run's
+	// ✓ iam line reads. A test that only asked whether both strings appear
+	// would pass with the two transposed, which is a different sentence:
+	// "127.0.0.1:51234 (via arn:… → the task)".
+	ok := CheckCredentialEndpoint(addr, path, arn, nil, nil)
+	if strings.Index(ok.Detail, arn) > strings.Index(ok.Detail, addr) {
+		t.Errorf("the task role must be reported before the endpoint it came through: %q", ok.Detail)
+	}
+	// A failure must not claim an identity the child does not have, even if
+	// a caller passes a stale ARN along with the error.
+	if bad := CheckCredentialEndpoint(addr, path, arn, errors.New("HTTP 502"), nil); strings.Contains(bad.Detail, arn) {
+		t.Errorf("credentials that never arrived must not be reported as an identity: %q", bad.Detail)
+	}
+	// STS being unreachable is not the child's problem, so the row must say
+	// the credentials did arrive - and must not be a failure, or a developer
+	// on a plane could not get a clean report.
+	unknown := CheckCredentialEndpoint(addr, path, "", nil, errors.New("i/o timeout"))
+	if unknown.Status == Fail {
+		t.Errorf("an unreachable STS must not fail the report: %+v", unknown)
+	}
+	if !strings.Contains(unknown.Detail, "reached tetherd") {
+		t.Errorf("the row must say the credentials arrived: %q", unknown.Detail)
+	}
+}
+
+// Steal is on by default and the agent is on the ALB's data path whether or
+// not anyone is listening on the laptop, so "nothing is listening" is the one
+// finding that used to leave every other row green while the developer's own
+// requests came back 502.
+func TestCheckSteal(t *testing.T) {
+	inc := proto.Incoming{Enabled: true, Header: "X-Dev-User", TokenHeader: "X-Dev-Token"}
+
+	off := CheckSteal(proto.Incoming{}, 0, false)
+	if off.Status != OK || off.Next != "" {
+		t.Errorf("a session that takes nothing has nothing wrong with it: %+v", off)
+	}
+	if off.Detail == "" {
+		t.Error("a row must still say what it found")
+	}
+
+	on := CheckSteal(inc, 8080, true)
+	if on.Status != OK || on.Next != "" {
+		t.Errorf("a listener on the local port is the healthy case: %+v", on)
+	}
+	for _, want := range []string{"X-Dev-User", "X-Dev-Token", "8080"} {
+		if !strings.Contains(on.Detail, want) {
+			t.Errorf("detail %q does not mention %q", on.Detail, want)
+		}
+	}
+	// The order is the sentence run prints: the header, then the token
+	// header, then where a match goes. Checking presence alone would pass
+	// with the two headers transposed, which tells the developer to send the
+	// token under the name of the user and the user under the name of the
+	// token.
+	if strings.Index(on.Detail, "X-Dev-User") > strings.Index(on.Detail, "X-Dev-Token") {
+		t.Errorf("the match header must be reported before the token header: %q", on.Detail)
+	}
+	if strings.Index(on.Detail, "X-Dev-Token") > strings.Index(on.Detail, "8080") {
+		t.Errorf("the headers must be reported before the port they are sent to: %q", on.Detail)
+	}
+
+	dead := CheckSteal(inc, 3000, false)
+	if dead.Status != Warn {
+		t.Fatalf("steal enabled with nothing listening must warn: %+v", dead)
+	}
+	if !strings.Contains(dead.Detail, "3000") || !strings.Contains(dead.Detail, "502") {
+		t.Errorf("the warning must name the port and what happens: %q", dead.Detail)
+	}
+	if !strings.Contains(dead.Next, "3000") || !strings.Contains(dead.Next, "--no-incoming") {
+		t.Errorf("the next step must name the port to start a server on and the way out: %q", dead.Next)
+	}
+	// The port is whatever the CLI resolved, never a default reapplied here:
+	// a row that said 8080 for a repository whose incoming.local_port is
+	// 3000 would send the developer to check the wrong port.
+	if strings.Contains(dead.Detail, "8080") {
+		t.Errorf("the resolved port is the only port this row may name: %q", dead.Detail)
+	}
+}
+
 func TestCheckOverlapAndRemoteCIDRs(t *testing.T) {
 	if r := CheckOverlap(nil); r.Status != OK {
 		t.Errorf("got %+v", r)
@@ -479,6 +615,12 @@ func TestCheckDomainsDoesNotClaimUncheckedDomainsWork(t *testing.T) {
 	if r.Status == OK {
 		t.Fatalf("an unchecked domain must not read as healthy: %+v", r)
 	}
+	// Unknown, not Warn: nothing here is a finding about the domains or the
+	// configuration. Whatever stopped them being asked has its own row and
+	// is counted there, and this row must not fail the command on its own.
+	if r.Status != Unknown {
+		t.Errorf("a domain that was never asked about must read as unchecked, got %v: %+v", r.Status, r)
+	}
 	if !strings.Contains(r.Detail, "b.internal") || r.Next == "" {
 		t.Errorf("the unchecked domain must be named with a next step: %+v", r)
 	}
@@ -538,6 +680,8 @@ func TestEveryFailureNamesAnActionTheDeveloperCanTake(t *testing.T) {
 		{"agent unreachable", CheckAgentSession("", "", "dev", errors.New("connection refused")), "tetherd-agent"},
 		{"agent env mismatch", CheckAgentSession("1", "prod", "dev", nil), "--env"},
 		{"task env", CheckTaskEnv(0, "no ECS metadata endpoint"), "TETHERD_APP_CONTAINER"},
+		{"task role", CheckCredentialEndpoint("127.0.0.1:1", "/v2/credentials/x", "", errors.New("HTTP 502"), nil), "task role"},
+		{"steal", CheckSteal(proto.Incoming{Enabled: true, Header: "X-Dev-User", TokenHeader: "X-Dev-Token"}, 8080, false), "--no-incoming"},
 		{"overlap", CheckOverlap([]string{"en0 10.0.3.14/24 overlaps 10.0.0.0/16"}), "local_cidrs"},
 		{"wide cidr", CheckRemoteCIDRs([]netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}), "remote_cidrs"},
 		{"domain", CheckDomains([]string{"x.internal"}, map[string]DomainProbe{"x.internal": {Err: errors.New("session closed")}}), "remote_domains"},
@@ -566,6 +710,8 @@ func TestEveryFailureNamesAnActionTheDeveloperCanTake(t *testing.T) {
 		CheckPIDMode("task", nil),
 		CheckAgentSession("1", "dev", "dev", nil),
 		CheckTaskEnv(3, ""),
+		CheckCredentialEndpoint("127.0.0.1:1", "/v2/credentials/x", "arn:aws:sts::1:assumed-role/task/abc", nil, nil),
+		CheckSteal(proto.Incoming{Enabled: true, Header: "X-Dev-User", TokenHeader: "X-Dev-Token"}, 8080, true),
 		CheckOverlap(nil),
 		CheckRemoteCIDRs([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}),
 		CheckDomains(nil, nil),
@@ -591,18 +737,27 @@ func TestCheckNamesAreStableAndDistinct(t *testing.T) {
 		"helper":                 CheckHelper("1", nil),
 		"setgid tetherd-exec":    CheckExecSetgid("/x", 0o755|fs.ModeSetgid, g, g, true, nil),
 		"session-manager-plugin": CheckPlugin("/usr/bin/session-manager-plugin", nil),
-		"AWS identity":           CheckIdentity("arn", nil),
+		"your AWS identity":      CheckIdentity("arn", nil),
 		"attachable task":        CheckTask(transport.Task{ID: "abc"}, nil),
 		"pidMode":                CheckPIDMode("task", nil),
 		"agent session":          CheckAgentSession("1", "dev", "dev", nil),
 		"task env":               CheckTaskEnv(1, ""),
+		"task role":              CheckCredentialEndpoint("127.0.0.1:1", "/v2/credentials/x", "arn", nil, nil),
 		"local addresses":        CheckOverlap(nil),
 		"remote CIDRs":           CheckRemoteCIDRs(nil),
+		"steal":                  CheckSteal(proto.Incoming{}, 0, false),
 		"remote domains":         CheckDomains(nil, nil),
 	}
 	for name, r := range want {
 		if r.Name != name {
 			t.Errorf("row name %q, want %q", r.Name, name)
 		}
+	}
+	// The two identity rows report different ARNs and must not read as the
+	// same row: they were both called "AWS identity" while one was the
+	// developer's own credentials and the other the task role the child
+	// gets.
+	if CheckIdentity("arn", nil).Name == CheckCredentialEndpoint("127.0.0.1:1", "/v2/credentials/x", "arn", nil, nil).Name {
+		t.Error("the developer's identity row and the task role row must not share a name")
 	}
 }

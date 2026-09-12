@@ -13,6 +13,21 @@ import (
 )
 
 // Status is how a check came out.
+//
+// There are four rather than three because "could not be checked" is not a
+// warning about the setup, and the report said it was: a row whose facts were
+// never gathered - the agent did not answer, --skip-agent was given, an
+// earlier row failed - was a Warn carrying "not checked: …" in its detail, so
+// one mark stood for both "your setup works but look at this" and "I have no
+// idea". A developer cannot act on the first without being able to tell it
+// from the second, and the same finding (LocalOverlaps') reached them under
+// two marks and two nouns.
+//
+// The marks are also `tetherd run`'s: run prints its warnings as ⚠, so a
+// finding that both commands can make now looks the same in both. Only Fail
+// is counted by Render, so an Unknown row never fails the command - which is
+// the other half of the separation: a row that says nothing must not decide
+// the exit code.
 type Status int
 
 const (
@@ -22,6 +37,11 @@ const (
 	Warn
 	// Fail means tetherd will not work until it is fixed.
 	Fail
+	// Unknown means the check could not be run at all, so this row says
+	// nothing about the setup either way. It is never a reason to fail:
+	// whatever stopped the check has its own row, and counting this one
+	// again would fail a report over a single missing session.
+	Unknown
 )
 
 func (s Status) mark() string {
@@ -29,8 +49,15 @@ func (s Status) mark() string {
 	case OK:
 		return "✓"
 	case Warn:
-		return "!"
+		// ⚠, not !, because `tetherd run` already prints its warnings as ⚠
+		// and the two commands describe one system.
+		return "⚠"
+	case Unknown:
+		return "?"
 	default:
+		// Fail, and any status a later hand adds without a mark: a row
+		// nobody has decided about reads as a problem rather than as
+		// health.
 		return "✗"
 	}
 }
@@ -50,6 +77,11 @@ type Result struct {
 // exit non-zero. Next steps print only where there is something to do, so a
 // healthy machine is quiet. Every result is printed: a doctor that stopped at
 // the first problem would make the developer run it once per problem.
+//
+// Only Fail is counted. A Warn is something to look at rather than a reason
+// to fail a script, and an Unknown was never checked at all - failing on it
+// would fail the command for a row that made no claim, on top of the row that
+// actually broke and is counted here already.
 func Render(w io.Writer, results []Result) int {
 	// Names are padded by rune count, not bytes, so the detail column lines up
 	// in display columns however wide the names are.

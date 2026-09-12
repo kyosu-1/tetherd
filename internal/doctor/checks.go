@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"strings"
 
+	"github.com/kyosu-1/tetherd/internal/proto"
 	"github.com/kyosu-1/tetherd/internal/transport"
 )
 
@@ -74,9 +75,15 @@ func CheckPlugin(path string, lookErr error) Result {
 	return r
 }
 
-// CheckIdentity reports whether AWS credentials resolve, and to whom.
+// CheckIdentity reports whether the developer's own AWS credentials resolve,
+// and to whom. This is the identity tetherd itself calls ECS, STS and SSM
+// with - not the one the child process gets, which is the task role and has
+// its own row (CheckCredentialEndpoint). The name says whose it is because
+// the two were both called "AWS identity" while reporting different ARNs,
+// and a developer comparing this row against `tetherd run`'s ✓ iam line was
+// comparing two different things.
 func CheckIdentity(arn string, err error) Result {
-	r := Result{Name: "AWS identity"}
+	r := Result{Name: "your AWS identity"}
 	if err != nil {
 		r.Status = Fail
 		r.Detail = err.Error()
@@ -193,6 +200,64 @@ func CheckTaskEnv(vars int, envError string) Result {
 	return r
 }
 
+// CheckCredentialEndpoint reports whether the child would have the task
+// role. That is a different question from CheckIdentity's, and the two were
+// being reported under one word: `tetherd run` prints its ✓ iam line with
+// the ARN the *task* role resolves to, fetched through the loopback
+// credential endpoint it serves over the session, while the identity row
+// above reports the developer's own ARN from the developer's own
+// credentials. A report carrying only the second told a developer their IAM
+// was fine on a machine where `tetherd run` was warning them that the child
+// had no AWS identity at all.
+//
+// The inputs are the facts run's own path produces, in run's order:
+//
+//   - credPath is ContainerCredentialsPath's answer: the path the task
+//     advertises its role on, "" when it advertises none. It is the value
+//     run branches on rather than a second reading of the same environment,
+//     because it decides the same thing twice over - what to point the
+//     child at, and whether to hide the developer's own credentials from it.
+//   - credsErr is why the credentials did not arrive over the loopback
+//     endpoint (addr) and the session. That is the child's own path, so this
+//     failure means the child would have no AWS identity.
+//   - identityErr is why sts:GetCallerIdentity could not say whose the
+//     credentials are. That call leaves the laptop for
+//     sts.<region>.amazonaws.com, which has nothing to do with the session
+//     and may be unreachable on a plane or behind a proxy - so it is
+//     Unknown rather than a failure: the credentials did arrive, and the
+//     child can sign with them whatever STS says.
+//
+// arn is what sts:GetCallerIdentity answered for those credentials, and addr
+// is where doctor served the endpoint. The address is in the detail for the
+// same reason it is on run's line: it is the only way to tell "the task's
+// role, relayed through the session" from the developer's own credentials
+// resolving locally.
+func CheckCredentialEndpoint(addr, credPath, arn string, credsErr, identityErr error) Result {
+	r := Result{Name: "task role"}
+	if credPath == "" {
+		// Not a warning. run prints no iam line at all for a task that
+		// advertises no role, and leaves the developer's own credentials in
+		// the child's environment instead of stripping them - a working
+		// setup, just not the one the ✓ iam line describes.
+		r.Detail = "the task advertises no role to relay; the child would keep your own AWS credentials"
+		return r
+	}
+	if credsErr != nil {
+		r.Status = Fail
+		r.Detail = fmt.Sprintf("%v  (via %s → the task)", credsErr, addr)
+		r.Next = "check the task definition names a task role, and that the tetherd-agent sidecar can reach the task's credential endpoint; tetherd run would start the child with no AWS identity"
+		return r
+	}
+	if identityErr != nil {
+		r.Status = Unknown
+		r.Detail = fmt.Sprintf("the task's credentials reached tetherd (via %s → the task) but sts:GetCallerIdentity could not confirm whose they are: %v", addr, identityErr)
+		r.Next = "check this machine can reach sts.<region>.amazonaws.com; the credentials themselves arrived, so the child would hold the task role whatever STS says"
+		return r
+	}
+	r.Detail = fmt.Sprintf("%s  (via %s → the task)", arn, addr)
+	return r
+}
+
 // CheckOverlap reports local interfaces whose addresses fall inside the
 // captured set: traffic to those addresses would go to the VPC instead of the
 // LAN (spec §11). tetherd still runs, so this is a warning.
@@ -241,6 +306,47 @@ func CheckRemoteCIDRs(cidrs []netip.Prefix) Result {
 		return r
 	}
 	r.Detail = FormatPrefixes(cidrs)
+	return r
+}
+
+// CheckSteal reports whether a stolen request would reach anything.
+//
+// Steal is on unless --no-incoming turns it off, and the agent sits on the
+// ALB's data path whether or not anyone is attached: a request carrying this
+// developer's name and token leaves the task for their laptop, and if
+// nothing is listening there it comes back a 502 - while every other row in
+// this report is green, which is the state this row exists to end. `tetherd
+// run` says it at the moment it happens ("nothing is listening on
+// 127.0.0.1:8080"), which is one request too late for a developer trying to
+// work out why their browser extension does nothing.
+//
+// inc and localPort are the settings as the CLI resolved them - what the
+// agent is told to match, and where a match goes - so the three defaults
+// stay in the one place that applies them (internal/cli's stealSettings) and
+// are not reapplied here under a second spelling. listening is whether
+// anything answered a connect on that port.
+//
+// A missing listener is a warning, not a failure: a developer who starts
+// their server after running doctor has nothing wrong with their setup.
+func CheckSteal(inc proto.Incoming, localPort int, listening bool) Result {
+	r := Result{Name: "steal"}
+	if !inc.Enabled {
+		r.Detail = "not taking requests; every request stays with the application"
+		return r
+	}
+	// 127.0.0.1, not localhost, because that is the address the receiver
+	// actually dials (internal/cli's StealServer.addr). A process bound only
+	// to ::1 answers `curl localhost:8080` and never a stolen request, so a
+	// row that said "localhost" would send the developer to a check that
+	// passes.
+	target := fmt.Sprintf("127.0.0.1:%d", localPort)
+	if !listening {
+		r.Status = Warn
+		r.Detail = fmt.Sprintf("nothing is listening on %s, so a request matching %s would come back 502", target, inc.Header)
+		r.Next = fmt.Sprintf("start your own server on port %d, or run with --no-incoming to leave every request with the application", localPort)
+		return r
+	}
+	r.Detail = fmt.Sprintf("%s (+ %s) → %s, which has a listener", inc.Header, inc.TokenHeader, target)
 	return r
 }
 
@@ -307,7 +413,10 @@ func CheckDomains(domains []string, probed map[string]DomainProbe) Result {
 		return r
 	}
 	if len(unchecked) > 0 {
-		r.Status = Warn
+		// Unknown, not Warn: nothing here is a finding about the domains.
+		// Whatever stopped them being asked - an agent that never answered,
+		// the report's budget - has its own row and is counted there.
+		r.Status = Unknown
 		r.Detail = "not checked: " + strings.Join(unchecked, ", ")
 		r.Next = "fix the rows above, then run tetherd doctor again so these can be resolved through the agent"
 		return r
