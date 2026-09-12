@@ -28,8 +28,17 @@ type AWS struct {
 
 // Target names the service to attach to.
 type Target struct {
-	Cluster   string `yaml:"cluster"`
-	Service   string `yaml:"service"`
+	Cluster string `yaml:"cluster"`
+	Service string `yaml:"service"`
+	// Container is parsed but nothing reads it (like Incoming). Which
+	// container's environment is read is decided by the agent's
+	// TETHERD_APP_CONTAINER in the task definition, not from here - so a
+	// developer whose app container is named "web" gets no error from
+	// setting this and then debugs a `task env` failure whose advice points
+	// at a different mechanism. KnownFields(true) is why it stays: removing
+	// the field would turn every committed .tetherd.yml that carries the
+	// key into a hard parse error. Wiring it up is a v0.3 decision
+	// (docs/config.md says so too).
 	Container string `yaml:"container"`
 	Env       string `yaml:"env"`
 }

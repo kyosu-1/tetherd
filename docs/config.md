@@ -22,7 +22,7 @@ aws:
 target:
   cluster: myapp-dev
   service: api
-  container: app                # env を読むコンテナ（既定 app）
+  container: app                # 今は読まれるだけで使われない（実際に効くのは agent 側の TETHERD_APP_CONTAINER）
   env: dev                      # agent の TETHERD_ENV と照合し、違えば接続を拒否する
 env:
   override:                     # タスクの env の上にかぶせる
@@ -45,7 +45,7 @@ incoming:                       # v0.3。今は読まれるだけで使われな
 - `version` — 今は `1` のみ。将来フォーマットを変えたときに、古い tetherd が「upgrade してください」と言えるようにするためのもの。未知のキーもエラーにするので、綴り間違いは黙って無視されない
 - `aws.profile` / `aws.region` — SDK の既定チェーンの代わりに使うプロファイルとリージョン。個人設定の同じキーが勝つ
 - `target.cluster` / `target.service` — 接続先の ECS サービス。この 2 つが書いてあれば `tetherd run -- <cmd>` だけで動く
-- `target.container` — env を読むコンテナ名。agent は `pidMode: task` で共有した pid 名前空間からこのコンテナの最古のプロセスの `/proc/<pid>/environ` を読む
+- `target.container` — **今は読まれるだけで使われない**（`incoming` と同じ）。env を読むコンテナを決めているのは**タスク定義の agent サイドカーに渡す `TETHERD_APP_CONTAINER`**（既定 `app`）で、CLI 側のこのキーではない。agent は `pidMode: task` で共有した pid 名前空間から、そのコンテナの最古のプロセスの `/proc/<pid>/environ` を読む。つまりアプリのコンテナ名が `web` なら、ここに `web` と書いても何も起きず、agent の環境変数に `TETHERD_APP_CONTAINER=web` を設定する必要がある（設定しないと `task env` が「container "app" is not in the task」で失敗する）。このキーを実際に配線するかどうかは v0.3 の判断
 - `target.env` — 環境ガード。agent が名乗る `TETHERD_ENV` と一致しなければ接続を拒否する。prod のタスクに誤って繋ぐのを防ぐための最後の砦
 - `env.override` — タスクの env より強い。ローカルのポートだけ変えたいときなど
 - `env.exclude` — タスクの env から落とす名前。tetherd が常に落とすもの（下記）に追加される

@@ -13,7 +13,9 @@ aws:
 target:
   cluster: tetherd-dev
   service: api
-  container: app          # env を読むコンテナ
+  # 今は読まれるだけで使われない。env を読むコンテナは agent 側の
+  # TETHERD_APP_CONTAINER（既定 app）で決まる。docs/config.md 参照
+  container: app
   env: dev                # agent の TETHERD_ENV と一致しなければ接続を拒否する
 network:
   remote_domains:
