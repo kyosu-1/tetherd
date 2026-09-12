@@ -151,18 +151,51 @@ func (c *Client) Resolve(ctx context.Context, name string) ([]string, int, error
 	} else {
 		s.SetReadDeadline(time.Now().Add(10 * time.Second))
 	}
-	_, rawReply, err := proto.ReadHeader(s)
+	// A caller that cancels ctx (Ctrl-C on `tetherd doctor`, an errgroup
+	// tearing down its siblings) must not stay blocked in ReadHeader until
+	// the deadline set above fires.
+	stop := context.AfterFunc(ctx, func() { s.SetReadDeadline(time.Now()) })
+	defer stop()
+	typ, rawReply, err := proto.ReadHeader(s)
+	s.SetReadDeadline(time.Time{})
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, 0, ctxErr
+		}
 		return nil, 0, fmt.Errorf("session: resolve %s: %w", name, err)
 	}
-	var reply proto.ResolveReply
-	if err := proto.Unmarshal(rawReply, &reply); err != nil {
-		return nil, 0, err
+	switch typ {
+	case proto.TypeResolve:
+		var reply proto.ResolveReply
+		if err := proto.Unmarshal(rawReply, &reply); err != nil {
+			return nil, 0, err
+		}
+		if !reply.OK {
+			msg := reply.Error
+			if msg == "" {
+				msg = "agent did not say why"
+			}
+			return nil, 0, fmt.Errorf("resolve %s via agent: %s", name, msg)
+		}
+		return reply.Addrs, reply.TTL, nil
+	case proto.TypeError:
+		// A pre-v0.2 agent doesn't know the resolve stream type and answers
+		// TypeError(CodeBadHello, "unknown stream type resolve") instead —
+		// version skew is the single most likely failure for this feature,
+		// so name it plainly rather than surfacing the routing error as-is.
+		var e proto.Error
+		proto.Unmarshal(rawReply, &e)
+		if e.Code == proto.CodeBadHello {
+			return nil, 0, fmt.Errorf("resolve %s via agent: this agent does not support name resolution; upgrade the sidecar", name)
+		}
+		msg := e.Message
+		if msg == "" {
+			msg = "agent rejected the resolve request"
+		}
+		return nil, 0, fmt.Errorf("resolve %s via agent: %s", name, msg)
+	default:
+		return nil, 0, fmt.Errorf("resolve %s via agent: unexpected reply type %q", name, typ)
 	}
-	if !reply.OK {
-		return nil, 0, fmt.Errorf("resolve %s via agent: %s", name, reply.Error)
-	}
-	return reply.Addrs, reply.TTL, nil
 }
 
 // Close sends bye and tears the session down.

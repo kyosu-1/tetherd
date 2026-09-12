@@ -32,6 +32,10 @@ type ServeOptions struct {
 	// ControlTimeout is the longest the control stream may be silent. The
 	// client pings every 5s, so 20s means ~4 missed pings.
 	ControlTimeout time.Duration
+	// ResolveTimeout bounds how long a single resolve stream's lookup may
+	// take before serveStream gives up and answers with an error, so a
+	// handler that hangs cannot leak a stream forever. Default 5s.
+	ResolveTimeout time.Duration
 }
 
 // Serve runs the agent side of one session until the client says bye, the
@@ -39,6 +43,9 @@ type ServeOptions struct {
 func Serve(ctx context.Context, conn net.Conn, h Handler, opts ServeOptions) error {
 	if opts.ControlTimeout == 0 {
 		opts.ControlTimeout = 20 * time.Second
+	}
+	if opts.ResolveTimeout == 0 {
+		opts.ResolveTimeout = 5 * time.Second
 	}
 	cfg := yamux.DefaultConfig()
 	cfg.LogOutput = io.Discard
@@ -97,7 +104,7 @@ func Serve(ctx context.Context, conn net.Conn, h Handler, opts ServeOptions) err
 			if err != nil {
 				return
 			}
-			go serveStream(ctx, s, h)
+			go serveStream(ctx, s, h, opts.ResolveTimeout)
 		}
 	}()
 
@@ -119,7 +126,7 @@ func Serve(ctx context.Context, conn net.Conn, h Handler, opts ServeOptions) err
 	}
 }
 
-func serveStream(ctx context.Context, s net.Conn, h Handler) {
+func serveStream(ctx context.Context, s net.Conn, h Handler, resolveTimeout time.Duration) {
 	defer s.Close()
 	typ, raw, err := proto.ReadHeader(s)
 	if err != nil {
@@ -151,7 +158,11 @@ func serveStream(ctx context.Context, s net.Conn, h Handler) {
 			enc.Encode(proto.TypeResolve, proto.ResolveReply{Error: err.Error()})
 			return
 		}
-		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if hd.QType != "A" {
+			enc.Encode(proto.TypeResolve, proto.ResolveReply{Error: fmt.Sprintf("unsupported query type %q: only A is supported", hd.QType)})
+			return
+		}
+		rctx, cancel := context.WithTimeout(ctx, resolveTimeout)
 		addrs, ttl, err := h.Resolve(rctx, hd.Name)
 		cancel()
 		if err != nil {
