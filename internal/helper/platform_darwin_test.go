@@ -4,6 +4,8 @@ package helper
 
 import (
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -40,6 +42,7 @@ func TestDarwinPlatformPinsThroughRoute8(t *testing.T) {
 	f := &fakeRun{}
 	p := NewDarwinPlatform((&recorder{}).pfctl, t.TempDir(), nil)
 	p.route.Run = f.run
+	p.route.PinFile = "" // the record is exercised in route_test.go
 
 	if err := p.RouteSet([]netip.Addr{netip.MustParseAddr("169.254.170.2")}); err != nil {
 		t.Fatal(err)
@@ -66,6 +69,7 @@ func TestDarwinShutdownUnpinsTheRouteBeforeTouchingPf(t *testing.T) {
 	rec := &recorder{}
 	p := NewDarwinPlatform(rec.pfctl, t.TempDir(), nil)
 	p.route.Run = rec.route
+	p.route.PinFile = ""
 	if err := p.RouteSet([]netip.Addr{netip.MustParseAddr("169.254.170.2")}); err != nil {
 		t.Fatal(err)
 	}
@@ -94,22 +98,27 @@ func TestDarwinShutdownUnpinsTheRouteBeforeTouchingPf(t *testing.T) {
 	}
 }
 
-// TestDarwinClearLeftoversRemovesAPinThisProcessNeverMade is the
-// crashed-helper case. Router.set lives in memory, so a helper killed with
-// SIGKILL leaves 169.254.170.2 pointing at lo0 with no record of it, and
-// from then on every AWS SDK on the machine hangs on the credential
-// endpoint. Startup is the only place that can notice.
-func TestDarwinClearLeftoversRemovesAPinThisProcessNeverMade(t *testing.T) {
+// TestDarwinClearLeftoversRemovesTheRecordedPin is the crashed-helper case.
+// Router.set lives in memory, so a helper killed with SIGKILL leaves
+// 169.254.170.2 pointing at lo0 and every AWS SDK on the machine then hangs
+// on the credential endpoint. The pin record is what outlives the process,
+// and startup is the only place that can act on it.
+func TestDarwinClearLeftoversRemovesTheRecordedPin(t *testing.T) {
 	rec := &recorder{}
+	pins := filepath.Join(t.TempDir(), "pins")
+	if err := os.WriteFile(pins, []byte("169.254.170.2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	p := NewDarwinPlatform(rec.pfctl, t.TempDir(), nil)
-	p.route.Run = rec.route // nothing pinned: this is a fresh process
+	p.route.Run = rec.route // nothing pinned in memory: this is a fresh process
+	p.route.PinFile = pins
 	if err := p.ClearLeftovers(); err != nil {
 		t.Fatal(err)
 	}
 	if rec.indexOf(delCmd) < 0 {
-		t.Fatalf("startup cleanup ran %v, want %q for the allowlisted host", rec.calls, delCmd)
+		t.Fatalf("startup cleanup ran %v, want %q for the recorded pin", rec.calls, delCmd)
 	}
-	// Ordinary Shutdown must not do this: it only removes what this process
+	// Ordinary Shutdown must not do this: it removes only what this process
 	// pinned, so it cannot delete a route someone else installed.
 	rec.calls = nil
 	if err := p.Shutdown(); err != nil {
@@ -117,5 +126,39 @@ func TestDarwinClearLeftoversRemovesAPinThisProcessNeverMade(t *testing.T) {
 	}
 	if rec.indexOf(delCmd) >= 0 {
 		t.Fatalf("Shutdown deleted a route it never pinned: %v", rec.calls)
+	}
+}
+
+// TestDarwinPlatformConfiguresThePinRecord: the tests above set PinFile
+// themselves, so without this the production wiring - the only place that
+// decides a real helper keeps a record at all - would be unasserted. A
+// helper with no record cannot clean up after being killed.
+func TestDarwinPlatformConfiguresThePinRecord(t *testing.T) {
+	p := NewDarwinPlatform((&recorder{}).pfctl, t.TempDir(), nil)
+	if p.route.PinFile != DefaultPinFile {
+		t.Fatalf("PinFile = %q, want %q", p.route.PinFile, DefaultPinFile)
+	}
+	if !filepath.IsAbs(DefaultPinFile) || filepath.Dir(DefaultPinFile) != filepath.Dir(DefaultSocket) {
+		t.Errorf("%q should live beside the socket %q", DefaultPinFile, DefaultSocket)
+	}
+}
+
+// TestDarwinClearLeftoversTouchesNoRouteWithoutARecord: the common startup.
+// Deleting 169.254.170.2 unconditionally here would take out a running
+// emulator's lo0 alias before any session began - and log it as a previous
+// helper's leftover, which would be false.
+func TestDarwinClearLeftoversTouchesNoRouteWithoutARecord(t *testing.T) {
+	rec := &recorder{}
+	p := NewDarwinPlatform(rec.pfctl, t.TempDir(), nil)
+	p.route.Run = rec.route
+	p.route.PinFile = filepath.Join(t.TempDir(), "absent")
+	if err := p.ClearLeftovers(); err != nil {
+		t.Fatal(err)
+	}
+	if rec.indexOf("route ") >= 0 {
+		t.Fatalf("startup cleanup with no record ran %v, want no route(8) call", rec.calls)
+	}
+	if rec.indexOf("pfctl") < 0 {
+		t.Fatalf("it must still flush pf: %v", rec.calls)
 	}
 }

@@ -33,9 +33,10 @@ func NewDarwinPlatform(run pf.Runner, resolverDir string, logf func(string, ...a
 		pf:       pf.Pfctl{Run: run},
 		resolver: Resolver{Dir: resolverDir},
 		// The Router logs every route(8) delete through the helper's log:
-		// it removes entries it did not create, and that has to be
-		// findable afterwards.
-		route: Router{Logf: logf},
+		// it can remove an entry it did not create, and that has to be
+		// findable afterwards. PinFile is how a helper that was killed
+		// leaves a record of its own pins for the next one.
+		route: Router{Logf: logf, PinFile: DefaultPinFile},
 		logf:  logf,
 	}
 }
@@ -109,10 +110,11 @@ func (p *DarwinPlatform) Shutdown() error { return p.teardown(false) }
 // ClearLeftovers is Shutdown plus the state a *previous* helper process may
 // have left on this machine, and belongs at startup only. Router.set lives
 // in memory, so a helper killed with SIGKILL leaves 169.254.170.2 pointing
-// at lo0 with nothing listening and no record of it - and from then on every
-// AWS SDK on the machine hangs on the credential endpoint instead of failing
-// fast. Startup is the only place that can notice, so it deletes the
-// allowlisted routes unconditionally: one fork per address, once per daemon.
+// at lo0 with nothing listening, and from then on every AWS SDK on the
+// machine hangs on the credential endpoint instead of failing fast. The pin
+// record (Router.PinFile) is what survives that process, and it is the only
+// thing consulted here: a route tetherd did not write down is somebody
+// else's.
 func (p *DarwinPlatform) ClearLeftovers() error { return p.teardown(true) }
 
 func (p *DarwinPlatform) teardown(leftovers bool) error {
@@ -127,7 +129,7 @@ func (p *DarwinPlatform) teardown(leftovers bool) error {
 		firstErr = err
 	}
 	if leftovers {
-		p.route.ClearAll()
+		p.route.ClearRecorded()
 	} else if err := p.route.Clear(); err != nil && firstErr == nil {
 		firstErr = err
 	}
