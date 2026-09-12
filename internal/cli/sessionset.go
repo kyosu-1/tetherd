@@ -161,6 +161,36 @@ func (s *SessionSet) Remove(taskID string) bool {
 	return true
 }
 
+// Retain closes and forgets every session whose task is not in live, and
+// returns the task ids it dropped - only those, like Reap, so a caller may
+// log from it. A nil or empty live map therefore drops everything: nothing
+// is live.
+//
+// It takes the whole live set rather than being called once per departure
+// because deciding and compacting have to happen in one critical section
+// (see dropLocked). A caller that snapshots TaskIDs and then calls Remove
+// for each id it did not see acts on a name rather than on a session, and
+// it promotes once per removal: a deploy that replaces every task at once
+// would announce that dial and DNS moved to a task the same call is about
+// to drop. Here the primary moves once, to a task that is still attached
+// when the announcement is made.
+func (s *SessionSet) Retain(live map[string]bool) []string {
+	s.mu.Lock()
+	removed, wentAway, to := s.dropLocked(func(e attached) bool { return !live[e.task.ID] })
+	s.mu.Unlock()
+
+	if len(removed) == 0 {
+		return nil
+	}
+	dropped := make([]string, 0, len(removed))
+	for _, e := range removed {
+		e.sess.Close()
+		dropped = append(dropped, e.task.ID)
+	}
+	s.promoted(wentAway, to)
+	return dropped
+}
+
 // Has reports whether taskID is attached.
 func (s *SessionSet) Has(taskID string) bool {
 	s.mu.Lock()
@@ -184,15 +214,30 @@ func (s *SessionSet) TaskIDs() []string {
 	return ids
 }
 
-// Primary is the session dial, resolve and env come from, or nil when the
-// set is empty.
+// Primary is the session dial, resolve and env come from: the oldest
+// attached task whose session is still alive, or nil when there is none.
+//
+// Skipping a session whose Done has fired is not tidiness. The reap that
+// drops one is a poll away - ten seconds in production - so between a task
+// stopping and the follower's next tick the set still holds that task's
+// closed session. Answering dial and DNS from it would fail every lookup
+// and every connection the child makes for that whole interval, during
+// exactly the rolling deploy the follower exists to survive.
+//
+// This is a read and nothing more: no compaction, no promotion, no log
+// line. Reap owns the bookkeeping and the announcement, so a developer is
+// told once, by the thing that actually dropped the session.
 func (s *SessionSet) Primary() *session.Client {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.entries) == 0 {
-		return nil
+	for _, e := range s.entries {
+		select {
+		case <-e.sess.Done():
+		default:
+			return e.sess
+		}
 	}
-	return s.entries[0].sess
+	return nil
 }
 
 // DialTCP forwards to the current primary. It is a method, not a field, so
