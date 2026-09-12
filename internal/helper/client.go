@@ -93,6 +93,23 @@ func (c *Client) ResolverClear() error {
 	return err
 }
 
+// RouteSet pins hosts to lo0 for the life of this connection (see route.go
+// for why the credential endpoint needs it).
+func (c *Client) RouteSet(hosts []netip.Addr) error {
+	ss := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		ss = append(ss, h.String())
+	}
+	_, err := c.call(request{Op: OpRouteSet, Hosts: ss})
+	return err
+}
+
+// RouteClear removes them.
+func (c *Client) RouteClear() error {
+	_, err := c.call(request{Op: OpRouteClear})
+	return err
+}
+
 // NatLook returns the pre-rdr destination of a captured connection.
 func (c *Client) NatLook(proto string, src, dst netip.AddrPort) (netip.AddrPort, error) {
 	resp, err := c.call(request{Op: OpNatLook, NatLook: &natLookWire{Proto: proto, Src: src.String(), Dst: dst.String()}})

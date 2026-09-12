@@ -11,8 +11,13 @@ import (
 	"github.com/kyosu-1/tetherd/internal/helper/pf"
 )
 
-// ProtocolVersion must match between CLI and helper.
-const ProtocolVersion = "1"
+// ProtocolVersion must match between CLI and helper. Bumped to 2 in v0.3a
+// with route.set / route.clear: a v0.2 helper does not know them, and a CLI
+// that silently skipped pinning the credential endpoint's route would leave
+// the task role working only intermittently - the exact failure v0.3a
+// closes. Dial refuses the mismatch instead, and VersionError says how to
+// restart the helper.
+const ProtocolVersion = "2"
 
 // DefaultSocket is where the helper listens.
 const DefaultSocket = "/var/run/tetherd.sock"
@@ -28,6 +33,8 @@ const (
 	OpResolverSet   = "resolver.set"
 	OpResolverClear = "resolver.clear"
 	OpNatLook       = "natlook"
+	OpRouteSet      = "route.set"
+	OpRouteClear    = "route.clear"
 )
 
 // Error codes in Response.Code.
@@ -49,6 +56,10 @@ type Platform interface {
 	PfClear() error
 	ResolverSet(domains []string, port int) error
 	ResolverClear() error
+	// RouteSet pins hosts to lo0 (see route.go); RouteClear removes what
+	// this helper pinned.
+	RouteSet(hosts []netip.Addr) error
+	RouteClear() error
 	NatLook(proto string, src, dst netip.AddrPort) (netip.AddrPort, error)
 }
 
@@ -75,6 +86,9 @@ type request struct {
 	Pf       *pfWire       `json:"pf,omitempty"`
 	Resolver *resolverWire `json:"resolver,omitempty"`
 	NatLook  *natLookWire  `json:"natlook,omitempty"`
+	// Hosts carries route.set's addresses. The helper decides which of them
+	// it is willing to pin.
+	Hosts []string `json:"hosts,omitempty"`
 }
 
 type pfWire struct {

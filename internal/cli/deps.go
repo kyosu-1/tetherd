@@ -57,6 +57,10 @@ type HelperClient interface {
 	NatLook(proto string, src, dst netip.AddrPort) (netip.AddrPort, error)
 	ResolverSet(domains []string, port int) error
 	ResolverClear() error
+	// RouteSet pins host routes to lo0 for the session; RouteClear removes
+	// them. See internal/helper/route.go.
+	RouteSet(hosts []netip.Addr) error
+	RouteClear() error
 	Close() error
 }
 

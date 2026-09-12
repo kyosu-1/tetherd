@@ -146,15 +146,27 @@ func checkTargetEnv(w proto.Welcome, opts RunOptions) error {
 // ~/.aws in favour of an endpoint the child cannot reach, leaving it with no
 // identity at all while printing a green iam line.
 func taskRoleReachable(taskEnv map[string]string, cidrs []netip.Prefix) bool {
-	if taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] == "" {
-		return false
-	}
+	return taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "" && capturesTaskRole(cidrs)
+}
+
+// capturesTaskRole reports whether pf's rdr rule will cover the credential
+// endpoint, which is the precondition for pinning its host route to lo0:
+// the route is only an improvement while something on lo0 picks the
+// connection up.
+func capturesTaskRole(cidrs []netip.Prefix) bool {
 	for _, p := range cidrs {
 		if p.Contains(ecsprov.TaskRoleAddr) {
 			return true
 		}
 	}
 	return false
+}
+
+// busySessionError is what a developer sees when another `tetherd run` holds
+// the helper. Both the route pin and pf.apply can be the call that finds
+// out, and they must say the same thing.
+func busySessionError(busy *helper.BusyError) error {
+	return fmt.Errorf("%w\n        Stop the other `tetherd run` first (one session per machine in v1)", busy)
 }
 
 // taskRoleEnv returns the variables that make the task role the child's
@@ -560,11 +572,28 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 				logf("⚠ remote CIDR overlaps this machine's network: %s (that part of the LAN is routed through the agent for the child)", o)
 			}
 		}
+		// The credential endpoint needs a route before pf can help: see
+		// internal/helper/route.go for why. Only when the remote set
+		// actually covers it - pinning an address the rdr rule does not
+		// catch would send it to lo0 where nothing answers, turning an
+		// immediate error into a hang. This is also the first call that
+		// claims the machine-wide session, so it is where a second
+		// `tetherd run` now learns it is busy.
+		if capturesTaskRole(cidrs) {
+			if err := hc.RouteSet([]netip.Addr{ecsprov.TaskRoleAddr}); err != nil {
+				var busy *helper.BusyError
+				if errors.As(err, &busy) {
+					return 1, busySessionError(busy)
+				}
+				return 1, fmt.Errorf("pin the route to %s: %w", ecsprov.TaskRoleAddr, err)
+			}
+			defer hc.RouteClear()
+		}
 		cap := d.NewCapturer(hc, logf)
 		if err := cap.Start(ctx, capture.Spec{RemoteCIDRs: cidrs}); err != nil {
 			var busy *helper.BusyError
 			if errors.As(err, &busy) {
-				return 1, fmt.Errorf("%w\n        Stop the other `tetherd run` first (one session per machine in v1)", busy)
+				return 1, busySessionError(busy)
 			}
 			return 1, err
 		}

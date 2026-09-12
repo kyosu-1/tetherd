@@ -1044,6 +1044,12 @@ type fakeHelperClient struct {
 	// after recording domains/port, so a test can learn the port without
 	// polling.
 	onResolverSet func()
+	// routes is what RouteSet was asked to pin, routeCleared whether
+	// RouteClear ran, and routeSetErr what RouteSet returns (a BusyError,
+	// for the second `tetherd run` on a machine).
+	routes       []netip.Addr
+	routeCleared bool
+	routeSetErr  error
 }
 
 func (f *fakeHelperClient) PfApply(helper.PfSpec) error { return nil }
@@ -1061,6 +1067,17 @@ func (f *fakeHelperClient) ResolverSet(domains []string, port int) error {
 }
 func (f *fakeHelperClient) ResolverClear() error {
 	f.cleared = true
+	return nil
+}
+func (f *fakeHelperClient) RouteSet(hosts []netip.Addr) error {
+	if f.routeSetErr != nil {
+		return f.routeSetErr
+	}
+	f.routes = append(f.routes, hosts...)
+	return nil
+}
+func (f *fakeHelperClient) RouteClear() error {
+	f.routeCleared = true
 	return nil
 }
 func (f *fakeHelperClient) Close() error { return nil }
@@ -1106,3 +1123,136 @@ func (f *fakeCapturer) Close() error {
 	return nil
 }
 func (f *fakeCapturer) RedirectPort() int { return 15300 }
+
+// TestRunPinsTheCredentialEndpointRoute: connect()'s route lookup runs
+// before pf's output rules, so without a host route for 169.254.170.2 the
+// kernel answers EHOSTUNREACH from the reject route a failed ARP left
+// behind and pf never sees the packet (internal/helper/route.go).
+func TestRunPinsTheCredentialEndpointRoute(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{
+		region: "ap-northeast-1", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
+	hc := &fakeHelperClient{}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return hc, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.ExecPath = "/usr/bin/true"
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if len(hc.routes) != 1 || hc.routes[0].String() != "169.254.170.2" {
+		t.Fatalf("route.set was called with %v, want the credential endpoint", hc.routes)
+	}
+	if !hc.routeCleared {
+		t.Error("the route must be cleared when the run ends")
+	}
+}
+
+func TestRunDoesNotPinTheRouteWithoutCapture(t *testing.T) {
+	// --no-network never touches the helper, so it pins no route either.
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+	hc := &fakeHelperClient{}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return hc, nil }
+	if code, err := RunWithDeps(context.Background(), ssmOpts("true"), io.Discard, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if len(hc.routes) != 0 {
+		t.Fatalf("routes = %v, want none with --no-network", hc.routes)
+	}
+}
+
+// TestRunDoesNotPinARouteTheCaptureWillNotRedirect is the boundary the pin
+// has to respect: the route is only correct while pf's `rdr pass on lo0`
+// covers that address. Under --transport direct the operator chooses the
+// remote set by hand, and 169.254.170.0/24 is not in it unless they say so -
+// pinning anyway would send the credential endpoint to lo0 where no rdr rule
+// picks it up, turning an immediate "no route to host" into a hang.
+func TestRunDoesNotPinARouteTheCaptureWillNotRedirect(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	hc := &fakeHelperClient{}
+	cap := newFakeCapturer()
+	d := Deps{
+		DialHelper:  func(string) (HelperClient, error) { return hc, nil },
+		NewCapturer: func(HelperClient, func(string, ...any)) Capturer { return cap },
+	}
+	opts := RunOptions{
+		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
+		RemoteCIDRs: []string{"10.9.0.0/16"},
+		ExecPath:    "/usr/bin/true", Command: []string{"true"},
+	}
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if addrIn(cap.spec.RemoteCIDRs, "169.254.170.2") {
+		t.Fatalf("the premise is wrong: %v already covers the endpoint", cap.spec.RemoteCIDRs)
+	}
+	if len(hc.routes) != 0 {
+		t.Fatalf("routes = %v, want none: no rdr rule covers 169.254.170.2 here", hc.routes)
+	}
+}
+
+// TestRunPinsTheRouteWhenDirectCapturesTheEndpoint is the other half: pass
+// the range explicitly and the pin comes back. Without this, a pin that
+// never happened at all would satisfy the test above.
+func TestRunPinsTheRouteWhenDirectCapturesTheEndpoint(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	hc := &fakeHelperClient{}
+	d := Deps{
+		DialHelper:  func(string) (HelperClient, error) { return hc, nil },
+		NewCapturer: func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() },
+	}
+	opts := RunOptions{
+		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
+		RemoteCIDRs: []string{"10.9.0.0/16", ecsprov.TaskRoleCIDR.String()},
+		ExecPath:    "/usr/bin/true", Command: []string{"true"},
+	}
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if len(hc.routes) != 1 || hc.routes[0] != ecsprov.TaskRoleAddr {
+		t.Fatalf("routes = %v, want the credential endpoint pinned", hc.routes)
+	}
+}
+
+// TestRunExplainsABusyHelperFromRouteSet: route.set is now the first call
+// that claims the machine-wide session, so it is where a second `tetherd
+// run` finds out. That must still be the explanation a developer can act on,
+// not a bare wrapped error.
+func TestRunExplainsABusyHelperFromRouteSet(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{
+		region: "ap-northeast-1", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
+	hc := &fakeHelperClient{routeSetErr: &helper.BusyError{PID: 4242, Since: time.Now()}}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return hc, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.ExecPath = "/usr/bin/true"
+	code, err := RunWithDeps(context.Background(), opts, io.Discard, d)
+	if code != 1 || err == nil {
+		t.Fatalf("code=%d err=%v, want a failure", code, err)
+	}
+	var busy *helper.BusyError
+	if !errors.As(err, &busy) {
+		t.Fatalf("err = %v, want the BusyError to survive", err)
+	}
+	if !strings.Contains(err.Error(), "Stop the other") {
+		t.Errorf("err = %q, want the same next step pf.apply gives", err)
+	}
+}

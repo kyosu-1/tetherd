@@ -13,6 +13,7 @@ import (
 type DarwinPlatform struct {
 	pf       pf.Pfctl
 	resolver Resolver
+	route    Router
 	logf     func(string, ...any)
 
 	mu    sync.Mutex
@@ -73,6 +74,21 @@ func (p *DarwinPlatform) ResolverSet(domains []string, port int) error {
 // ResolverClear removes them.
 func (p *DarwinPlatform) ResolverClear() error { return p.resolver.Clear() }
 
+// RouteSet pins the hosts to lo0 with route(8). The lock is the same one
+// Shutdown takes, so a helper exiting mid-session cannot race the pin.
+func (p *DarwinPlatform) RouteSet(hosts []netip.Addr) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.route.Set(hosts)
+}
+
+// RouteClear removes the routes this helper pinned.
+func (p *DarwinPlatform) RouteClear() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.route.Clear()
+}
+
 // NatLook queries /dev/pf.
 func (p *DarwinPlatform) NatLook(proto string, src, dst netip.AddrPort) (netip.AddrPort, error) {
 	return NatLookPF(proto, src, dst)
@@ -88,6 +104,14 @@ func (p *DarwinPlatform) Shutdown() error {
 		firstErr = err
 	}
 	if err := p.resolver.Clear(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	// A pinned host route outlives the process that made it, so it has to
+	// go before the helper does. Only what this process pinned is known
+	// here: a route left by a crashed helper is not in p.route.set and
+	// survives to the next run, where route.set's delete-and-retry takes
+	// care of it.
+	if err := p.route.Clear(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if p.token != "" {
