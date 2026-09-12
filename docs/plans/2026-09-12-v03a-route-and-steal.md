@@ -77,6 +77,15 @@ docs/*                           spec §12 の枠、e2e チェックリスト、
   func (r *Router) Clear() error                   // 張ったものだけ route delete
   func (r *Router) Active() []netip.Addr
 
+  // helper/wire.go — Platform gains two methods (this is how every other
+  // root-only operation is abstracted; DarwinPlatform is the real one and
+  // fakePlatform in helper_test.go is the test double)
+  //   RouteSet(hosts []netip.Addr) error
+  //   RouteClear() error
+
+  // helper/platform_darwin.go — DarwinPlatform gets a `route Router` field
+  // and delegates to it.
+
   // helper/client.go
   func (c *Client) RouteSet(hosts []netip.Addr) error
   func (c *Client) RouteClear() error
@@ -195,58 +204,70 @@ func TestRouterSetRejectsAnythingButALinkLocalHost(t *testing.T) {
 }
 ```
 
-`internal/helper/helper_test.go` に追記（ソケット越しの往復と後片付け。既存の `TestServerRejectsASecondSession` などと同じ形で書く）:
+`internal/helper/helper_test.go` に追記。**既存のテストの形に合わせること**: `startServer(t, allow func(Peer) bool) (sock string, fp *fakePlatform)` が `Server{Platform: fp, ...}` を一時ソケットで起動して `fakePlatform` を返す。`fakePlatform` に `RouteSet` / `RouteClear` を足し（`routes []netip.Addr` と `routeCleared int` を記録、`snapshot()` と同じ形のアクセサを用意）、往復はそれで確認する:
 
 ```go
 func TestRouteSetAndClearOverTheSocket(t *testing.T) {
-	var got [][]string
-	srv, path := startServer(t, func(name string, args ...string) ([]byte, error) {
-		got = append(got, append([]string{name}, args...))
-		return nil, nil
-	})
-	_ = srv
-	c, err := Dial(path)
+	sock, fp := startServer(t, func(Peer) bool { return true })
+	c, err := Dial(sock)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := c.RouteSet([]netip.Addr{netip.MustParseAddr("169.254.170.2")}); err != nil {
 		t.Fatal(err)
+	}
+	if got := fp.routeSnapshot(); len(got) != 1 || got[0].String() != "169.254.170.2" {
+		t.Fatalf("platform saw %v", got)
 	}
 	if err := c.RouteClear(); err != nil {
 		t.Fatal(err)
 	}
-	c.Close()
-	if len(got) != 2 || got[0][2] != "-host" || got[1][1] != "-delete" {
-		t.Fatalf("route calls = %v", got)
+	if got := fp.routeSnapshot(); len(got) != 0 {
+		t.Fatalf("after clear the platform still has %v", got)
 	}
+	c.Close()
 }
 
 func TestDisconnectClearsTheRouteToo(t *testing.T) {
-	var got [][]string
-	_, path := startServer(t, func(name string, args ...string) ([]byte, error) {
-		got = append(got, append([]string{name}, args...))
-		return nil, nil
-	})
-	c, err := Dial(path)
+	// The CLI dying is the case this matters for: a host route left pointing
+	// at lo0 would swallow that address with nothing listening.
+	sock, fp := startServer(t, func(Peer) bool { return true })
+	c, err := Dial(sock)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := c.RouteSet([]netip.Addr{netip.MustParseAddr("169.254.170.2")}); err != nil {
 		t.Fatal(err)
 	}
-	c.Close() // CLI が異常終了した場合と同じ
-	waitFor(t, func() bool {
-		for _, c := range got {
-			if len(c) > 1 && c[1] == "-delete" {
-				return true
-			}
-		}
-		return false
-	}, "the route must be deleted when the session's connection drops")
+	c.Close()
+	waitFor(t, func() bool { return len(fp.routeSnapshot()) == 0 }, "the route to be cleared on disconnect")
+}
+
+func TestRouteSetRefusesASecondSession(t *testing.T) {
+	// Same one-session rule as pf.apply: two CLIs cannot both pin routes.
+	sock, _ := startServer(t, func(Peer) bool { return true })
+	first, err := Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if err := first.RouteSet([]netip.Addr{netip.MustParseAddr("169.254.170.2")}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	err = second.RouteSet([]netip.Addr{netip.MustParseAddr("169.254.170.2")})
+	var busy *BusyError
+	if err == nil || !errors.As(err, &busy) {
+		t.Fatalf("err = %v, want a BusyError", err)
+	}
 }
 ```
 
-（`startServer` と `waitFor` は既存のテストヘルパに合わせる。無ければこのタスクで足す — `startServer` は `Server` を一時ソケットで起動して `run` フックを差し替えられる形、`waitFor` は 2 秒まで 10ms 間隔でポーリングして条件が成立しなければ `t.Fatal`。）
+（`errors` の import を足す。`BusyError` は既存。`waitFor` は既存のヘルパ。）
 
 `internal/cli/run_e2e_test.go` に追記:
 
@@ -400,7 +421,11 @@ func (r *Router) Clear() error {
 func (r *Router) Active() []netip.Addr { return append([]netip.Addr(nil), r.set...) }
 ```
 
-`internal/helper/server.go`: セッション状態に `router *Router` を持ち、`OpRouteSet` / `OpRouteClear` を `pf.apply` / `resolver.set` と同じ形で受ける（1 セッション制の検査も同じ）。接続断の `cleanup()` は **resolver → route → pf** の順で消す（resolver が生きている間はルートも要る、という依存の逆順）。
+`internal/helper/wire.go` の `Platform` インターフェースに `RouteSet(hosts []netip.Addr) error` と `RouteClear() error` を足す。
+
+`internal/helper/platform_darwin.go` の `DarwinPlatform` に `route Router` フィールドを足し、2 メソッドを `p.route.Set` / `p.route.Clear` に委譲する（`Router.Run` は nil のままで、既定の `exec.Command("route", ...)` が使われる）。`route.go` にはビルドタグを付けない — `resolver.go` と同じく、実行するのは darwin だけだがコード自体は移植性がある。
+
+`internal/helper/server.go`: `OpRouteSet` / `OpRouteClear` を `pf.apply` / `resolver.set` と同じ形で受ける（1 セッション制の検査も同じ）。接続断の `cleanup()` は **resolver → route → pf** の順で消す（resolver が生きている間はルートも要る、という依存の逆順）。
 
 `internal/helper/client.go`:
 
