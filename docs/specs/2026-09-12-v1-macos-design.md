@@ -614,9 +614,34 @@ design.md §10 に加えて:
 
 ### v0.3a（ルート固定と steal）
 
-配線: ALB のターゲットグループを app の `:8081` から agent の `:8080` に移した（`deploy/dev-env/alb.tf` / `ecs.tf` / `rds.tf` の sg-app）。agent は `TETHERD_APP_ADDR=127.0.0.1:8081` で app へリバースプロキシし（§5.1）、`X-Dev-User` / `X-Dev-Token` が一致するリクエストだけを steal してラップトップへ転送する（§5.2）。ヘルスチェックのパスを `/healthz` から `/`・matcher `200` に変更し、agent 経由でも常に app に届くようにした。
+配線: ALB のターゲットグループを app の `:8081` から agent の `:8080` に移した（`deploy/dev-env/alb.tf` / `ecs.tf` / `rds.tf` の sg-app）。agent は `TETHERD_APP_ADDR=127.0.0.1:8081` で app へリバースプロキシし（§5.1）、`X-Dev-User` / `X-Dev-Token` が一致するリクエストだけを steal してラップトップへ転送する（§5.2）。ヘルスチェックは `/healthz`・matcher `200` のまま。agent はヘルスチェックを特別扱いしない（一致ヘッダーを持たないリクエストが app に行くだけ）ので、パスを変える必要は無かった。`healthy_threshold` だけ 3 → 2 に下げた（ターゲットグループ置き換え中の窓を短くするため）。
 
-検証手順は `docs/e2e-aws.md` の 20〜26 行。**未実施** — Go 側（`internal/agent` の steal、`internal/cli` の `--no-incoming` / `--local-port` / `--as` と `hello` へのトークン同梱）の実装が終わり、`terraform apply` で上記の配線を反映し、agent イメージを再ビルド・再デプロイした後に実施する（本計画の Task 6 Step 4）。結果は実施後にここへ追記する。
+検証手順は `docs/e2e-aws.md` の 20〜26 行。**20〜26 すべて成功**（2026-09-12、ap-northeast-1、ALB `tetherd-dev-1301575947`）。
+
+| # | 結果 |
+|---|---|
+| 20 | ラップトップが応答。CLI に `← GET /hello 200 1ms (from 124.35.91.195)`。転送先に `X-Forwarded-For: 124.35.91.195`、`X-Forwarded-Proto: http`、`Host` は ALB のホスト名のまま届いた |
+| 21 | タスクの応答。`from 127.0.0.1:57164` — app が見る接続元が同一タスク内の agent になっており、経路が ALB → agent → app であることの証拠 |
+| 22 | トークンを 1 文字変えた場合・トークン無しの場合ともタスクの応答。**ラップトップ側の受信数は 0**（応答の出どころだけでなく受信側でも確認した） |
+| 23 | セッション断の直後に一致ヘッダーで叩いて 200・タスクの応答。502 ではない |
+| 24 | タスクの応答 + CLI に `✗ steal  GET /row24  502  nothing is listening on 127.0.0.1:9321`。クライアントのレスポンスヘッダーに `X-Tetherd-No-Listener` は**出ない** |
+| 25 | `--no-incoming` 中は一致ヘッダーでもタスクの応答。`✓ steal` 行は出ず、ラップトップ側の受信数は 0 |
+| 26 | 20 秒間隔 9 サンプル（約 3 分）すべて `healthy` |
+
+**手順に罠が 1 つあった。** 既定の `local_port: 8080` は現実の開発機で埋まっている。この Mac では無関係な Docker コンテナ（nginx）が `*:8080` を IPv6 で保持していて、ローカルサーバ（IPv4 の `127.0.0.1:8080`）と共存していた。そのため**ローカルサーバを落としても 8080 は 200 を返し続け**、24 行をそのまま実行すればダイヤルは nginx に成功して「何も listen していない」経路を一度も通らずに合格していた。24 行は `--local-port` で確実に空いているポート（9321）に移して実施した。24 行を再実施する者は、まずそのポートが**接続拒否を返すこと**を確認すること。
+
+あわせて確認できたこと（v0.3a の設計変更の本体）:
+
+```
+✓ endpoint 127.0.0.1:58066 → the task's credential and metadata endpoint
+           (the child is pointed here; 169.254.170.2 is never dialed)
+✓ iam      arn:aws:sts::…:assumed-role/tetherd-dev-api-task/…  (via 127.0.0.1:58066 → the task)
+✓ network  transparent (pf rdr, gid tetherd) · remote: 10.0.0.0/16
+```
+
+`remote:` に `169.254.170.0/24` が入らないこと（既定ではループバック口から配るため）、そして §12 の既知の穴 3 番（ARP 失敗の拒否ルートで間欠的に壊れる）の原因アドレスに**もう誰も接続しない**ことが実機で確認できた。
+
+**`terraform apply` で 1 回失敗した。** ターゲットグループの `port` 変更は置き換えを強制するが、リスナが転送先にしている間は削除できないため `ResourceInUse` になる。しかも失敗が綺麗ではなく、セキュリティグループの更新だけ先に適用済みで、ALB からのインバウンドが 8080 のみ許可・ターゲットグループはまだ 8081 をヘルスチェック、という状態で止まり、dev 環境が一時的に 5xx になった。`create_before_destroy` と `name_prefix`（ターゲットグループは 6 文字まで）で解決（`f099788`）。次に同種の置き換えを含む変更を当てる者は、plan の `# forces replacement` を見た時点でこれを疑うこと。
 
 ---
 
