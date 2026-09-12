@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/kyosu-1/tetherd/internal/agent"
+	"github.com/kyosu-1/tetherd/internal/session"
 	"github.com/kyosu-1/tetherd/internal/transport"
+	ssmtr "github.com/kyosu-1/tetherd/internal/transport/ssm"
 )
 
 // --- row parsing -----------------------------------------------------------
@@ -1680,4 +1682,121 @@ func TestDoctorCommandOverridesTheTargetFromFlags(t *testing.T) {
 	if !captured.SkipAgent {
 		t.Errorf("--skip-agent must reach doctor")
 	}
+}
+
+// TestDoctorCommandExposesBothBounds: DoctorOptions.Timeout and .Budget were
+// honoured by the code from the start but no flag reached them, so an
+// operator whose network makes a row time out had nothing to turn at all.
+//
+// The zero case is the load-bearing half. Zero means "use the defaults", and
+// those are not one number - the agent-session row gets a longer bound than
+// the rest - so a flag default of 10s arriving as if it had been typed would
+// silently cap that row at 10s on every run, undoing
+// DefaultAgentCheckTimeout.
+func TestDoctorCommandExposesBothBounds(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	t.Setenv("USER", "tester")
+
+	var captured DoctorOptions
+	doctorFn = func(opts DoctorOptions) (int, error) { captured = opts; return 0, nil }
+	t.Cleanup(func() { doctorFn = defaultDoctor })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"doctor", "--cluster", "c", "--service", "api", "--timeout", "3s", "--budget", "25s"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if captured.Timeout != 3*time.Second {
+		t.Errorf("--timeout must reach doctor: %s", captured.Timeout)
+	}
+	if captured.Budget != 25*time.Second {
+		t.Errorf("--budget must reach doctor: %s", captured.Budget)
+	}
+
+	captured = DoctorOptions{}
+	root = NewRootCommand()
+	root.SetArgs([]string{"doctor", "--cluster", "c", "--service", "api"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if captured.Timeout != 0 || captured.Budget != 0 {
+		t.Errorf("a bound nobody typed must arrive as zero (= use the defaults), got timeout %s budget %s", captured.Timeout, captured.Budget)
+	}
+}
+
+// deadlineTransport records the deadline its Dial was handed and then fails,
+// so a test can read the bound doctor actually imposes on the agent-session
+// row without waiting for it.
+type deadlineTransport struct {
+	left time.Duration
+	got  bool
+}
+
+func (d *deadlineTransport) Dial(ctx context.Context, _ transport.Task) (net.Conn, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		d.left, d.got = time.Until(dl), true
+	}
+	return nil, errors.New("not today")
+}
+
+// TestDoctorGivesTheAgentRowABoundThatCoversItsWork: the agent-session row
+// ran under the general per-check bound of 10s, while the work it starts is
+// the ssm transport allowing ssm.StartupWait (20s) for the
+// session-manager-plugin to bind its local port and then the handshake
+// allowing session.HandshakeWait (15s) for the welcome. `tetherd run` gives
+// the identical work both allowances and caps neither, so the inner bound
+// outlived the outer one and doctor could red-flag a service run attaches to
+// fine.
+//
+// The deadline is read rather than waited out: waiting 35s to prove a 35s
+// bound is not a test anyone runs.
+func TestDoctorGivesTheAgentRowABoundThatCoversItsWork(t *testing.T) {
+	if DefaultAgentCheckTimeout < ssmtr.StartupWait+session.HandshakeWait {
+		t.Fatalf("DefaultAgentCheckTimeout = %s, less than the %s + %s it has to cover",
+			DefaultAgentCheckTimeout, ssmtr.StartupWait, session.HandshakeWait)
+	}
+	// The budget has to be able to hold that bound with room for the three
+	// rows printed after it, or a slow-but-healthy session costs them their
+	// turn.
+	if DefaultDoctorBudget <= DefaultAgentCheckTimeout {
+		t.Fatalf("DefaultDoctorBudget = %s, not more than the agent row's own %s", DefaultDoctorBudget, DefaultAgentCheckTimeout)
+	}
+
+	t.Run("no timeout given", func(t *testing.T) {
+		tr := &deadlineTransport{}
+		p := healthyProvider("")
+		p.tr = tr
+		opts := doctorOpts()
+		opts.Timeout = 0 // as newDoctorCommand leaves it when --timeout was not typed
+		var out strings.Builder
+		if _, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(p)); err != nil {
+			t.Fatal(err)
+		}
+		if !tr.got {
+			t.Fatal("the agent dial was given no deadline at all")
+		}
+		// Slack for the rows that ran before this one; the point is that it
+		// is nowhere near DefaultDoctorTimeout.
+		if want := ssmtr.StartupWait + session.HandshakeWait - time.Second; tr.left < want {
+			t.Errorf("the agent dial had %s left, want at least %s (the plugin's startup allowance plus the handshake)", tr.left, want)
+		}
+	})
+
+	t.Run("explicit timeout wins", func(t *testing.T) {
+		tr := &deadlineTransport{}
+		p := healthyProvider("")
+		p.tr = tr
+		opts := doctorOpts() // Timeout: 2s
+		var out strings.Builder
+		if _, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(p)); err != nil {
+			t.Fatal(err)
+		}
+		if !tr.got {
+			t.Fatal("the agent dial was given no deadline at all")
+		}
+		if tr.left > 2*time.Second {
+			t.Errorf("the agent dial had %s left, want no more than the --timeout the operator typed", tr.left)
+		}
+	})
 }

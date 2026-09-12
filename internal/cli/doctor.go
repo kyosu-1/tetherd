@@ -16,6 +16,7 @@ import (
 	"github.com/kyosu-1/tetherd/internal/proto"
 	"github.com/kyosu-1/tetherd/internal/session"
 	"github.com/kyosu-1/tetherd/internal/transport"
+	ssmtr "github.com/kyosu-1/tetherd/internal/transport/ssm"
 )
 
 // DefaultDoctorTimeout bounds any single check that has to talk to something
@@ -28,12 +29,32 @@ import (
 // because the developer learns nothing at all.
 const DefaultDoctorTimeout = 10 * time.Second
 
+// DefaultAgentCheckTimeout bounds the agent-session row, and it is
+// deliberately not DefaultDoctorTimeout: that row's work is opening the ssm
+// transport, which allows the session-manager-plugin ssm.StartupWait to bind
+// its local port, and then the control handshake, which allows
+// session.HandshakeWait for the agent's welcome. `tetherd run` gives the
+// identical work the same two allowances and caps neither, so a 10s bound
+// here red-flagged a service run attaches to fine - an inner bound
+// outliving the outer one, which can only ever produce a false failure.
+//
+// Sized from the two constants rather than written out, so raising either
+// one cannot leave this behind.
+const DefaultAgentCheckTimeout = ssmtr.StartupWait + session.HandshakeWait
+
 // DefaultDoctorBudget bounds the whole report, not just each row. Eleven
 // checks plus one resolve per configured domain, each allowed
 // DefaultDoctorTimeout, adds up to minutes in the worst case; nobody waits
 // that long for a diagnostic. What the budget cuts short is reported as
 // unchecked or failed, never silently dropped.
-const DefaultDoctorBudget = 45 * time.Second
+//
+// It has to be comfortably more than DefaultAgentCheckTimeout, not merely
+// more: a budget that the agent row alone could exhaust would leave the
+// three rows after it - the captured set, the local addresses, the remote
+// domains - reported as not checked on a slow but healthy session, which is
+// the same false report from the other direction. --budget is there for an
+// operator who wants a shorter one.
+const DefaultDoctorBudget = 90 * time.Second
 
 // sessionManagerPluginName is the binary the ssm transport runs as a
 // subprocess (spec §6.1).
@@ -49,7 +70,11 @@ const domainProbeLabel = "tetherd-doctor-probe"
 type DoctorOptions struct {
 	RunOptions
 	// Timeout is how long any one check may take before it is reported as
-	// failed. Zero means DefaultDoctorTimeout.
+	// failed. Zero means DefaultDoctorTimeout for every row except the
+	// agent session, which gets DefaultAgentCheckTimeout - the work that
+	// row starts does not fit the general bound. A non-zero value applies
+	// to every row, that one included: an operator who types --timeout
+	// means it.
 	Timeout time.Duration
 	// Budget is how long the whole report may take. Zero means
 	// DefaultDoctorBudget.
@@ -116,8 +141,17 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 
 	d = d.withDefaults()
 	timeout := opts.Timeout
+	// agentTimeout is the one check whose work does not fit the general
+	// per-check bound (see DefaultAgentCheckTimeout). An explicit
+	// --timeout is honoured as typed - an operator who asks for 5s means
+	// every row, including this one - so the longer default applies only
+	// when no timeout was given. newDoctorCommand keeps Timeout zero unless
+	// the flag was actually set, which is what makes that distinction exist
+	// at all.
+	agentTimeout := timeout
 	if timeout <= 0 {
 		timeout = DefaultDoctorTimeout
+		agentTimeout = DefaultAgentCheckTimeout
 	}
 	budget := opts.Budget
 	if budget <= 0 {
@@ -255,7 +289,7 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 	case taskErr != nil:
 		results = append(results, notChecked("agent session", "the task could not be found"))
 	default:
-		sctx, scancel := context.WithTimeout(ctx, timeout)
+		sctx, scancel := context.WithTimeout(ctx, agentTimeout)
 		s, dialErr := dialAgent(sctx, opts.RunOptions, d, prov, task, quiet)
 		scancel()
 		if dialErr == nil {
@@ -272,7 +306,7 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 		// Sending a developer to inspect a healthy sidecar over a clock is
 		// the misattribution timedOut exists for.
 		if isContextError(dialErr) {
-			results = append(results, timedOut("agent session", checkTimedOut(ctx, "the tetherd-agent handshake", timeout)))
+			results = append(results, timedOut("agent session", checkTimedOut(ctx, "the tetherd-agent handshake", agentTimeout)))
 		} else {
 			results = append(results, doctor.CheckAgentSession(welcome.Version, welcome.Env, opts.TargetEnv, dialErr))
 		}

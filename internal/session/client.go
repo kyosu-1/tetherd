@@ -14,6 +14,15 @@ import (
 	"github.com/kyosu-1/tetherd/internal/proto"
 )
 
+// HandshakeWait is how long Dial waits for the agent's welcome when the
+// caller's context carries no deadline of its own (`tetherd run`'s case).
+//
+// It is exported because a caller that does impose a deadline has to allow
+// at least this long for the handshake: `tetherd doctor` bounds every check,
+// and a bound shorter than this reports an agent that answers `tetherd run`
+// fine as one that is not there.
+const HandshakeWait = 15 * time.Second
+
 // Options tunes the client's liveness check.
 type Options struct {
 	PingInterval time.Duration // default 5s
@@ -62,7 +71,7 @@ func Dial(ctx context.Context, conn net.Conn, hello proto.Hello, opts Options) (
 	if dl, ok := ctx.Deadline(); ok {
 		control.SetReadDeadline(dl)
 	} else {
-		control.SetReadDeadline(time.Now().Add(15 * time.Second))
+		control.SetReadDeadline(time.Now().Add(HandshakeWait))
 	}
 	typ, raw, err := dec.Decode()
 	control.SetReadDeadline(time.Time{})

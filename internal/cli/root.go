@@ -161,6 +161,22 @@ func newDoctorCommand() *cobra.Command {
 			if err := applyConfig(cmd, &opts.RunOptions); err != nil {
 				return err
 			}
+			// A bound the operator did not type must reach DoctorRun as
+			// zero, not as the flag's default. Zero is what means "use the
+			// defaults", and the defaults are not one number: the
+			// agent-session row needs DefaultAgentCheckTimeout, because the
+			// ssm transport allows its plugin ssm.StartupWait to bind a
+			// port before the handshake even begins. Letting the flag's own
+			// default arrive as an explicit 10s would silently cap that row
+			// at 10s on every run, which is the bug the longer bound fixes.
+			// Both go through changed() so a rename cannot turn either
+			// guard into a silent no-op.
+			if !changed(cmd, "timeout") {
+				opts.Timeout = 0
+			}
+			if !changed(cmd, "budget") {
+				opts.Budget = 0
+			}
 			code, err := doctorFn(opts)
 			if err != nil {
 				if code == 0 {
@@ -188,6 +204,15 @@ func newDoctorCommand() *cobra.Command {
 	// No backticks in this help text: cobra reads a backquoted word as the
 	// flag's argument name, which for a bool flag prints as nonsense.
 	f.BoolVar(&opts.SkipAgent, "skip-agent", false, "do not open a session to the agent; the agent session, task env and remote domain rows are then reported as not checked, and they are the only ones that prove tetherd run can attach at all")
+	// The two bounds the report runs under. They were honoured by
+	// DoctorRun from the start but reachable only in-process, so an
+	// operator whose network makes a row time out had nothing to turn. The
+	// defaults shown here are only the general per-check bound and the
+	// whole-report budget; see DoctorOptions.Timeout for the agent-session
+	// row, whose default is longer, and RunE above for why not typing
+	// these is not the same as typing their defaults.
+	f.DurationVar(&opts.Timeout, "timeout", DefaultDoctorTimeout, "how long any one check may take before it is reported as not having answered")
+	f.DurationVar(&opts.Budget, "budget", DefaultDoctorBudget, "how long the whole report may take; what it cuts short is reported as not checked")
 	return cmd
 }
 
