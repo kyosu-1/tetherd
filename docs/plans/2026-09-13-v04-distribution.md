@@ -46,7 +46,6 @@ servicedir: "~/Library/Services",
 `homebrew_casks:` で配り、常駐は `sudo tetherd-helper install` が `/Library/LaunchDaemons/` に plist を書いて `launchctl bootstrap` する。**却下した代替は formula（`brews:`）を deprecation 警告つきで使い続けること** — UX は `sudo brew services start tetherd` の 1 行ぶん良いが、`goreleaser check` を門にできず、hard deprecated の経路に乗る。
 
 自前で持つほうが結果的に良い点（これは副産物ではなく採用理由）:
-- Homebrew を使わない人も「アーカイブを展開して `sudo tetherd-helper install`」で同じ状態になる
 - plist が自分のものなので `KeepAlive` / `ThrottleInterval` / ログの行き先 / `--exec-src` を自分で決められる
 - `brew upgrade` 後に `sudo tetherd-helper install` を再実行すれば**両方のバイナリが入れ替わる**（後述）
 - **間違っていた場合の代償**: ユーザが打つコマンドが `brew services` でない 1 つだけ。小さく、あとから formula に戻せる
@@ -54,6 +53,21 @@ servicedir: "~/Library/Services",
 **4. cask は quarantine を踏む。** GoReleaser の cask テンプレート自身が `postflight` に「removing the macOS quarantine attribute」の注記を持ち、公式の移行例も `post_install` で `xattr` を外している。**署名と notarization（Apple Developer アカウントが必要）は v0.4 の範囲外**で、v1 の課題として書き残す。v0.4 は `postflight` で quarantine 属性を外す。
 
 **5. `LICENSE` ファイルがリポジトリに無い。** だから cask の `license:` は**書かない**（持っていないライセンスを宣言しないこと）。「LICENSE を追加するかは所有者の判断」として PR に書く。**MIT だと推測して書かない。**
+
+**7. spec §7 は既にこの全部を指定していた。読んでから書くこと。** `docs/specs/2026-09-12-v1-macos-design.md:415-427` に導入手順・ラベル・`install` / `uninstall` の中身・`KeepAlive` の形まで書いてある。**この計画の初稿はそれを読まずに書いたので、ラベルを発明して production の文字列 2 本と矛盾させていた。** spec が binding authority。ただし spec の 3 点は今や古い:
+
+| spec の記述 | 現状 | この計画の扱い |
+|---|---|---|
+| 「formula は 3 バイナリを prefix に置くだけ」 | **formula 生成は hard deprecated**（実測 1） | **cask にする。spec を修正する**（Task 2 Step 10） |
+| tap は `kyosu-1/homebrew-tetherd` | batcha が使っている `kyosu-1/homebrew-tap` が既にある | **既存の tap を使う**（利用者の指示）。**spec を修正する** |
+| **helper は常駐しない**（`Sockets` によるソケットアクティベーション、`launch_activate_socket()` を `purego` で呼ぶ、30 秒でアイドル終了） | 未実装。`helper.Server.ListenAndServe` は自分でソケットを作る | **v0.4 では常駐にする。下の Ruling S を読むこと** |
+
+**Ruling S — ソケットアクティベーションは v0.4 では実装しない。** `RunAtLoad: true` + `KeepAlive: {SuccessfulExit: false}` の常駐デーモンにする。
+
+- **理由 1:** 常駐なら helper 側のコードは **1 行も変わらない**（`ListenAndServe` がそのまま使える）。アクティベーションは `purego` という**新しい依存**（この計画は Task 6 の 1 モジュールしか許していない）と、fd を launchd から受け取る新しい経路と、アイドル終了のライフサイクルを要求する。
+- **理由 2: 後から入れるのが安い。** plist を書くのは `sudo tetherd-helper install` 自身で、それは spec が定めた**アップグレード手順そのもの**。だから後で `Sockets` を足しても、利用者がすることは「文書済みのコマンドをもう一度打つ」だけ。**「先に入れないと高くつく」と最初は考えたが、それは間違いだった。**
+- **代償:** それまでの利用者の Mac には root のデーモンが常駐する。spec が常駐を避けたのはこの攻撃面のため。**小さくない代償なので、README にも spec にも「v0.4 は常駐、アクティベーションは次」と書く。**
+- **spec §7 を「v0.4 では常駐」と明記して修正すること**（Task 2 Step 10）。黙って乖離させない — それが v0.3b で 7 件直した欠陥そのもの。
 
 **6. `goreleaser` はこのマシンに入っていない。入れないこと。** `go run github.com/goreleaser/goreleaser/v2@v2.18.1 ...` で動く。**実測済みで `go.mod` / `go.sum` は変化しない**（`go run pkg@version` はカレントモジュールを無視する）。バージョンは必ず固定する（`@latest` は再現しない）。
 
@@ -245,14 +259,14 @@ git commit
 
 **ここが v0.4 の核心。設計上の決定を先に全部書く。**
 
-1. **ラベルは `io.github.kyosu-1.tetherd.helper`。** plist は `/Library/LaunchDaemons/io.github.kyosu-1.tetherd.helper.plist`。逆 DNS は**実際に所有しているもの**から取る（`com.tetherd` は所有していないドメイン）。ラベルと plist のファイル名は一致させる（`launchctl` の慣習）。
+1. **ラベルは `dev.tetherd.helper`。決めるのではなく、既にあるものに合わせる。** spec §7 が `/Library/LaunchDaemons/dev.tetherd.helper.plist` を指定しており、**production の文字列 2 本が既にこのラベルを案内している**: `internal/doctor/checks.go:20` と `internal/helper/client.go:43` の `sudo launchctl kickstart -k system/dev.tetherd.helper`。テスト 2 本（`internal/doctor/doctor_test.go:191`、`internal/helper/client_test.go:115`）がそれを留めている。**別のラベルを発明すると doctor が出す案内が動かなくなる。**
 2. **plist は root:wheel の 0644。** launchd は group/world 書き込み可能な plist を拒否する。ディレクトリは 0755。
 3. **daemon が起動するのは Homebrew のパスではなく root 所有のコピー。** `install` は自分自身と `tetherd-exec` を `ExecInstallDir`（`/usr/local/libexec/tetherd`）にコピーし、plist はそのコピーを指す。理由は `internal/helper/install.go:13` のコメントが `tetherd-exec` について既に書いているのと同じ:「Homebrew の prefix はユーザが書ける」。**root の LaunchDaemon がユーザ書き込み可能なパスのバイナリを起動したら、そのユーザは root を取れる。**
 4. **だから `install` は転送先のパス全体を検証する。** `ExecInstallDir` の各構成要素（`/`, `/usr`, `/usr/local`, `/usr/local/libexec`, `/usr/local/libexec/tetherd`）が **root 所有かつ group/world 書き込み不可**であることを確かめ、違えば**何も書かずに失敗する**。
    **なぜ必須か:** Intel Mac では Homebrew の prefix が `/usr/local` で、`install.go:13` のコメントの前提がそこで成り立つか**この計画では確かめられなかった**（Homebrew の書き込み可能ディレクトリ一覧が手元の Homebrew のソースに定数として見つからなかった）。このマシン（Apple Silicon、prefix は `/opt/homebrew`）では `/usr/local` と `/usr/local/libexec` は root:wheel 0755 で成り立っている。**コメントの前提を、コードで強制される不変条件に変える。** そうすれば Homebrew の内部仕様を当てにしなくてよい。
 5. **`install` は upgrade でもある。** 冪等で、毎回両方のバイナリを上書きし、plist を書き直し、`bootout` → `bootstrap` し直す。`brew upgrade tetherd` の後にこれを打てば新しいバイナリが常駐する。**README と caveats はこれを「アップグレード手順」として書く。**
 6. **`os.Executable()` の結果は `filepath.EvalSymlinks` に通す。** cask は `tetherd-helper` を Homebrew の `bin` から staged path への symlink として置く。symlink のままだと隣にある `tetherd-exec` が見つからない。**これは実機でしか分からない類の失敗なので e2e 行で見る。**
-7. **`KeepAlive` は `SuccessfulExit: false` にする。** `main.go` は `EnsureGroup` / `InstallExec` の失敗で `log.Fatalf`（終了コード 1）する。素の `KeepAlive: true` だと、復旧しない失敗で再起動を繰り返してログが埋まり原因が埋もれる。`SuccessfulExit: false` なら異常終了時だけ上げ直すので**正常な停止（`bootout`）では上がってこず**、異常時は `ThrottleInterval` で間隔が空く。**`ThrottleInterval` は明示的に書く** — 既定値（10 秒）に頼らない。
+7. **`KeepAlive` は `SuccessfulExit: false` にする（spec §7 がこの形を指定している）。`RunAtLoad` は `true`**（Ruling S。アクティベーションを入れるまでは常駐）。 `main.go` は `EnsureGroup` / `InstallExec` の失敗で `log.Fatalf`（終了コード 1）する。素の `KeepAlive: true` だと、復旧しない失敗で再起動を繰り返してログが埋まり原因が埋もれる。`SuccessfulExit: false` なら異常終了時だけ上げ直すので**正常な停止（`bootout`）では上がってこず**、異常時は `ThrottleInterval` で間隔が空く。**`ThrottleInterval` は明示的に書く** — 既定値（10 秒）に頼らない。
 8. **ログの行き先を plist で指定する。** `StandardOutPath` / `StandardErrorPath` を `/var/log/tetherd-helper.log` に。初回インストールで失敗したときに何も残らないのが最悪。
 
 **テスト可能性の制約（Global Constraints の再掲。ここが一番効く）:**
@@ -261,7 +275,7 @@ git commit
 
 ```go
 // DaemonLabel はラベルと plist ファイル名の唯一の出どころ。
-const DaemonLabel = "io.github.kyosu-1.tetherd.helper"
+const DaemonLabel = "dev.tetherd.helper"
 
 // Paths は install/uninstall が書き込む先。テストは tmpdir を渡す。
 type Paths struct {
@@ -309,7 +323,9 @@ func Uninstall(p Paths, run func(string, ...string) (string, error)) error
 - **2 回呼んでも成功すること（冪等）**。2 回目で plist の内容が同じこと。
 - 注入した `run` に渡った `launchctl` の呼び出し列が **`bootout` → `bootstrap` の順**であること。
 - **`bootout` が「そんなものは無い」で失敗しても `Install` は成功すること**（初回インストールがこれ）。`bootout` の失敗を握りつぶす条件が広すぎないこと — **`bootstrap` の失敗は握りつぶさない。**
-- `Uninstall` が plist を消し、`bootout` を呼ぶこと。**グループは消さない**（`docs/uninstall.md` が他の残骸と一緒に扱う。グループを消すと同じマシンの別の利用者の setgid バイナリが壊れる）。
+- `Uninstall` が **spec §7 の 4 つ**を行うこと: `launchctl bootout`、plist の削除、**グループの削除**、`/usr/local/libexec/tetherd` の削除。
+  **初稿は「グループは消さない」と書いていたが、spec は消すと書いてある。spec が authority なので消す。** グループを消すと同じマシンの他の利用者の setgid バイナリが壊れうるが、これは 1 人の開発者の Mac に入るツールで、`uninstall` は「無かった状態に戻す」ためのもの。**消さないと初回インストールの検証ができない**（Task 4 の理由そのもの）。
+- **`Uninstall` は途中で失敗しても残りを試すこと。** plist が無い・グループが無い・ディレクトリが無いのは**成功**として扱う（2 回実行できる必要がある）。**`bootout` の「無い」以外の失敗は報告する。**
 - **mutation: `bootstrap` の失敗を握りつぶす / 順序を入れ替える / 2 回目の呼び出しで失敗する（冪等性の破壊） / plist を 0666 で書く。**
 
 - [ ] **Step 4: `main.go` にサブコマンドを足す**
@@ -318,9 +334,18 @@ func Uninstall(p Paths, run func(string, ...string) (string, error)) error
 
 `install` は `filepath.EvalSymlinks(os.Executable())` の親を `srcDir` として `Install` を呼ぶ。成功したら**何をどこに置いたかを 1 行ずつ出す**（初回インストールで唯一の手がかりになる）。
 
-- [ ] **Step 5: helper のバージョン不一致メッセージを新しいラベルに合わせる**
+- [ ] **Step 5: 既にあるラベルのリテラルを `DaemonLabel` 1 箇所にまとめる**
 
-既存のメッセージが `launchctl` の形で案内しているので **`DaemonLabel` を使う形に直す**。`grep -rn 'launchctl' internal/ cmd/` で全部見つけて、リテラルのラベルを 2 箇所に書かないこと。**この 1 件を忘れると、案内されたコマンドが動かない。**
+**メッセージの文面は変えない。**`internal/doctor/checks.go:20` と `internal/helper/client.go:43` が既に `system/dev.tetherd.helper` を案内しており、これが正しい。やるのは**リテラルを定数に寄せること**だけ:
+
+```
+internal/doctor/checks.go:20  r.Next = "sudo tetherd-helper install  (then: sudo launchctl kickstart -k system/dev.tetherd.helper)"
+internal/helper/client.go:43  ... "brew upgrade tetherd && sudo tetherd-helper install  (then: sudo launchctl kickstart -k system/dev.tetherd.helper)"
+```
+
+`internal/doctor` が `internal/helper` を import してよいかを確認してから寄せること（循環 import になるなら**寄せずに、両方が同じ文字列であることをテストで留める**ほうを選ぶ。判断と理由を報告に書く）。テストは `internal/doctor/doctor_test.go:191` と `internal/helper/client_test.go:115` が留めているので、**文面を変えたらそれらが落ちる。落ちたら文面を戻すこと**（テストが正しい）。
+
+**v0.4 の本当の意味がここにある: `checks.go:20` は `sudo tetherd-helper install` を案内しているが、そのサブコマンドは存在しない。** doctor が「打て」と言うコマンドが無い状態が v0.3b まで続いていた。Task 2 はその案内を真にする。
 
 - [ ] **Step 6: `.goreleaser.yml` に `homebrew_casks:` を足す**
 
@@ -332,12 +357,14 @@ homebrew_casks:
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: https://github.com/kyosu-1/tetherd
     description: mirrord-like local development environment for ECS Fargate
-    # binaries は PATH に symlink されるものだけ。tetherd-exec は
-    # root 所有のディレクトリからしか意味を持たない setgid ラッパーなので
-    # アーカイブには入るが symlink はしない（install がコピーする）。
+    # spec §7: 「formula は 3 バイナリを prefix に置くだけ」。cask でも
+    # 同じ数を置く。tetherd-exec を PATH に出しても害は無く (setgid の
+    # 実体は install が root 所有のディレクトリに置くコピーのほう)、
+    # spec との乖離を増やさないほうを選ぶ。
     binaries:
       - tetherd
       - tetherd-helper
+      - tetherd-exec
     dependencies:
       - formula: session-manager-plugin
     hooks:
@@ -345,9 +372,9 @@ homebrew_casks:
         install: |
           system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", staged_path]
     uninstall:
-      launchctl: io.github.kyosu-1.tetherd.helper
+      launchctl: dev.tetherd.helper
       delete:
-        - /Library/LaunchDaemons/io.github.kyosu-1.tetherd.helper.plist
+        - /Library/LaunchDaemons/dev.tetherd.helper.plist
         - /usr/local/libexec/tetherd
     caveats: |
       tetherd needs a root helper for pf, /etc/resolver and the tetherd group:
@@ -374,7 +401,16 @@ homebrew_casks:
 
 cask の全文、root 所有のディレクトリにコピーする理由（と `install.go:13` のコメントとの関係）、`KeepAlive` の判断とその根拠、quarantine の扱いと**署名・notarization が v1 の課題であること**、アップグレード手順（`brew upgrade` の後に `sudo tetherd-helper install`）、**ラベルが Go の定数と cask の両方に書かれていること**。
 
-- [ ] **Step 9: コミット**（`daemon.go`/`daemon_test.go`/`main.go` と `.goreleaser.yml`/`docs/install.md` は**別コミット**に分ける。レビュアが片方だけ却下できるように）
+- [ ] **Step 9: `docs/specs/2026-09-12-v1-macos-design.md` §7 を修正する**
+
+**黙って乖離させないこと。**`:415-427` の 3 点を直す（実測 7 の表）:
+- `brew install kyosu-1/tetherd/tetherd` → `brew install kyosu-1/tap/tetherd`、tap 名も `kyosu-1/homebrew-tap`
+- 「formula は 3 バイナリを prefix に置くだけ。`service` ブロックは使わない」→ **cask**。`service` を使わない理由は spec が既に正しく書いている（launchd の登録は helper 自身が行う）ので、そこは変えない
+- 「**helper は常駐しない**」→ **v0.4 では常駐**（`RunAtLoad: true`）であることと、ソケットアクティベーションが次であることを明記。**30 秒のアイドル終了と `purego` の記述もそこに掛かるので、同じ場所に書く**
+
+`§12` にも v0.4 の検証行への参照を足す。
+
+- [ ] **Step 10: コミット**（`daemon.go`/`daemon_test.go`/`main.go` と `.goreleaser.yml`/`docs/install.md`/spec は**別コミット**に分ける。レビュアが片方だけ却下できるように）
 
 ---
 
@@ -409,8 +445,8 @@ cask の全文、root 所有のディレクトリにコピーする理由（と 
 - [ ] **Step 1: `docs/uninstall.md` を書く**
 
 この順で:
-1. `sudo tetherd-helper uninstall`（daemon を落として plist を消す。pf と `/etc/resolver` は helper 自身が終了時に片付ける）
-2. 残留の確認: `sudo pfctl -a com.apple/900.tetherd -s rules`（空であること）、`ls /etc/resolver/`、`netstat -rn | grep 169.254.170`（`pin_credential_route` を使った場合）、`sudo launchctl print system/io.github.kyosu-1.tetherd.helper`（見つからないこと）
+1. `sudo tetherd-helper uninstall` — **spec §7 の 4 つをこれ 1 つが行う**（`bootout`、plist、グループ、`/usr/local/libexec/tetherd`）。pf と `/etc/resolver` は helper 自身が終了時に片付ける。**以下の 3〜5 は、これが失敗したときの手作業の手順として書く**（消し残りがあると初回インストールの検証が嘘になるので、確認手順は残す）
+2. 残留の確認: `sudo pfctl -a com.apple/900.tetherd -s rules`（空であること）、`ls /etc/resolver/`、`netstat -rn | grep 169.254.170`（`pin_credential_route` を使った場合）、`sudo launchctl print system/dev.tetherd.helper`（見つからないこと）
 3. `sudo rm -rf /usr/local/libexec/tetherd`
 4. `sudo dseditgroup -o delete tetherd`
 5. `brew uninstall --cask tetherd`
@@ -422,9 +458,9 @@ cask の全文、root 所有のディレクトリにコピーする理由（と 
 
 | # | コマンド | 期待 | 確認すること |
 |---|---|---|---|
-| 32 | `docs/uninstall.md` を全部実行 → `brew install kyosu-1/tap/tetherd` | `tetherd` と `tetherd-helper` が PATH に入る | アーカイブの中身が cask の想定と一致。**`tetherd-exec` は PATH に出ない** |
+| 32 | `docs/uninstall.md` を全部実行 → `brew install kyosu-1/tap/tetherd` | **3 本**が PATH に入る | アーカイブの中身が cask の `binaries` と一致（spec §7 の「3 バイナリを prefix に」） |
 | 33 | `sudo tetherd-helper install` | plist が置かれ、グループが作られ、`/usr/local/libexec/tetherd/` に 2 本入り、daemon が上がる | **`EvalSymlinks` が効いていること** — Homebrew の symlink 経由で起動しても隣の `tetherd-exec` を見つけられる（設計上の決定 6）。**実機でしか分からない** |
-| 34 | `sudo launchctl print system/io.github.kyosu-1.tetherd.helper` | 走っていて、`ProgramArguments` が root 所有のパスを指す | **Homebrew の prefix を指していないこと**（設計上の決定 3） |
+| 34 | `sudo launchctl print system/dev.tetherd.helper` | 走っていて、`ProgramArguments` が root 所有のパスを指す | **Homebrew の prefix を指していないこと**（設計上の決定 3）。**`RunAtLoad` で常駐していること**（Ruling S。アクティベーションを入れたらこの行の期待値が変わる） |
 | 35 | `tetherd doctor` | helper・グループ・setgid の 3 行が ✓ | 初回インストール直後が doctor から見て健全 |
 | 36 | `tetherd run -- aws sts get-caller-identity` | タスクロールの ARN | **brew で入れたバイナリで**一通り動く。**helper が launchd 経由で動いている状態で**（前面起動の検証は v0.3b までに済んでいる） |
 | 37 | `sudo tetherd-helper install` をもう一度 | 成功して daemon が上がり直す | 冪等性。**アップグレード手順がこれなので、動かないと README が嘘になる** |
