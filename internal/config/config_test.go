@@ -497,6 +497,52 @@ func TestEnsurePersonalBackfillsAMissingToken(t *testing.T) {
 	}
 }
 
+// TestEnsurePersonalBackfillIsRaceSafe covers the other half of the token
+// race: the file already exists without a token (hand-created, or written
+// by an older tetherd), and several runs start at once. Every caller must
+// come back with the one token that is on disk - a caller holding a token
+// the file does not have would fail the agent's X-Dev-Token match in v0.3
+// while looking perfectly healthy locally.
+func TestEnsurePersonalBackfillIsRaceSafe(t *testing.T) {
+	const callers = 16
+	path := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(path, []byte("user: x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	tokens := make([]string, callers)
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			got, _, err := EnsurePersonal(path, "ignored")
+			tokens[i], errs[i] = got.Token, err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	onDisk := Personal{}
+	if err := decodeFile(path, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.Token == "" || onDisk.User != "x" {
+		t.Fatalf("the file must keep user and gain exactly one token: %+v", onDisk)
+	}
+	for i := range tokens {
+		if errs[i] != nil {
+			t.Fatalf("caller %d: %v", i, errs[i])
+		}
+		if tokens[i] != onDisk.Token {
+			t.Fatalf("caller %d got a token that is not on disk: %q vs %q", i, tokens[i], onDisk.Token)
+		}
+	}
+}
+
 // TestEnsurePersonalWithATokenIsByteIdentical is "never overwrite" for the
 // case that already has a token: it must not be touched at all.
 func TestEnsurePersonalWithATokenIsByteIdentical(t *testing.T) {

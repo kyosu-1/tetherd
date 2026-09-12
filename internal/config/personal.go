@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -106,23 +107,77 @@ func decodeExisting(path string) (Personal, error) {
 // ensureToken mints and persists a token for p if it does not already have
 // one, preserving every other field p already has. p with a token is
 // returned unchanged (and the file is not touched at all).
+//
+// The backfill holds an exclusive flock on the file across re-read, mint
+// and write. Without it two runs starting together on a token-less file
+// would each mint a token, each write it, and each return its own - one of
+// which is not the token on disk, which is the same mismatch the atomic
+// creation path exists to prevent. The lock is advisory and process-wide,
+// which is exactly the scope that matters here: the racing writers are
+// other tetherd runs on this machine.
 func ensureToken(path string, p Personal) (Personal, bool, error) {
 	if p.Token != "" {
 		return p, false, nil
 	}
-	token, err := newToken()
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		return Personal{}, false, fmt.Errorf("open %s to add a token: %w", path, err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return Personal{}, false, fmt.Errorf("lock %s: %w", path, err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+
+	// Re-read under the lock: another run may have backfilled already.
+	cur, err := decodeLocked(f, path)
 	if err != nil {
 		return Personal{}, false, err
 	}
-	p.Token = token
-	body, err := yaml.Marshal(p)
+	if cur.Token != "" {
+		return cur, false, nil
+	}
+	if cur.Token, err = newToken(); err != nil {
+		return Personal{}, false, err
+	}
+	body, err := yaml.Marshal(cur)
 	if err != nil {
 		return Personal{}, false, err
 	}
-	if err := os.WriteFile(path, body, 0o600); err != nil {
-		return Personal{}, false, fmt.Errorf("write %s: %w", path, err)
+	if err := writeLocked(f, path, body); err != nil {
+		return Personal{}, false, err
 	}
-	return p, false, nil
+	return cur, false, nil
+}
+
+// decodeLocked decodes the already-open file from its start.
+func decodeLocked(f *os.File, path string) (Personal, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return Personal{}, err
+	}
+	var p Personal
+	dec := yaml.NewDecoder(f)
+	dec.KnownFields(true)
+	if err := dec.Decode(&p); err != nil && !errors.Is(err, io.EOF) {
+		return Personal{}, fmt.Errorf("%s: %w", path, err)
+	}
+	return p, nil
+}
+
+// writeLocked replaces the open file's contents in place, which is what
+// keeps the flock meaningful: publishing through a rename would swap the
+// inode the lock is held on.
+func writeLocked(f *os.File, path string, body []byte) error {
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if _, err := f.Write(body); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
 }
 
 // linkFile is os.Link, indirected so tests can force the
