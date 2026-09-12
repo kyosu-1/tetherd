@@ -505,6 +505,180 @@ func TestRunStripsLocalAWSCredentialsFromTheChild(t *testing.T) {
 	}
 }
 
+// breakableTransport dials the in-process agent and keeps every connection
+// it hands out, so a test can cut the session while the child is still
+// running. Nothing outside Run can arrange that otherwise: the session is
+// built and owned inside it.
+type breakableTransport struct {
+	addr  string
+	mu    sync.Mutex
+	conns []net.Conn
+}
+
+func (b *breakableTransport) Dial(ctx context.Context, _ transport.Task) (net.Conn, error) {
+	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", b.addr)
+	if err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	b.conns = append(b.conns, c)
+	b.mu.Unlock()
+	return c, nil
+}
+
+// breakSession closes the transport under the session, which is what the
+// CLI sees when the session-manager-plugin dies or the task goes away.
+func (b *breakableTransport) breakSession() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, c := range b.conns {
+		c.Close()
+	}
+}
+
+// writeChildScript writes a /bin/sh child and returns its path. Every script
+// here ignores SIGINT, because that is the case both tests below are about:
+// cancel() only asks.
+func writeChildScript(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "child.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\ntrap '' INT\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%s never appeared", path)
+}
+
+// runInBackground starts Run and returns a channel carrying its result, so a
+// test can assert on *when* it returns and not only on what it returns.
+type runResult struct {
+	code int
+	err  error
+}
+
+func runInBackground(opts RunOptions, out io.Writer, d Deps) <-chan runResult {
+	done := make(chan runResult, 1)
+	go func() {
+		code, err := RunWithDeps(context.Background(), opts, out, d)
+		done <- runResult{code: code, err: err}
+	}()
+	return done
+}
+
+// TestRunWaitsForTheChildWhenTheSessionIsLost pins the `<-waitErr` on the
+// session-lost arm. Deleting it left the suite green, and what it does is
+// not cosmetic: Run's defers pull the pf rules, the helper connection and
+// every /etc/resolver file down as it returns, so returning while the child
+// is still alive leaves that child running with its network half
+// dismantled.
+//
+// The child ignores SIGINT and then blocks until this test releases it, so
+// "did Run wait" is decided by a file, not by a sleep race.
+func TestRunWaitsForTheChildWhenTheSessionIsLost(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	tr := &breakableTransport{addr: ag.addr}
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, tr: tr}
+
+	dir := t.TempDir()
+	started, release, finished := filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "finished")
+	script := writeChildScript(t, "echo up > "+started+"\n"+
+		"while [ ! -f "+release+" ]; do sleep 0.05; done\n"+
+		"echo done > "+finished+"\n")
+
+	opts := ssmOpts("/bin/sh", script) // NoNetwork, so Command is the child
+	var out strings.Builder
+	done := runInBackground(opts, &out, depsFor(p))
+
+	waitForFile(t, started)
+	tr.breakSession()
+
+	// The grace period is the assertion: Run has seen the session die and
+	// must still be waiting, because the child has not finished.
+	select {
+	case r := <-done:
+		t.Fatalf("Run returned (code=%d err=%v) while the child was still running; its defers have now torn down pf and /etc/resolver under it\n%s", r.code, r.err, out.String())
+	case <-time.After(300 * time.Millisecond):
+	}
+	if _, err := os.Stat(finished); err == nil {
+		t.Fatal("the child finished on its own; this test proves nothing")
+	}
+
+	if err := os.WriteFile(release, []byte("go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.code != 1 || r.err == nil {
+			t.Errorf("a lost session must be reported: code=%d err=%v", r.code, r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run never returned after the child finished")
+	}
+	// Run returned after the child was gone, not before it.
+	if _, err := os.Stat(finished); err != nil {
+		t.Errorf("Run returned before the child had finished: %v", err)
+	}
+	if !strings.Contains(out.String(), "agent session lost") {
+		t.Errorf("the run must say why it stopped: %s", out.String())
+	}
+}
+
+// TestRunKillsAChildThatIgnoresSIGINT pins child.WaitDelay. Deleting it left
+// the suite green too, and a zero WaitDelay means "wait indefinitely": a
+// child that ignores SIGINT - an interactive shell, anything with its own
+// handler - then wedges `tetherd run` forever while it is still holding the
+// pf rules and the /etc/resolver files, which is the one state a developer
+// cannot get out of without knowing about tetherd-helper.
+//
+// The delay is shortened for the test; five seconds is far too long to wait
+// for and is what production keeps. The child gives up by itself after six
+// seconds so that a regression costs a slow test rather than an orphaned
+// process, and the elapsed-time assertion is well inside that.
+func TestRunKillsAChildThatIgnoresSIGINT(t *testing.T) {
+	restore := childWaitDelay
+	childWaitDelay = 300 * time.Millisecond
+	t.Cleanup(func() { childWaitDelay = restore })
+
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	tr := &breakableTransport{addr: ag.addr}
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, tr: tr}
+
+	started := filepath.Join(t.TempDir(), "started")
+	script := writeChildScript(t, "echo up > "+started+"\n"+
+		"i=0\nwhile [ $i -lt 120 ]; do sleep 0.05; i=$((i+1)); done\n")
+
+	opts := ssmOpts("/bin/sh", script)
+	var out strings.Builder
+	done := runInBackground(opts, &out, depsFor(p))
+
+	waitForFile(t, started)
+	tr.breakSession()
+
+	start := time.Now()
+	select {
+	case r := <-done:
+		if elapsed := time.Since(start); elapsed > 3*time.Second {
+			t.Fatalf("Run took %s to give up on a child that ignores SIGINT, want about the %s wait delay", elapsed, childWaitDelay)
+		}
+		if r.code != 1 || r.err == nil {
+			t.Errorf("a lost session must be reported: code=%d err=%v", r.code, r.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run never returned: a child that ignores SIGINT is holding tetherd run, and with it the pf rules and /etc/resolver")
+	}
+}
+
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	b, err := os.ReadFile(path)

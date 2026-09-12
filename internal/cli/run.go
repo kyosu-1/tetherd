@@ -678,7 +678,7 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 	}
 	child.Env = env.Merge(os.Environ(), taskEnv, mergeOpts)
 	child.Cancel = func() error { return child.Process.Signal(os.Interrupt) }
-	child.WaitDelay = 5 * time.Second
+	child.WaitDelay = childWaitDelay
 	logf("▶ %s", joinArgs(opts.Command))
 	if err := child.Start(); err != nil {
 		return 1, fmt.Errorf("start %s: %w", opts.Command[0], err)
@@ -699,10 +699,30 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 	case <-sess.Done():
 		logf("✗ agent session lost: %v", sess.Err())
 		cancel()
+		// Not a bare return: Run's defers pull the pf rules, the helper
+		// socket and every /etc/resolver file down, and doing that while
+		// the child is still alive leaves it running with its network half
+		// dismantled - connections to the VPC failing in whatever way the
+		// teardown happens to land. Waiting here is what bounds the child's
+		// life to the capture's. child.WaitDelay above is what bounds this
+		// wait: cancel() only asks (SIGINT), and a child that ignores it
+		// would otherwise hold `tetherd run` - and the pf rules - forever.
 		<-waitErr
 		return 1, sess.Err()
 	}
 }
+
+// childWaitDelay is how long a child gets between being asked to stop
+// (SIGINT, from child.Cancel) and being killed. It is the bound on the
+// <-waitErr above: a child that ignores SIGINT - an interactive shell, a
+// process with its own handler - would otherwise wedge `tetherd run` while
+// it still holds the pf rules and the /etc/resolver files, which is the one
+// state a developer cannot get out of without knowing about
+// `tetherd-helper`.
+//
+// A var, not a const, only so a test can shorten it: five seconds is
+// unremarkable to wait for and far too long to test against.
+var childWaitDelay = 5 * time.Second
 
 func short(id string) string {
 	if len(id) > 8 {
