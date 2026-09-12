@@ -368,31 +368,84 @@ func readFile(t *testing.T, path string) string {
 	return string(b)
 }
 
-// TestRunFailsOnBadLocalCIDRs pins the decision that a bad local_cidrs
-// entry - which can now arrive from a committed .tetherd.yml, not only a
-// flag - exits 1 (an operational/config failure) rather than the usage exit
-// code 2 that a bad --remote-cidr still gets before the switch on
-// opts.Transport (see TestRunSSMRequiresClusterAndService and
-// TestParseRemoteCIDRs elsewhere in this package for that flag-side check).
-func TestRunFailsOnBadLocalCIDRs(t *testing.T) {
-	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
-	p := &fakeProvider{
-		region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
-		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
-		agentAddr: ag.addr,
+// TestRunExitsTwoForEveryBadCIDRValue pins the exit code of one class of
+// .tetherd.yml mistake - a CIDR value that is simply wrong - across both
+// transports and both ways of being wrong.
+//
+// They used to disagree. Measured: `network.remote_cidrs: [10.0.0.0/99]`
+// exited 2, a `network.local_cidrs` typo exited 1, and a local_cidrs that
+// removed the whole remote set exited 1 - so a CI wrapper reading 2 as "fix
+// the invocation" and 1 as "retry" looped forever on the second. Nothing
+// about retrying any of them can change the answer, so all of them are 2.
+//
+// Each case is caught before the agent is dialed, which is why a bogus
+// agent address is enough for the direct ones.
+func TestRunExitsTwoForEveryBadCIDRValue(t *testing.T) {
+	ssmCase := func(mod func(*RunOptions)) RunOptions {
+		o := ssmOpts("true")
+		o.NoNetwork = false
+		o.ExecPath = "/usr/bin/true" // exists, so the pre-flight stat passes
+		mod(&o)
+		return o
 	}
-	d := depsFor(p)
-	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
-	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+	directCase := func(mod func(*RunOptions)) RunOptions {
+		o := RunOptions{
+			Transport: "direct", AgentAddr: "127.0.0.1:1", TargetEnv: "dev", User: "tester",
+			RemoteCIDRs: []string{"10.0.0.0/16"}, ExecPath: "/usr/bin/true", Command: []string{"true"},
+		}
+		mod(&o)
+		return o
+	}
+	cases := []struct {
+		name string
+		opts RunOptions
+		want string // a token the error must name, so the operator knows which key
+	}{
+		// The reference behaviour the other rows are made to match: this
+		// one always exited 2, because it is parsed before the switch on
+		// opts.Transport.
+		{"ssm remote_cidrs", ssmCase(func(o *RunOptions) { o.RemoteCIDRs = []string{"10.0.0.0/99"} }), "10.0.0.0/99"},
+		{"ssm local_cidrs typo", ssmCase(func(o *RunOptions) { o.LocalCIDRs = []string{"not-a-cidr"} }), "network.local_cidrs"},
+		{"ssm local_cidrs excludes everything", ssmCase(func(o *RunOptions) { o.LocalCIDRs = []string{"10.0.0.0/8"} }), "local_cidrs"},
+		{"direct local_cidrs typo", directCase(func(o *RunOptions) { o.LocalCIDRs = []string{"not-a-cidr"} }), "network.local_cidrs"},
+		{"direct local_cidrs excludes everything", directCase(func(o *RunOptions) { o.LocalCIDRs = []string{"10.0.0.0/8"} }), "local_cidrs"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := &fakeProvider{
+				region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+				vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+			}
+			d := depsFor(p)
+			d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
+			d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+			code, err := RunWithDeps(context.Background(), c.opts, io.Discard, d)
+			if code != 2 {
+				t.Fatalf("code = %d, want 2 (a value that is wrong, not an operational failure): err=%v", code, err)
+			}
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want it to name %q", err, c.want)
+			}
+		})
+	}
 
-	opts := ssmOpts("true")
-	opts.NoNetwork = false
-	opts.ExecPath = "/usr/bin/true"
-	opts.LocalCIDRs = []string{"not-a-cidr"}
-	code, err := RunWithDeps(context.Background(), opts, io.Discard, d)
-	if code != 1 || err == nil || !strings.Contains(err.Error(), "network.local_cidrs") {
-		t.Fatalf("code=%d err=%v, want code 1 and a network.local_cidrs error", code, err)
-	}
+	// The other arm of the same mapping: an AWS call that failed is
+	// operational and stays 1. Without this, "always return 2" would pass
+	// every case above.
+	t.Run("an AWS failure is still 1", func(t *testing.T) {
+		p := &fakeProvider{
+			region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+			vpcErr: errAlwaysFails,
+		}
+		d := depsFor(p)
+		d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
+		d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+		opts := ssmCase(func(*RunOptions) {})
+		code, err := RunWithDeps(context.Background(), opts, io.Discard, d)
+		if code != 1 || err == nil {
+			t.Fatalf("code = %d err = %v, want code 1: a failed AWS call is worth retrying", code, err)
+		}
+	})
 }
 
 // TestRunDirectAppliesLocalCIDRs pins item 6 of the fix-round-1 review:
@@ -456,6 +509,10 @@ func TestRunDirectIgnoresRemoteServicesWithALogLine(t *testing.T) {
 // --remote-cidr really does leave zero remote ranges, which must be a loud
 // error naming local_cidrs rather than a silent hand-off to the helper. This
 // fails before the agent is ever dialed, so a bogus address is enough.
+//
+// The exit code this produces is pinned by
+// TestRunExitsTwoForEveryBadCIDRValue, alongside every other spelling of the
+// same mistake.
 func TestRunDirectRejectsLocalCIDRsExcludingEverything(t *testing.T) {
 	opts := RunOptions{
 		Transport: "direct", AgentAddr: "127.0.0.1:1", TargetEnv: "dev", User: "tester",
@@ -463,8 +520,8 @@ func TestRunDirectRejectsLocalCIDRsExcludingEverything(t *testing.T) {
 		ExecPath: "/usr/bin/true", Command: []string{"true"},
 	}
 	code, err := RunWithDeps(context.Background(), opts, io.Discard, Deps{})
-	if code != 1 || err == nil || !strings.Contains(err.Error(), "network.local_cidrs") {
-		t.Fatalf("code=%d err=%v, want code 1 and a network.local_cidrs error", code, err)
+	if code == 0 || err == nil || !strings.Contains(err.Error(), "network.local_cidrs") {
+		t.Fatalf("code=%d err=%v, want a failure naming network.local_cidrs", code, err)
 	}
 }
 

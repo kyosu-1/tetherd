@@ -565,16 +565,20 @@ func TestRemoteSetDoesNotMutateTheProvidersVPCSlice(t *testing.T) {
 }
 
 // TestRemoteSetRejectsBadLocalCIDRs pins the decision that a local_cidrs
-// parse failure is reported with the "network.local_cidrs" prefix (so an
-// operator can tell it apart from a bad --remote-cidr) and, since local_cidrs
-// can now come from a committed config file rather than only a flag, Run
-// maps it to exit 1 rather than the usage exit code 2 (see TestRunFailsOnBadLocalCIDRs).
+// parse failure is reported with the "network.local_cidrs" prefix, so an
+// operator can tell it apart from a bad --remote-cidr, and that it is a
+// usage error: a value that is wrong however it arrived, flag or committed
+// config file, which is what makes Run exit 2 for it the way it always has
+// for a bad --remote-cidr (see TestRunExitsTwoForEveryBadCIDRValue).
 func TestRemoteSetRejectsBadLocalCIDRs(t *testing.T) {
 	p := &fakeProvider{}
 	opts := RunOptions{LocalCIDRs: []string{"not-a-cidr"}}
 	_, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {})
 	if err == nil || !strings.Contains(err.Error(), "network.local_cidrs") {
 		t.Fatalf("err = %v, want it to mention network.local_cidrs", err)
+	}
+	if !isUsageError(err) {
+		t.Errorf("a local_cidrs typo is a usage error (exit 2), got %v", err)
 	}
 }
 
@@ -611,5 +615,8 @@ func TestRemoteSetRejectsLocalCIDRsThatRemoveEverything(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "local_cidrs") {
 		t.Fatalf("the error must name local_cidrs: %v", err)
+	}
+	if !isUsageError(err) {
+		t.Errorf("a local_cidrs that removes everything is a usage error (exit 2), got %v", err)
 	}
 }

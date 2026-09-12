@@ -58,15 +58,22 @@ type RunOptions struct {
 // from ("--remote-cidr", "network.local_cidrs", ...) so a parse failure
 // reads correctly regardless of which flag or config key produced it,
 // instead of every source's errors being mislabelled as "--remote-cidr".
+//
+// Every failure is a usageError, so Run exits 2 for it wherever it was
+// caught. An unparseable prefix is a value that is simply wrong - retrying
+// it will never work - and that has to be true of every source: measured on
+// this branch, `network.remote_cidrs: [10.0.0.0/99]` exited 2 while a
+// `network.local_cidrs` typo exited 1, and a CI wrapper that reads 2 as "fix
+// the invocation" and 1 as "retry" loops forever on the second.
 func ParseRemoteCIDRs(source string, in []string) ([]netip.Prefix, error) {
 	out := make([]netip.Prefix, 0, len(in))
 	for _, s := range in {
 		p, err := netip.ParsePrefix(s)
 		if err != nil {
-			return nil, fmt.Errorf("%s %q: %w", source, s, err)
+			return nil, usageError{fmt.Errorf("%s %q: %w", source, s, err)}
 		}
 		if !p.Addr().Is4() {
-			return nil, fmt.Errorf("%s %q: only IPv4 is supported in v1", source, s)
+			return nil, usageError{fmt.Errorf("%s %q: only IPv4 is supported in v1", source, s)}
 		}
 		out = append(out, p.Masked())
 	}
@@ -269,14 +276,17 @@ func Subtract(all []netip.Prefix, exclude []netip.Prefix) []netip.Prefix {
 // removes the whole VPC. The run then starts normally, prints a green
 // network line, and every connection to the VPC leaves over the laptop's
 // own route to time out somewhere else.
+// Both returns are usageErrors, so Run exits 2 rather than 1: this is a
+// value in .tetherd.yml that is wrong, in the same class as an unparseable
+// prefix, and nothing about retrying it can change the answer.
 func applyLocalCIDRs(cidrs, local, floor []netip.Prefix) ([]netip.Prefix, error) {
 	kept := Subtract(cidrs, local)
 	if len(cidrs) > 0 && len(kept) == 0 {
-		return nil, errLocalCIDRsExcludeEverything
+		return nil, usageError{errLocalCIDRsExcludeEverything}
 	}
 	out := append(kept, floor...)
 	if len(out) == 0 {
-		return nil, errLocalCIDRsExcludeEverything
+		return nil, usageError{errLocalCIDRsExcludeEverything}
 	}
 	return out, nil
 }
@@ -334,6 +344,19 @@ func (e usageError) Unwrap() error { return e.error }
 func isUsageError(err error) bool {
 	var ue usageError
 	return errors.As(err, &ue)
+}
+
+// exitFor is Run's exit code for err: 2 when what went wrong is a value the
+// operator gave (a flag, or a key in .tetherd.yml), 1 when it is
+// operational. Both arms of the transport switch go through it, because the
+// same class of mistake exiting 2 from one and 1 from the other is a trap
+// for anything that reads the code: a CI wrapper treating 2 as "fix the
+// invocation" and 1 as "retry" loops forever on a local_cidrs typo.
+func exitFor(err error) int {
+	if isUsageError(err) {
+		return 2
+	}
+	return 1
 }
 
 // directProvider is the awsProvider for --transport direct: a bare TCP
@@ -470,11 +493,11 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 			// lookup) cannot be resolved here - only local_cidrs applies.
 			local, err := ParseRemoteCIDRs("network.local_cidrs", opts.LocalCIDRs)
 			if err != nil {
-				return 1, err
+				return exitFor(err), err
 			}
 			cidrs, err = applyLocalCIDRs(cidrs, local, nil)
 			if err != nil {
-				return 1, err
+				return exitFor(err), err
 			}
 			if len(opts.RemoteServices) > 0 {
 				logf("           remote_services %s ignored under --transport direct (prefix lists need an AWS session)", strings.Join(opts.RemoteServices, ", "))
@@ -484,7 +507,11 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 		if !opts.NoNetwork {
 			cidrs, err = remoteSet(ctx, opts, prov, task, logf)
 			if err != nil {
-				return 1, err
+				// remoteSet mixes the two classes: a local_cidrs typo or a
+				// local_cidrs that removes everything (usage), and a
+				// DescribeVpcs or prefix-list call that failed
+				// (operational). They must not collapse onto one code.
+				return exitFor(err), err
 			}
 		}
 	}
