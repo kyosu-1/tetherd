@@ -69,24 +69,79 @@ const (
 // table, which is the only failure that may lead to a delete.
 const fileExists = "add host 169.254.170.2: gateway lo0: File exists"
 
-// rejectEntry is `route -n get` on the entry a failed ARP leaves behind:
-// the one this whole feature exists to displace.
-const rejectEntry = `   route to: 169.254.170.2
+// The three fixtures below are `route -n get` output measured on a real Mac
+// (macOS 25.6) that had the stale entry this feature exists for. They are
+// verbatim, because the classifier reads this text and a fixture written
+// from a model of the output would only test the model.
+//
+// Note what staleEntry does NOT contain: the word REJECT. netstat renders
+// this entry with a trailing "!", route get does not, and one of its flag
+// bits has no name at all (b016). A classifier keyed on "REJECT" could
+// never fire against real output.
+const staleEntry = `   route to: 169.254.170.2
 destination: 169.254.170.2
   interface: en0
-      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+      flags: <UP,HOST,DONE,LLINFO,STATIC,b016,WASCLONED>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
-       0         0         0         0         0         0     16384       -18`
+       0         0         0         0         0         0      1500     -9813`
 
-// aliasEntry is `route -n get` when something else - typically
-// amazon-ecs-local-container-endpoints, which aliases 169.254.170.2 onto
-// lo0 - already serves the address locally.
+// loopbackEntry is a live lo0 host route. Measured for 127.0.0.1: an lo0
+// alias for 169.254.170.2 - what amazon-ecs-local-container-endpoints
+// installs - needs root to create, so the address is substituted in
+// aliasEntry below and the real text is classified here under its own
+// address. (The numeric row is elided as it was in the measurement.)
+const loopbackEntry = `   route to: 127.0.0.1
+destination: 127.0.0.1
+  interface: lo0
+      flags: <UP,HOST,DONE,LOCAL>`
+
+// aliasEntry is loopbackEntry with the credential endpoint substituted for
+// 127.0.0.1: what tetherd sees when the emulator owns the address.
 const aliasEntry = `   route to: 169.254.170.2
 destination: 169.254.170.2
   interface: lo0
-      flags: <UP,HOST,DONE,LOCAL,IFSCOPE>
- recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
-       0         0         0         0         0         0     16384         0`
+      flags: <UP,HOST,DONE,LOCAL>`
+
+// coveringNetEntry is what route(8) answers - with exit status 0 - for an
+// address that has no host route: the network route that covers it.
+// Measured for 169.254.99.99.
+const coveringNetEntry = `   route to: 169.254.99.99
+destination: 169.254.0.0
+       mask: 255.255.0.0
+  interface: en0
+      flags: <UP,DONE,CLONING,STATIC>`
+
+// coveringNetForEndpoint is coveringNetEntry as it would arrive for the
+// credential endpoint: same answer, different question.
+const coveringNetForEndpoint = `   route to: 169.254.170.2
+destination: 169.254.0.0
+       mask: 255.255.0.0
+  interface: en0
+      flags: <UP,DONE,CLONING,STATIC>`
+
+// TestClassifyRouteGetAgainstRealOutput is the parser's contract, pinned to
+// the measured text. The three cases are the only ones route(8) produces
+// here, and each drives a different decision in Set: displace, refuse
+// because somebody else owns the address, refuse because there is no host
+// route to displace at all.
+func TestClassifyRouteGetAgainstRealOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  string
+		h    string
+		want routeGetState
+	}{
+		{"the stale entry a failed ARP left behind", staleEntry, "169.254.170.2", routeStale},
+		{"a live lo0 route", loopbackEntry, "127.0.0.1", routeLoopback},
+		{"the emulator's lo0 alias", aliasEntry, "169.254.170.2", routeLoopback},
+		{"no host route: the covering net route", coveringNetEntry, "169.254.99.99", routeNoHost},
+		{"no host route, asked about the endpoint", coveringNetForEndpoint, "169.254.170.2", routeNoHost},
+	} {
+		if got := classifyRouteGet(tc.out, netip.MustParseAddr(tc.h)); got != tc.want {
+			t.Errorf("%s: classified as %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
 
 func addr2() netip.Addr { return netip.MustParseAddr("169.254.170.2") }
 
@@ -179,7 +234,7 @@ func TestRouterClearOnARouterThatNeverSetAnything(t *testing.T) {
 func TestRouterSetDisplacesTheStaleRouteAndRetries(t *testing.T) {
 	f := &fakeRun{
 		once: map[string]error{addCmd: errors.New("exit 1")},
-		out:  map[string]string{addCmd: fileExists, getCmd: rejectEntry},
+		out:  map[string]string{addCmd: fileExists, getCmd: staleEntry},
 	}
 	r := &Router{Run: f.run, Logf: f.logf}
 	if err := r.Set([]netip.Addr{addr2()}); err != nil {
@@ -224,21 +279,30 @@ func TestRouterSetRefusesToDisplaceALiveLoopbackRoute(t *testing.T) {
 	}
 }
 
-// A rejecting route is never a working one, whatever interface it names, so
-// an entry on lo0 that rejects is still ours to displace.
-func TestRouterSetDisplacesARejectingLoopbackRoute(t *testing.T) {
-	rejectOnLo0 := strings.Replace(strings.Replace(rejectEntry, "en0", "lo0", 1),
-		"<UP,HOST,DONE,LLINFO", "<UP,HOST,REJECT,DONE,LLINFO", 1)
+// TestRouterSetRefusesWhenThereIsNoHostRouteToDisplace: route(8) answers a
+// host with no route of its own by describing the network route that covers
+// it - with exit status 0. Treating that as "the thing in the way" would
+// have tetherd delete on the strength of an answer about a different
+// destination, so the mismatch is the refusal.
+func TestRouterSetRefusesWhenThereIsNoHostRouteToDisplace(t *testing.T) {
 	f := &fakeRun{
-		once: map[string]error{addCmd: errors.New("exit 1")},
-		out:  map[string]string{addCmd: fileExists, getCmd: rejectOnLo0},
+		err: map[string]error{addCmd: errors.New("exit 1")},
+		out: map[string]string{addCmd: fileExists, getCmd: coveringNetForEndpoint},
 	}
 	r := &Router{Run: f.run, Logf: f.logf}
-	if err := r.Set([]netip.Addr{addr2()}); err != nil {
-		t.Fatalf("a rejecting lo0 entry must be displaced: %v", err)
+	err := r.Set([]netip.Addr{addr2()})
+	if err == nil {
+		t.Fatal("route(8) refusing the add while reporting no host route must be refused, not guessed at")
 	}
-	if got := len(f.calls); got != 4 {
-		t.Fatalf("calls = %v, want add, get, delete, add", f.joined())
+	if !strings.Contains(err.Error(), "169.254.0.0") {
+		t.Errorf("the error must show what route(8) actually described: %v", err)
+	}
+	want := []string{addCmd, getCmd}
+	if strings.Join(f.joined(), " | ") != strings.Join(want, " | ") {
+		t.Fatalf("calls = %v, want %v - nothing may be deleted", f.joined(), want)
+	}
+	if len(r.Active()) != 0 {
+		t.Errorf("active = %v, want empty", r.Active())
 	}
 }
 
@@ -295,7 +359,7 @@ func TestRouterSetLeavesNothingPinnedWhenTheAddKeepsFailing(t *testing.T) {
 	// route it never got - so a failed Set must report and record nothing.
 	f := &fakeRun{
 		err: map[string]error{addCmd: errors.New("exit 1")},
-		out: map[string]string{addCmd: fileExists, getCmd: rejectEntry},
+		out: map[string]string{addCmd: fileExists, getCmd: staleEntry},
 	}
 	r := &Router{Run: f.run, Logf: f.logf}
 	err := r.Set([]netip.Addr{addr2()})

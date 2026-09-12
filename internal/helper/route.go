@@ -1,9 +1,11 @@
 // Why this file exists: connect()'s route lookup runs before pf's output
 // rules, so pf cannot rescue a destination the kernel already considers
 // unreachable. macOS ARPs for 169.254.170.2 on the LAN, gets nothing back
-// (the address only exists inside the ECS task), and leaves a reject host
-// route behind on the LAN interface - `169.254.170.2 link#15 UHLSW en0 !` in
-// netstat -rn, LLINFO with a negative expire in `route -n get`. While that
+// (the address only exists inside the ECS task), and leaves a rejecting
+// host route behind on the LAN interface - `169.254.170.2 link#15 UHLSW en0
+// !` in netstat -rn; `route -n get` shows the same entry as
+// `<UP,HOST,DONE,LLINFO,STATIC,b016,WASCLONED>` on en0 with a negative
+// expire, and never names the reject bit at all. While that
 // entry is live connect() returns EHOSTUNREACH in about a millisecond and
 // the rdr rule never sees a packet, which is why the same child at the same
 // gid reaches a VPC address fine and the credential endpoint intermittently
@@ -139,10 +141,22 @@ func (r *Router) Set(hosts []netip.Addr) error {
 func (r *Router) displaceConflict(h netip.Addr) error {
 	got, err := r.run("-n", "get", h.String())
 	if err != nil {
+		// Measured on macOS 25.6: `route -n get` exits 0 even for an
+		// address with no host route of its own - it answers with the
+		// network route that covers it. So a failure here is not "there is
+		// nothing there": it means there is no route to the block at all,
+		// and on such a machine nothing occupies the destination either,
+		// so the add above would have succeeded and this code would not be
+		// running. That leaves a state tetherd cannot explain, which is
+		// exactly when a root daemon must not delete. Do not turn this
+		// into a silent delete.
 		return fmt.Errorf("route.set %s: a route for it already exists and `route -n get %s` could not describe it (%w: %s); remove it yourself (sudo route -n delete -host %s) and run tetherd again", h, h, err, summarize(got), h)
 	}
-	if isLiveLoopbackRoute(string(got)) {
+	switch classifyRouteGet(string(got), h) {
+	case routeLoopback:
 		return fmt.Errorf("route.set %s: something else already routes %s to lo0 and tetherd will not replace it (amazon-ecs-local-container-endpoints does this with an lo0 alias; stop it, or run without capturing %s): %s", h, h, h, summarize(got))
+	case routeNoHost:
+		return fmt.Errorf("route.set %s: route(8) refused the add but reports no host route for %s - it answered about %s instead; tetherd will not delete a route it cannot identify: %s", h, h, routeGetDestination(string(got)), summarize(got))
 	}
 	r.logf("route: %s already had an unusable route, deleting it to pin the address to lo0: %s", h, summarize(got))
 	if out, err := r.run("-n", "delete", "-host", h.String()); err != nil {
@@ -158,20 +172,68 @@ func destinationExists(out []byte) bool {
 	return strings.Contains(strings.ToLower(string(out)), "file exists")
 }
 
-// isLiveLoopbackRoute reports whether `route get` describes a working route
-// to lo0, as opposed to the reject/incomplete entry a failed ARP leaves
-// behind. A rejecting route is never working, whatever interface it names.
-func isLiveLoopbackRoute(out string) bool {
-	if strings.Contains(strings.ToUpper(out), "REJECT") {
-		return false
-	}
+// routeGetState is what `route -n get <h>` says about h. The three values
+// are the only answers route(8) gives here, measured on macOS 25.6 - see
+// the fixtures in route_test.go, which are that output verbatim.
+type routeGetState int
+
+const (
+	// routeNoHost: the answer describes a different destination, i.e. the
+	// network route that covers h, so h has no host route of its own.
+	// `route -n get 169.254.99.99` answers `destination: 169.254.0.0,
+	// mask: 255.255.0.0` and exits 0.
+	routeNoHost routeGetState = iota
+	// routeLoopback: a host route for h that works and points at lo0, so
+	// something else owns the address - the ECS credential emulator serves
+	// 169.254.170.2 by aliasing it onto lo0.
+	routeLoopback
+	// routeStale: a host route for h that is not a working lo0 route. On
+	// the machine this feature exists for that is the entry a failed ARP
+	// left behind: `interface: en0`, flags
+	// `<UP,HOST,DONE,LLINFO,STATIC,b016,WASCLONED>`, `expire -9813`.
+	//
+	// Note what route(8) does *not* print: REJECT. netstat renders this
+	// entry with a trailing "!" and one of its flag bits has no name at
+	// all (b016), so a classifier keyed on that word could never fire.
+	// This state is therefore "a host route that is not a live lo0 route",
+	// not "a route that says it rejects".
+	routeStale
+)
+
+// classifyRouteGet reads the fields route(8) prints. Only `destination:`,
+// `interface:` and `gateway:` matter, and the destination is what
+// distinguishes an answer about h from an answer about the block h lives in.
+func classifyRouteGet(out string, h netip.Addr) routeGetState {
+	var iface, gw string
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
-		if len(f) == 2 && (f[0] == "interface:" || f[0] == "gateway:") && f[1] == "lo0" {
-			return true
+		if len(f) != 2 {
+			continue
+		}
+		switch f[0] {
+		case "interface:":
+			iface = f[1]
+		case "gateway:":
+			gw = f[1]
 		}
 	}
-	return false
+	if routeGetDestination(out) != h.String() {
+		return routeNoHost
+	}
+	if iface == "lo0" || gw == "lo0" {
+		return routeLoopback
+	}
+	return routeStale
+}
+
+// routeGetDestination is the `destination:` field, or "" if there is none.
+func routeGetDestination(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) == 2 && f[0] == "destination:" {
+			return f[1]
+		}
+	}
+	return ""
 }
 
 // summarize flattens route(8)'s multi-line output into something that fits
