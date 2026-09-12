@@ -67,6 +67,15 @@ const DefaultStealTimeout = 30 * time.Second
 // a writer blocked on the stream fails the moment the write deadline moves
 // into the past, and one blocked on the body ends by itself when the
 // handler returns and net/http closes it.
+//
+// That last clause is the mechanism, and it is worth naming so that nobody
+// "fixes" the residual by making this join unbounded again: on the way out
+// of the handler, finishRequest calls connReader.abortPendingRead
+// synchronously, which sees cr.inRead for the blocked read and moves the
+// *connection's* read deadline into the past. The read fails, releases
+// body.mu, and reqBody.Close() then proceeds on that same mutex. So a
+// writer this grace gives up on outlives its request by a tick, not for the
+// life of the process, and the connection is not left wedged.
 const DefaultWriteAbortGrace = 2 * time.Second
 
 // Proxy routes each request either to the application or to the laptop of
@@ -387,9 +396,14 @@ func (t *streamTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// maxInformationalResponses bounds how many 1xx replies the CLI may send
-// before the final one. A CLI streaming them without end would otherwise
-// hold this request until the read deadline with no way to say why.
+// maxInformationalResponses is the 1xx reply at which this transport gives
+// up: seven are read past, the eighth is refused. A CLI streaming them
+// without end would otherwise hold the request until the read deadline with
+// nothing naming the cause.
+//
+// The count and the comparison are stated together on purpose - "8" with a
+// `>=` check tolerates seven, which reads like an off-by-one whichever way
+// round you guess.
 const maxInformationalResponses = 8
 
 // readFinalResponse reads the CLI's reply, discarding informational (1xx)

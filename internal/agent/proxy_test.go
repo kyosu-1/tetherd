@@ -35,8 +35,10 @@ func appStub(t *testing.T, body string) *appServer {
 	a.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a.hits.Add(1)
 		b, _ := io.ReadAll(r.Body)
-		fmt.Fprintf(w, "%s path=%s body=%q len=%d upgrade=%q xff=%q host=%s",
-			body, r.URL.Path, string(b), len(b), r.Header.Get("Upgrade"), r.Header.Get("X-Forwarded-For"), r.Host)
+		fmt.Fprintf(w, "%s path=%s body=%q len=%d upgrade=%q host=%s xff=%q xfp=%q xfh=%q fwd=%q",
+			body, r.URL.Path, string(b), len(b), r.Header.Get("Upgrade"), r.Host,
+			r.Header.Get("X-Forwarded-For"), r.Header.Get("X-Forwarded-Proto"),
+			r.Header.Get("X-Forwarded-Host"), r.Header.Get("Forwarded"))
 	}))
 	t.Cleanup(a.Close)
 	return a
@@ -69,6 +71,10 @@ type laptop struct {
 	raw     string
 	partial string
 	silent  bool
+	// reply is handed the stream after its header has been read, so a test
+	// can write a response in its own time - which is the only way to have
+	// a body still arriving after the steal timeout would have fired.
+	reply func(net.Conn)
 
 	fail bool // OpenStream fails: the laptop is gone
 }
@@ -87,8 +93,19 @@ func (l *laptop) OpenStream() (net.Conn, error) {
 	l.streams = append(l.streams, cli)
 	l.eofs = append(l.eofs, eof)
 	handler, refuse, silent := l.handler, l.refuse, l.silent
-	raw, partial := l.raw, l.partial
+	raw, partial, reply := l.raw, l.partial, l.reply
 	switch {
+	case reply != nil:
+		go func() {
+			if typ, _, err := proto.ReadHeader(cli); err != nil || typ != proto.TypeHTTP {
+				cli.Close()
+				return
+			}
+			// Drain on the side: net.Pipe is unbuffered, so a proxy still
+			// writing the request would block against this reply.
+			go io.Copy(io.Discard, cli)
+			reply(cli)
+		}()
 	case silent:
 		// A CLI that reads the request and never answers it. Measured
 		// behaviour for a CLI older than the accept loop, and the reason
@@ -342,6 +359,7 @@ func TestProxyPassesEverythingToTheAppWithNoSession(t *testing.T) {
 	// forwarding headers the ALB writes.
 	resp = do(t, h, "POST", "/api/orders", "hello", map[string]string{
 		"X-Forwarded-For": "203.0.113.5", "X-Forwarded-Proto": "https",
+		"X-Forwarded-Host": "dev.example.com", "Forwarded": "for=203.0.113.5;proto=https",
 	})
 	b = readAll(t, resp)
 	if resp.StatusCode != 200 || !strings.Contains(b, `APP path=/api/orders body="hello"`) {
@@ -350,8 +368,24 @@ func TestProxyPassesEverythingToTheAppWithNoSession(t *testing.T) {
 	// httputil.ReverseProxy deletes the X-Forwarded-* headers whenever
 	// Rewrite is set. tetherd is not the hop that owns them: the
 	// application has to see what the ALB sent (spec §5.1).
-	if !strings.Contains(b, `xff="203.0.113.5"`) {
-		t.Errorf("X-Forwarded-For must reach the application unchanged: %s", b)
+	//
+	// Every one of them, asserted by name. Asserting only X-Forwarded-For
+	// leaves the rest free to be dropped, and a missing X-Forwarded-Proto
+	// behind the ALB's TLS is an application that redirects to https
+	// forever.
+	for _, want := range []string{
+		`xff="203.0.113.5"`, `xfp="https"`, `xfh="dev.example.com"`,
+		`fwd="for=203.0.113.5;proto=https"`,
+	} {
+		if !strings.Contains(b, want) {
+			t.Errorf("the application must see %s unchanged: %s", want, b)
+		}
+	}
+	// And the Host the ALB sent, which an application may route on. The
+	// steal path asserts the same thing; this is the path that carries
+	// every request when nobody is attached.
+	if !strings.Contains(b, "host=example.com") {
+		t.Errorf("the inbound Host must reach the application: %s", b)
 	}
 }
 
@@ -385,13 +419,20 @@ func TestProxyStealsAMatchingRequestAndPassesTheRest(t *testing.T) {
 	app := appStub(t, "APP")
 	l := &laptop{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
-		fmt.Fprintf(w, "LAPTOP path=%s body=%q xff=%q host=%s", r.URL.Path, string(b), r.Header.Get("X-Forwarded-For"), r.Host)
+		fmt.Fprintf(w, "LAPTOP path=%s body=%q host=%s xff=%q xfp=%q xfh=%q fwd=%q",
+			r.URL.Path, string(b), r.Host,
+			r.Header.Get("X-Forwarded-For"), r.Header.Get("X-Forwarded-Proto"),
+			r.Header.Get("X-Forwarded-Host"), r.Header.Get("Forwarded"))
 	})}
 	s := sess("shota", "tok", true)
 	s.open = l
 	h := proxyFor(t, app.addr(), s)
 
-	match := map[string]string{"X-Dev-User": "shota", "X-Dev-Token": "tok", "X-Forwarded-For": "203.0.113.5"}
+	match := map[string]string{
+		"X-Dev-User": "shota", "X-Dev-Token": "tok",
+		"X-Forwarded-For": "203.0.113.5", "X-Forwarded-Proto": "https",
+		"X-Forwarded-Host": "dev.example.com", "Forwarded": "for=203.0.113.5;proto=https",
+	}
 	resp := do(t, h, "POST", "/api/orders", "hello", match)
 	b := readAll(t, resp)
 	if resp.StatusCode != 200 || !strings.Contains(b, `LAPTOP path=/api/orders body="hello"`) {
@@ -399,9 +440,15 @@ func TestProxyStealsAMatchingRequestAndPassesTheRest(t *testing.T) {
 	}
 	// X-Forwarded-* and tracing headers pass through untouched (spec §5.1):
 	// the developer debugging a stolen request is looking at the real
-	// client's address.
-	if !strings.Contains(b, `xff="203.0.113.5"`) {
-		t.Errorf("X-Forwarded-For must survive: %s", b)
+	// client's address - and at the scheme, host and Forwarded the ALB
+	// wrote, each of which is separately deletable.
+	for _, want := range []string{
+		`xff="203.0.113.5"`, `xfp="https"`, `xfh="dev.example.com"`,
+		`fwd="for=203.0.113.5;proto=https"`,
+	} {
+		if !strings.Contains(b, want) {
+			t.Errorf("the laptop must see %s: %s", want, b)
+		}
 	}
 	// And the Host the ALB sent, not the proxy's placeholder authority.
 	if !strings.Contains(b, "host=example.com") {
@@ -721,6 +768,143 @@ func TestProxyClosesTheStreamWhenTheResponseIsDone(t *testing.T) {
 	case <-eof:
 	case <-time.After(3 * time.Second):
 		t.Fatal("the stream was never closed: the CLI end is still waiting for another request")
+	}
+}
+
+// patternBody is a body whose every byte is a function of its offset, so a
+// reader can tell "I got fewer bytes" from "I got the wrong bytes" and,
+// crucially, from "I got a suffix" - a body missing its first N bytes has
+// the right shape and the wrong contents at offset 0.
+func patternBody(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte('a' + i%26)
+	}
+	return string(b)
+}
+
+// checkPattern reports the length it read and whether every byte was the
+// one patternBody would have put at that offset.
+func checkPattern(got []byte) string {
+	for i, c := range got {
+		if c != byte('a'+i%26) {
+			return fmt.Sprintf("len=%d ok=false first-wrong-at=%d", len(got), i)
+		}
+	}
+	return fmt.Sprintf("len=%d ok=true", len(got))
+}
+
+// TestProxyRelaysAResponseLargerThanTheTransportsBuffer pins the stream's
+// lifetime against the thing that hid the missing close in the first place:
+// net/http's buffering. Every other stolen response in this file is a few
+// bytes and is already sitting in the transport's 4 KiB bufio.Reader by the
+// time the response is handed over, so closing the stream early is
+// invisible. A response that does not fit truncates - to nothing at all -
+// and half a megabyte is the ordinary size of a real one.
+func TestProxyRelaysAResponseLargerThanTheTransportsBuffer(t *testing.T) {
+	app := appStub(t, "APP")
+	const size = 512 << 10
+	want := patternBody(size)
+	l := &laptop{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, want)
+	})}
+	s := sess("shota", "tok", true)
+	s.open = l
+	h := proxyFor(t, app.addr(), s)
+
+	resp := do(t, h, "GET", "/report", "", stealHeaders())
+	b := readAll(t, resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if len(b) != size || b != want {
+		t.Fatalf("the stolen response arrived as %s, want len=%d ok=true: the stream was closed before the body was read",
+			checkPattern([]byte(b)), size)
+	}
+}
+
+// TestProxyStealsABodyTooLargeToBufferWithoutLosingAByte is the other end
+// of MaxReplayBody, and the one no test reached: both over-cap tests use a
+// laptop that is gone, so the rewind that puts the buffered prefix back in
+// front of the rest was only ever exercised as far as "returns 502".
+//
+// A successful steal of an over-cap body is the common case for an upload,
+// and getting it wrong is silent: the developer's process receives the body
+// with its first MaxReplayBody+1 bytes missing and no error anywhere.
+func TestProxyStealsABodyTooLargeToBufferWithoutLosingAByte(t *testing.T) {
+	app := appStub(t, "APP")
+	const size = MaxReplayBody + 4096
+	want := patternBody(size)
+	l := &laptop{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, err := io.ReadAll(r.Body)
+		if err != nil {
+			fmt.Fprintf(w, "LAPTOP read-error=%v", err)
+			return
+		}
+		fmt.Fprintf(w, "LAPTOP %s", checkPattern(got))
+	})}
+	s := sess("shota", "tok", true)
+	s.open = l
+	p, _ := newProxy(t, app.addr(), s)
+	p.StealTimeout = 20 * time.Second // a megabyte over net.Pipe, unhurried
+	h := p.Handler()
+
+	resp := do(t, h, "POST", "/upload", want, stealHeaders())
+	b := readAll(t, resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d body = %s", resp.StatusCode, b)
+	}
+	if wantLine := fmt.Sprintf("LAPTOP len=%d ok=true", size); !strings.Contains(b, wantLine) {
+		t.Fatalf("the laptop received %q, want %q: every byte of an over-cap body, in order", b, wantLine)
+	}
+	if n := app.hits.Load(); n != 0 {
+		t.Errorf("the application was asked %d times about a request the laptop served", n)
+	}
+}
+
+// TestProxyLetsAStolenResponseStreamPastTheStealTimeout is what the steal
+// timeout's own comment promises: the bound covers waiting for the reply's
+// headers, and is cleared once they arrive, because a stolen response may
+// legitimately take minutes (SSE, a slow report) and the laptop owns its
+// timing from that point on. Leaving the deadline in place kills exactly
+// the responses a developer is most likely to be watching.
+func TestProxyLetsAStolenResponseStreamPastTheStealTimeout(t *testing.T) {
+	app := appStub(t, "APP")
+	pieces := []string{"data: one\n\n", "data: two\n\n", "data: three\n\n"}
+	want := strings.Join(pieces, "")
+	l := &laptop{reply: func(c net.Conn) {
+		fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: %d\r\n\r\n", len(want))
+		for i, piece := range pieces {
+			if i > 0 {
+				// Past the 300ms steal timeout by the second piece, and
+				// well past it by the third.
+				time.Sleep(250 * time.Millisecond)
+			}
+			if _, err := io.WriteString(c, piece); err != nil {
+				return
+			}
+		}
+	}}
+	s := sess("shota", "tok", true)
+	s.open = l
+	p, _ := newProxy(t, app.addr(), s)
+	p.StealTimeout = 300 * time.Millisecond
+	h := p.Handler()
+
+	got := make(chan string, 1)
+	go func() {
+		resp := do(t, h, "GET", "/events", "", stealHeaders())
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		got <- string(b)
+	}()
+	select {
+	case b := <-got:
+		if b != want {
+			t.Fatalf("the stream was cut off: got %q, want %q; the read deadline was not cleared once the headers arrived", b, want)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the streamed response never completed")
 	}
 }
 
