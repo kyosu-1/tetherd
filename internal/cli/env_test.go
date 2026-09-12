@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -91,6 +93,33 @@ func TestFormatEnvQuotesAndFormats(t *testing.T) {
 	}
 }
 
+// TestFormatEnvDotenvEscapesNewlines pins that dotenv, the default format,
+// cannot be used to corrupt itself: a value containing a newline must not
+// print across two raw lines (which no dotenv parser reads back as one
+// value), and in particular a value shaped like "\nFOO=bar" must not forge
+// an extra assignment when the output is read back line by line.
+func TestFormatEnvDotenvEscapesNewlines(t *testing.T) {
+	vars := map[string]string{"MULTI": "line1\nFOO=bar", "PLAIN": "ok"}
+	var b strings.Builder
+	if err := FormatEnv(&b, vars, nil, "dotenv", true); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("an embedded newline must not create extra raw lines: %q", out)
+	}
+	if strings.Contains(out, "\nFOO=bar") {
+		t.Fatalf("an embedded newline must not forge a new assignment: %q", out)
+	}
+	if !strings.Contains(out, `MULTI="line1\nFOO=bar"`) {
+		t.Fatalf("dotenv = %q, want the newline escaped inside a double-quoted value", out)
+	}
+	if !strings.Contains(out, "PLAIN=ok\n") {
+		t.Fatalf("a value needing no escaping must stay bare: %q", out)
+	}
+}
+
 func TestEnvRunPrintsTheTaskEnvironment(t *testing.T) {
 	ag := startAgentFor(t, map[string]string{"PORT": "8080", "API_KEY": "s3cret"}, nil, nil)
 	p := &fakeProvider{
@@ -114,9 +143,17 @@ func TestEnvRunPrintsTheTaskEnvironment(t *testing.T) {
 	if p.secretsARN != "arn:def" {
 		t.Errorf("SecretNames was asked about %q", p.secretsARN)
 	}
-	// The status chatter belongs on stderr so `eval "$(tetherd env)"` works.
+	// The status chatter belongs on stderr so `eval "$(tetherd env)"` works -
+	// checked both ways: stdout must not carry it, and stderr must actually
+	// have it (a no-op logf would pass the first half on its own).
 	if strings.Contains(out.String(), "tetherd ") {
 		t.Errorf("stdout must carry only the variables: %q", out.String())
+	}
+	if !strings.Contains(logs.String(), "✓ env") {
+		t.Errorf("the status line must reach stderr: %q", logs.String())
+	}
+	if strings.Contains(logs.String(), "s3cret") {
+		t.Fatalf("the secret leaked to stderr: %q", logs.String())
 	}
 }
 
@@ -184,10 +221,163 @@ func TestEnvRunFailsClosedWhenSecretNamesFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "--reveal") {
 		t.Errorf("the error must name --reveal as the deliberate override: %v", err)
 	}
+	// Checked before the emptiness check below, which would otherwise make
+	// this assertion unreachable (a failing Fatalf there stops the test
+	// before this line ever runs) and so unable to catch a leak.
+	if strings.Contains(out.String(), "s3cret") {
+		t.Fatalf("the secret leaked to stdout: %q", out.String())
+	}
 	if out.Len() != 0 {
 		t.Fatalf("nothing may reach stdout when secret names cannot be determined: %q", out.String())
 	}
-	if strings.Contains(out.String(), "s3cret") {
-		t.Fatalf("the secret leaked to stdout: %q", out.String())
+}
+
+// TestEnvRunFiltersAndOverridesLikeRunWould pins the property review round 1
+// found broken against a live task: `tetherd env` must print what `tetherd
+// run` would inject into the child, not the task's raw environment.
+// Un-filtered, eval "$(tetherd env --format shell)" replaces the developer's
+// own HOME and PATH with the container's, and injects SSL_CERT_FILE pointed
+// at a path that does not exist on macOS - the exact variable that broke
+// every Go child's TLS on real Fargate in v0.2a.
+func TestEnvRunFiltersAndOverridesLikeRunWould(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{
+		"HOME":          "/home/nonroot",
+		"PATH":          "/usr/local/sbin:/usr/local/bin",
+		"SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x",
+		"ECS_CONTAINER_METADATA_URI_V4":          "http://169.254.170.2/v4/x",
+		"PORT":    "8080",
+		"DROP_ME": "x",
+	}, nil, nil)
+	p := &fakeProvider{
+		region:    "r",
+		task:      transport.Task{ID: "t1", SubnetID: "subnet-a", DefinitionARN: "arn:def"},
+		agentAddr: ag.addr,
+	}
+	opts := EnvOptions{RunOptions: ssmOpts(), Format: "dotenv"}
+	opts.EnvExclude = []string{"DROP_ME"}
+	opts.EnvOverride = map[string]string{"PORT": "9090"}
+	var out, logs strings.Builder
+	code, err := EnvRunWithDeps(context.Background(), opts, &out, &logs, depsFor(p))
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v logs=%s", code, err, logs.String())
+	}
+	for _, name := range []string{
+		"HOME", "PATH", "SSL_CERT_FILE", "DROP_ME",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "ECS_CONTAINER_METADATA_URI_V4",
+	} {
+		if strings.Contains(out.String(), name+"=") {
+			t.Errorf("%s must be filtered out the same way `run` filters it: %q", name, out.String())
+		}
+	}
+	if !strings.Contains(out.String(), "PORT=9090") {
+		t.Fatalf("network.env.override must be layered on top: %q", out.String())
+	}
+}
+
+// TestEnvRunValidatesFormatBeforeAnyWork pins that a bad --format is caught
+// before the task is even discovered: review round 1 found that
+// `tetherd env --format yaml` ran DescribeTasks, opened the SSM session and
+// printed two status lines before failing. logs.Len() == 0 is the proxy for
+// "no work happened" - discoverTask's ssm branch always logs a target line
+// on success, so if it had run at all, stderr would be non-empty.
+func TestEnvRunValidatesFormatBeforeAnyWork(t *testing.T) {
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"}}
+	opts := EnvOptions{RunOptions: ssmOpts(), Format: "yaml"}
+	var out, logs strings.Builder
+	code, err := EnvRunWithDeps(context.Background(), opts, &out, &logs, depsFor(p))
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "yaml") {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("no work (discovery, the agent dial) may happen before --format is validated: %q", logs.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("nothing may be printed for a bad --format: %q", out.String())
+	}
+}
+
+// TestEnvRunReturnsUsageExitCodeForBadFlags pins the exit-code-2 branch of
+// discoverTask's error handling in EnvRunWithDeps, which nothing exercised
+// before review round 1 (collapsing it to always return 1 passed the
+// suite). No fake AWS provider is needed: discoverTask refuses before ever
+// calling Deps.NewAWSProvider.
+func TestEnvRunReturnsUsageExitCodeForBadFlags(t *testing.T) {
+	opts := EnvOptions{RunOptions: RunOptions{Transport: "ssm", TargetEnv: "dev"}}
+	var out, logs strings.Builder
+	code, err := EnvRunWithDeps(context.Background(), opts, &out, &logs, Deps{})
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "--cluster") {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+}
+
+// TestEnvRunFailsOnAgentEnvError pins resolveTaskEnv's error path in
+// EnvRunWithDeps, which nothing exercised before review round 1 (ignoring
+// the error passed the suite, degrading to "print nothing, exit 0" - the
+// opposite of a fail-closed diagnostic tool).
+func TestEnvRunFailsOnAgentEnvError(t *testing.T) {
+	ag := startAgentFor(t, nil, fmt.Errorf("pidMode task is not set"), nil)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"}, agentAddr: ag.addr}
+	opts := EnvOptions{RunOptions: ssmOpts(), Format: "dotenv"}
+	var out, logs strings.Builder
+	code, err := EnvRunWithDeps(context.Background(), opts, &out, &logs, depsFor(p))
+	if code == 0 || err == nil || !strings.Contains(err.Error(), "pidMode") {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("nothing may be printed when the task's environment could not be resolved: %q", out.String())
+	}
+}
+
+// TestEnvCommandParsesFlags is env's analogue of run_test.go's
+// TestRunCommandDirectFlags: it exercises the cobra layer end to end
+// (NewRootCommand -> flag parsing -> envFn), which review round 1 found had
+// zero coverage - flipping --reveal's default to true, unregistering
+// newEnvCommand entirely, or binding --format/--reveal to a throwaway
+// variable all passed the suite before this test existed.
+func TestEnvCommandParsesFlags(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	var captured EnvOptions
+	envFn = func(opts EnvOptions) (int, error) { captured = opts; return 0, nil }
+	t.Cleanup(func() { envFn = defaultEnv })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"env", "--transport", "direct", "--agent-addr", "127.0.0.1:9900", "--format", "json"})
+	var stderr bytes.Buffer
+	root.SetErr(&stderr)
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if captured.Format != "json" {
+		t.Errorf("--format must reach EnvOptions.Format: %+v", captured)
+	}
+	if captured.Reveal {
+		t.Errorf("Reveal must default to false: %+v", captured)
+	}
+	if captured.AgentAddr != "127.0.0.1:9900" {
+		t.Errorf("--agent-addr must reach EnvOptions: %+v", captured)
+	}
+}
+
+// TestEnvCommandRevealFlag is the other half of TestEnvCommandParsesFlags:
+// --reveal must actually flip EnvOptions.Reveal, not just exist as a flag
+// bound to something that discards it.
+func TestEnvCommandRevealFlag(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	var captured EnvOptions
+	envFn = func(opts EnvOptions) (int, error) { captured = opts; return 0, nil }
+	t.Cleanup(func() { envFn = defaultEnv })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"env", "--transport", "direct", "--agent-addr", "127.0.0.1:9900", "--reveal"})
+	var stderr bytes.Buffer
+	root.SetErr(&stderr)
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !captured.Reveal {
+		t.Fatalf("--reveal must set Reveal=true: %+v", captured)
 	}
 }

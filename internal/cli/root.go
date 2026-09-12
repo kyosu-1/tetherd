@@ -122,8 +122,14 @@ func newEnvCommand() *cobra.Command {
 	var opts EnvOptions
 	cmd := &cobra.Command{
 		Use:   "env",
-		Short: "Print the dev task's environment (secrets masked by default)",
-		Args:  cobra.NoArgs,
+		Short: "Print the environment `tetherd run` would inject (secrets masked by default)",
+		Long: "Print the environment `tetherd run` would inject into the child - the task's\n" +
+			"environment after the same filtering run applies (network.env.exclude,\n" +
+			"network.env.override; container-only names like PATH, HOME and\n" +
+			"SSL_CERT_FILE are always dropped), not the task's raw environment.\n" +
+			"Secrets (from the task definition's secrets: block) are masked as ***\n" +
+			"unless --reveal is given.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := applyConfig(cmd, &opts.RunOptions); err != nil {
 				return err

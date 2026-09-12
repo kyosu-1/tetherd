@@ -7,6 +7,8 @@ import (
 	"io"
 	"sort"
 	"strings"
+
+	"github.com/kyosu-1/tetherd/internal/env"
 )
 
 // maskedValue is what `tetherd env` prints instead of a secret. It is a
@@ -37,6 +39,12 @@ func EnvRun(ctx context.Context, opts EnvOptions, stdout, stderr io.Writer) (int
 // variables are secrets - has already succeeded, so a refusal never leaks a
 // partial, wrongly-unmasked env.
 func EnvRunWithDeps(ctx context.Context, opts EnvOptions, stdout, stderr io.Writer, d Deps) (int, error) {
+	// Checked before any AWS call or agent dial: a typo'd --format should
+	// not cost a DescribeTasks round trip and an SSM session, and must never
+	// leave two status lines on stderr as the only trace of the mistake.
+	if !validEnvFormat(opts.Format) {
+		return 2, fmt.Errorf("unknown --format %q; use dotenv, shell or json", opts.Format)
+	}
 	d = d.withDefaults()
 	logf := func(format string, args ...any) { fmt.Fprintf(stderr, "tetherd  "+format+"\n", args...) }
 
@@ -57,10 +65,27 @@ func EnvRunWithDeps(ctx context.Context, opts EnvOptions, stdout, stderr io.Writ
 	if err := checkTargetEnv(w, opts.RunOptions); err != nil {
 		return 1, err
 	}
-	taskEnv, envStatus, err := resolveTaskEnv(w, opts.RunOptions)
+	rawEnv, envStatus, err := resolveTaskEnv(w, opts.RunOptions)
 	if err != nil {
 		return 1, err
 	}
+
+	// `tetherd env` must print exactly what `tetherd run` would inject into
+	// the child, not the task's raw environment: printing raw would hand a
+	// developer HOME=/home/nonroot, PATH=/usr/local/sbin:..., and
+	// SSL_CERT_FILE pointed at a path that does not exist on macOS (the
+	// exact variable that broke every Go child's TLS on real Fargate in
+	// v0.2a) to `eval`. env.Merge with no local env applies the same
+	// DefaultExclude run always applies, plus network.env.exclude; and
+	// DropAWSContainer is always on here (unlike run's transparent mode)
+	// because env never opens the agent tunnel those link-local endpoints
+	// need - printing them would just be dead links. env.override still
+	// wins over all of that, exactly as it does for run.
+	taskEnv := toEnvMap(env.Merge(nil, rawEnv, env.Options{
+		Exclude:          opts.EnvExclude,
+		Override:         opts.EnvOverride,
+		DropAWSContainer: true,
+	}))
 
 	secrets := map[string]bool{}
 	if !opts.Reveal {
@@ -75,6 +100,30 @@ func EnvRunWithDeps(ctx context.Context, opts EnvOptions, stdout, stderr io.Writ
 	logf("%s", envStatus)
 	logf("✓ env      %d masked of %d variables", countMasked(taskEnv, secrets), len(taskEnv))
 	return 0, FormatEnv(stdout, taskEnv, secrets, opts.Format, opts.Reveal)
+}
+
+// validEnvFormat reports whether format is one FormatEnv accepts. Kept in
+// sync with FormatEnv's own switch (which stays authoritative and errors
+// the same way) so a caller of FormatEnv directly is still guarded.
+func validEnvFormat(format string) bool {
+	switch format {
+	case "", "dotenv", "shell", "json":
+		return true
+	default:
+		return false
+	}
+}
+
+// toEnvMap turns env.Merge's sorted "KEY=VALUE" pairs back into a map for
+// FormatEnv, which needs random access to mask by name.
+func toEnvMap(kvs []string) map[string]string {
+	m := make(map[string]string, len(kvs))
+	for _, kv := range kvs {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			m[k] = v
+		}
+	}
+	return m
 }
 
 func countMasked(vars map[string]string, secrets map[string]bool) int {
@@ -106,7 +155,7 @@ func FormatEnv(w io.Writer, vars map[string]string, secrets map[string]bool, for
 	switch format {
 	case "dotenv", "":
 		for _, k := range keys {
-			if _, err := fmt.Fprintf(w, "%s=%s\n", k, value(k)); err != nil {
+			if _, err := fmt.Fprintf(w, "%s=%s\n", k, dotenvQuote(value(k))); err != nil {
 				return err
 			}
 		}
@@ -135,4 +184,36 @@ func FormatEnv(w io.Writer, vars map[string]string, secrets map[string]bool, for
 // the quote around each embedded quote.
 func shellQuote(v string) string {
 	return "'" + strings.ReplaceAll(v, "'", `'"'"'`) + "'"
+}
+
+// dotenvQuote escapes a value for the dotenv format when printing it bare
+// would corrupt the file: an embedded newline would print across two lines,
+// which no dotenv parser reads back, and a value shaped like "\nFOO=bar"
+// would forge an extra assignment. Double-quoting with backslash escapes for
+// the quote, the newline and the backslash itself is what the common dotenv
+// readers (Docker's --env-file, python-dotenv, godotenv) expect back; a
+// value that does not need it is left bare so the common case stays
+// readable.
+func dotenvQuote(v string) string {
+	if !strings.ContainsAny(v, "\n\r\"") {
+		return v
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range v {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }

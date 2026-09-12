@@ -66,7 +66,7 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 	// table of rows it did not check. Refusing is the honest answer, and it
 	// keeps the printed table meaning one thing.
 	if opts.Transport != "ssm" {
-		return 2, fmt.Errorf("tetherd doctor checks an ssm setup; --transport %q has no AWS session, no task definition and no session-manager-plugin to check", opts.Transport)
+		return 2, fmt.Errorf("tetherd doctor checks an ssm setup; --transport %q has no AWS session, no task definition and no session-manager-plugin to check\n        run `tetherd doctor` without --transport direct", opts.Transport)
 	}
 	d = d.withDefaults()
 	timeout := opts.Timeout
