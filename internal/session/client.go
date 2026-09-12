@@ -136,6 +136,35 @@ func (c *Client) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
 	return s, nil
 }
 
+// Resolve asks the agent to resolve name with the task's resolver.
+func (c *Client) Resolve(ctx context.Context, name string) ([]string, int, error) {
+	s, err := c.mux.OpenStream()
+	if err != nil {
+		return nil, 0, fmt.Errorf("session: open stream: %w", err)
+	}
+	defer s.Close()
+	if err := proto.NewEncoder(s).Encode(proto.TypeResolve, proto.ResolveHeader{Name: name, QType: "A"}); err != nil {
+		return nil, 0, err
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		s.SetReadDeadline(dl)
+	} else {
+		s.SetReadDeadline(time.Now().Add(10 * time.Second))
+	}
+	_, rawReply, err := proto.ReadHeader(s)
+	if err != nil {
+		return nil, 0, fmt.Errorf("session: resolve %s: %w", name, err)
+	}
+	var reply proto.ResolveReply
+	if err := proto.Unmarshal(rawReply, &reply); err != nil {
+		return nil, 0, err
+	}
+	if !reply.OK {
+		return nil, 0, fmt.Errorf("resolve %s via agent: %s", name, reply.Error)
+	}
+	return reply.Addrs, reply.TTL, nil
+}
+
 // Close sends bye and tears the session down.
 func (c *Client) Close() error {
 	c.enc.Encode(proto.TypeBye, nil)

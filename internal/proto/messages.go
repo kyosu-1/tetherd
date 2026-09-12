@@ -71,3 +71,17 @@ type DialReply struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
 }
+
+// ResolveHeader is the first line of a resolve stream.
+type ResolveHeader struct {
+	Name  string `json:"name"`
+	QType string `json:"qtype"`
+}
+
+// ResolveReply is the agent's answer on a resolve stream.
+type ResolveReply struct {
+	OK    bool     `json:"ok"`
+	Addrs []string `json:"addrs,omitempty"`
+	TTL   int      `json:"ttl,omitempty"`
+	Error string   `json:"error,omitempty"`
+}

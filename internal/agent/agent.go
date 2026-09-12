@@ -21,10 +21,11 @@ type SessionInfo struct {
 
 // Agent serves control sessions.
 type Agent struct {
-	cfg  Config
-	logf func(string, ...any)
-	env  EnvReader // nil outside ECS
-	dial func(ctx context.Context, addr string) (net.Conn, error)
+	cfg    Config
+	logf   func(string, ...any)
+	env    EnvReader // nil outside ECS
+	dial   func(ctx context.Context, addr string) (net.Conn, error)
+	lookup func(ctx context.Context, name string) ([]net.IPAddr, error)
 
 	mu       sync.Mutex
 	sessions map[string]SessionInfo

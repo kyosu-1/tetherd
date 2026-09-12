@@ -19,6 +19,10 @@ type Handler interface {
 	Hello(h proto.Hello, remote string) (proto.Welcome, *proto.Error)
 	// Dial opens a TCP connection to addr from the agent's network.
 	Dial(ctx context.Context, addr string) (net.Conn, error)
+	// Resolve looks name up with the agent's own resolver (the task's
+	// resolv.conf), which is what makes Cloud Map names and private hosted
+	// zones resolvable from the laptop.
+	Resolve(ctx context.Context, name string) (addrs []string, ttl int, err error)
 	// Closed is called once when the session ends for any reason.
 	Closed()
 }
@@ -141,6 +145,20 @@ func serveStream(ctx context.Context, s net.Conn, h Handler) {
 			return
 		}
 		Pipe(s, target)
+	case proto.TypeResolve:
+		var hd proto.ResolveHeader
+		if err := proto.Unmarshal(raw, &hd); err != nil {
+			enc.Encode(proto.TypeResolve, proto.ResolveReply{Error: err.Error()})
+			return
+		}
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		addrs, ttl, err := h.Resolve(rctx, hd.Name)
+		cancel()
+		if err != nil {
+			enc.Encode(proto.TypeResolve, proto.ResolveReply{Error: err.Error()})
+			return
+		}
+		enc.Encode(proto.TypeResolve, proto.ResolveReply{OK: true, Addrs: addrs, TTL: ttl})
 	default:
 		enc.Encode(proto.TypeError, proto.Error{Code: proto.CodeBadHello, Message: "unknown stream type " + typ})
 	}
