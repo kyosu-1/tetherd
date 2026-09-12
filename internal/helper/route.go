@@ -15,6 +15,7 @@
 package helper
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"os/exec"
@@ -25,6 +26,10 @@ import (
 type Router struct {
 	// Run executes route(8). nil means the real one.
 	Run func(name string, args ...string) ([]byte, error)
+	// Logf is the helper's log. Every route(8) delete goes through it: this
+	// code removes entries it did not create, and a developer whose
+	// routing table changed has to be able to find out why.
+	Logf func(string, ...any)
 
 	set []netip.Addr // what this Router pinned; Clear removes exactly these
 }
@@ -37,7 +42,20 @@ type Router struct {
 // for". It is deliberately spelled out here instead of imported from
 // provider/ecs: what a privileged daemon will do must not be derived from
 // the client's idea of it.
-var allowedHosts = map[string]bool{"169.254.170.2": true}
+var allowedHosts = []netip.Addr{netip.MustParseAddr("169.254.170.2")}
+
+// maxHosts bounds one route.set. The allow-list is one address, so a caller
+// sending thousands only costs CPU in the pinned-already scan.
+const maxHosts = 8
+
+func hostAllowed(h netip.Addr) bool {
+	for _, a := range allowedHosts {
+		if a == h {
+			return true
+		}
+	}
+	return false
+}
 
 func (r *Router) run(args ...string) ([]byte, error) {
 	run := r.Run
@@ -47,6 +65,12 @@ func (r *Router) run(args ...string) ([]byte, error) {
 		}
 	}
 	return run("route", args...)
+}
+
+func (r *Router) logf(format string, args ...any) {
+	if r.Logf != nil {
+		r.Logf(format, args...)
+	}
 }
 
 func (r *Router) pinned(h netip.Addr) bool {
@@ -66,9 +90,15 @@ func (r *Router) pinned(h netip.Addr) bool {
 // made before returning: a host route left pointing at lo0 after the session
 // ends keeps swallowing that address with nothing listening.)
 func (r *Router) Set(hosts []netip.Addr) error {
+	if len(hosts) == 0 {
+		return errors.New("route.set: no hosts given")
+	}
+	if len(hosts) > maxHosts {
+		return fmt.Errorf("route.set: %d hosts is more than tetherd pins (max %d)", len(hosts), maxHosts)
+	}
 	for _, h := range hosts {
-		if !allowedHosts[h.String()] {
-			return fmt.Errorf("route.set: %s is not a host tetherd pins (only 169.254.170.2)", h)
+		if !hostAllowed(h) {
+			return fmt.Errorf("route.set: %s is not a host tetherd pins (only %s)", h, allowedHosts[0])
 		}
 	}
 	for _, h := range hosts {
@@ -79,15 +109,18 @@ func (r *Router) Set(hosts []netip.Addr) error {
 		// depend on DNS while DNS is being rearranged.
 		out, err := r.run("-n", "add", "-host", h.String(), "-interface", "lo0")
 		if err != nil {
-			// The likeliest failure is the reject route this whole file is
-			// about: it occupies the same destination, so route(8) refuses
-			// the add with "File exists". Take it out of the way and try
-			// once more. Deleting it costs nothing - the kernel recreates
-			// that entry on demand, and it is exactly the entry that makes
-			// the address unreachable.
-			if _, derr := r.run("-n", "delete", "-host", h.String()); derr == nil {
-				out, err = r.run("-n", "add", "-host", h.String(), "-interface", "lo0")
+			if !destinationExists(out) {
+				return fmt.Errorf("route.set %s: %w: %s", h, err, strings.TrimSpace(string(out)))
 			}
+			// Something already occupies this destination. It is most
+			// likely the reject entry this file is about, but it can also
+			// be a route a developer's own tooling installed - and this
+			// runs as root, so it must find out which before deleting
+			// anything.
+			if err := r.displaceConflict(h); err != nil {
+				return err
+			}
+			out, err = r.run("-n", "add", "-host", h.String(), "-interface", "lo0")
 		}
 		if err != nil {
 			return fmt.Errorf("route.set %s: %w: %s", h, err, strings.TrimSpace(string(out)))
@@ -97,17 +130,95 @@ func (r *Router) Set(hosts []netip.Addr) error {
 	return nil
 }
 
+// displaceConflict removes the route already occupying h, but only when it
+// is the stale entry that makes h unreachable. A live lo0 route is somebody
+// else's: amazon-ecs-local-container-endpoints (docs/design.md) serves this
+// very address on macOS by aliasing it onto lo0, and deleting that would
+// break the developer's tool for the rest of the boot with tetherd's pin
+// silently standing in its place - and then take it away again on Clear.
+func (r *Router) displaceConflict(h netip.Addr) error {
+	got, err := r.run("-n", "get", h.String())
+	if err != nil {
+		return fmt.Errorf("route.set %s: a route for it already exists and `route -n get %s` could not describe it (%w: %s); remove it yourself (sudo route -n delete -host %s) and run tetherd again", h, h, err, summarize(got), h)
+	}
+	if isLiveLoopbackRoute(string(got)) {
+		return fmt.Errorf("route.set %s: something else already routes %s to lo0 and tetherd will not replace it (amazon-ecs-local-container-endpoints does this with an lo0 alias; stop it, or run without capturing %s): %s", h, h, h, summarize(got))
+	}
+	r.logf("route: %s already had an unusable route, deleting it to pin the address to lo0: %s", h, summarize(got))
+	if out, err := r.run("-n", "delete", "-host", h.String()); err != nil {
+		return fmt.Errorf("route.set %s: could not remove the existing route: %w: %s", h, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// destinationExists reports whether route(8) refused an add because the
+// destination is already in the table (EEXIST, "File exists"). Any other
+// failure - no permission, a bad interface - must not lead to a delete.
+func destinationExists(out []byte) bool {
+	return strings.Contains(strings.ToLower(string(out)), "file exists")
+}
+
+// isLiveLoopbackRoute reports whether `route get` describes a working route
+// to lo0, as opposed to the reject/incomplete entry a failed ARP leaves
+// behind. A rejecting route is never working, whatever interface it names.
+func isLiveLoopbackRoute(out string) bool {
+	if strings.Contains(strings.ToUpper(out), "REJECT") {
+		return false
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && (f[0] == "interface:" || f[0] == "gateway:") && f[1] == "lo0" {
+			return true
+		}
+	}
+	return false
+}
+
+// summarize flattens route(8)'s multi-line output into something that fits
+// in one log line or error message.
+func summarize(out []byte) string {
+	s := strings.Join(strings.Fields(string(out)), " ")
+	if len(s) > 200 {
+		s = s[:200] + "..."
+	}
+	return s
+}
+
 // Clear removes the routes this Router added, and nothing else. Safe to call
 // more than once: the helper's disconnect cleanup calls it unconditionally.
+// A host whose delete failed stays in the set, so the next Clear - the
+// disconnect cleanup, which is the retry - tries it again instead of leaving
+// the address pinned to lo0 while this Router believes nothing is pinned.
 func (r *Router) Clear() error {
 	var firstErr error
+	var left []netip.Addr
 	for _, h := range r.set {
-		if out, err := r.run("-n", "delete", "-host", h.String()); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("route.clear %s: %w: %s", h, err, strings.TrimSpace(string(out)))
+		if out, err := r.run("-n", "delete", "-host", h.String()); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("route.clear %s: %w: %s", h, err, strings.TrimSpace(string(out)))
+			}
+			left = append(left, h)
+			continue
+		}
+	}
+	r.set = left
+	return firstErr
+}
+
+// ClearAll deletes the route for every address tetherd is allowed to pin,
+// whether this process pinned it or not, and is for helper startup only. A
+// helper killed with SIGKILL leaves 169.254.170.2 pointing at lo0 with
+// nothing listening, and from then on every AWS SDK on the machine hangs on
+// the credential endpoint instead of failing fast - with nothing in
+// Router.set to tell the next helper what to remove. A route that is not
+// there is the normal outcome, so a failed delete is not an error here.
+func (r *Router) ClearAll() {
+	for _, h := range allowedHosts {
+		if _, err := r.run("-n", "delete", "-host", h.String()); err == nil {
+			r.logf("route: removed a leftover route for %s (a previous helper did not shut down cleanly)", h)
 		}
 	}
 	r.set = nil
-	return firstErr
 }
 
 // Active reports what is currently pinned.

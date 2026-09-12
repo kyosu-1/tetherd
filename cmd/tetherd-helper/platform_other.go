@@ -11,6 +11,7 @@ import (
 type platform interface {
 	helper.Platform
 	Shutdown() error
+	ClearLeftovers() error
 }
 
 func newPlatform(string, func(string, ...any)) platform {

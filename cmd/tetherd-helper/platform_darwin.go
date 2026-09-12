@@ -10,6 +10,9 @@ import (
 type platform interface {
 	helper.Platform
 	Shutdown() error
+	// ClearLeftovers is the startup cleanup: it also removes state a
+	// previous helper process left behind (see helper.DarwinPlatform).
+	ClearLeftovers() error
 }
 
 func newPlatform(resolverDir string, logf func(string, ...any)) platform {

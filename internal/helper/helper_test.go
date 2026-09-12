@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +25,27 @@ type fakePlatform struct {
 	// hosts: the real Router refuses every address but the credential
 	// endpoint, and that refusal has to reach the client.
 	routeErr error
+	// routeClearErrOnce, when set, fails the first RouteClear only - the
+	// real Router keeps such a host and expects a later Clear to retry it.
+	routeClearErrOnce error
+	// order records the teardown calls in the order they arrived. The route
+	// must come down before the pf rules: in between, 169.254.170.2 is
+	// pinned to lo0 with no rdr rule to catch it, and a packet to a
+	// non-local address on lo0 is dropped - a hang, where the behaviour
+	// before the pin was an immediate EHOSTUNREACH.
+	order []string
+}
+
+func (f *fakePlatform) setRouteErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.routeErr = err
+}
+
+func (f *fakePlatform) setRouteClearErrOnce(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.routeClearErrOnce = err
 }
 
 func (f *fakePlatform) PfApply(spec PfSpec) error {
@@ -37,6 +59,7 @@ func (f *fakePlatform) PfClear() error {
 	defer f.mu.Unlock()
 	f.applied = nil
 	f.cleared++
+	f.order = append(f.order, "pf")
 	return nil
 }
 func (f *fakePlatform) ResolverSet(domains []string, port int) error {
@@ -50,6 +73,7 @@ func (f *fakePlatform) ResolverClear() error {
 	defer f.mu.Unlock()
 	f.domains = nil
 	f.resolverCleared++
+	f.order = append(f.order, "resolver")
 	return nil
 }
 func (f *fakePlatform) RouteSet(hosts []netip.Addr) error {
@@ -64,8 +88,13 @@ func (f *fakePlatform) RouteSet(hosts []netip.Addr) error {
 func (f *fakePlatform) RouteClear() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.routes = nil
 	f.routeCleared++
+	f.order = append(f.order, "route")
+	if err := f.routeClearErrOnce; err != nil {
+		f.routeClearErrOnce = nil
+		return err // the hosts stay pinned, as the real Router leaves them
+	}
+	f.routes = nil
 	return nil
 }
 func (f *fakePlatform) NatLook(proto string, src, dst netip.AddrPort) (netip.AddrPort, error) {
@@ -82,6 +111,19 @@ func (f *fakePlatform) routeSnapshot() []netip.Addr {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]netip.Addr(nil), f.routes...)
+}
+
+// clearOrder is the teardown sequence, e.g. "resolver,route,pf".
+func (f *fakePlatform) clearOrder() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return strings.Join(f.order, ",")
+}
+
+func (f *fakePlatform) counts() (pf, route int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cleared, f.routeCleared
 }
 
 func startServer(t *testing.T, allow func(Peer) bool) (sock string, fp *fakePlatform) {
@@ -254,7 +296,7 @@ func TestRouteSetRejectsAHostTheHelperWillNotPin(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	fp.routeErr = errors.New("route.set: 8.8.8.8 is not a host tetherd pins")
+	fp.setRouteErr(errors.New("route.set: 8.8.8.8 is not a host tetherd pins"))
 	if err := c.RouteSet([]netip.Addr{netip.MustParseAddr("8.8.8.8")}); err == nil {
 		t.Fatal("the platform's refusal must reach the client")
 	}
@@ -442,5 +484,192 @@ func TestRouteSetRejectsAHostItCannotParse(t *testing.T) {
 	}
 	if err := c.RouteSet(nil); err == nil {
 		t.Fatal("route.set with no hosts must fail")
+	}
+}
+
+// TestPfClearTakesTheRouteDownBeforeTheRules pins the teardown order on the
+// path that actually runs on every clean exit (cap.Close -> pf.clear). With
+// pf cleared first, 169.254.170.2 is still pinned to lo0 while no rdr rule
+// covers it - and a packet to a non-local address on lo0 is dropped, so the
+// child hangs where before the pin it got EHOSTUNREACH in a millisecond.
+func TestPfClearTakesTheRouteDownBeforeTheRules(t *testing.T) {
+	sock, fp := startServer(t, func(Peer) bool { return true })
+	c, err := Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.RouteSet([]netip.Addr{netip.MustParseAddr("169.254.170.2")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PfApply(spec()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ResolverSet([]string{"x.internal"}, 53530); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PfClear(); err != nil {
+		t.Fatal(err)
+	}
+	if got := fp.clearOrder(); got != "resolver,route,pf" {
+		t.Fatalf("teardown order = %q, want resolver,route,pf", got)
+	}
+	if pfN, routeN := fp.counts(); pfN != 1 || routeN != 1 {
+		t.Fatalf("pf cleared %d times, route %d; want 1 and 1", pfN, routeN)
+	}
+}
+
+// TestDisconnectClearsInDependencyOrder is the same invariant on the
+// abnormal path.
+func TestDisconnectClearsInDependencyOrder(t *testing.T) {
+	sock, fp := startServer(t, func(Peer) bool { return true })
+	c, err := Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RouteSet([]netip.Addr{netip.MustParseAddr("169.254.170.2")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PfApply(spec()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ResolverSet([]string{"x.internal"}, 53530); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	waitFor(t, func() bool { pfN, _ := fp.counts(); return pfN == 1 }, "cleanup after disconnect")
+	if got := fp.clearOrder(); got != "resolver,route,pf" {
+		t.Fatalf("teardown order = %q, want resolver,route,pf", got)
+	}
+}
+
+// TestAFailedRouteClearIsRetriedOnDisconnect: one failed route delete must
+// not end with the address pinned for the life of the helper. The
+// connection keeps the session, and the disconnect cleanup is the retry.
+func TestAFailedRouteClearIsRetriedOnDisconnect(t *testing.T) {
+	sock, fp := startServer(t, func(Peer) bool { return true })
+	c, err := Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RouteSet([]netip.Addr{netip.MustParseAddr("169.254.170.2")}); err != nil {
+		t.Fatal(err)
+	}
+	fp.setRouteClearErrOnce(errors.New("route: writing to routing socket: not in table"))
+	if err := c.RouteClear(); err == nil {
+		t.Fatal("a failed route delete must reach the client")
+	}
+	if got := fp.routeSnapshot(); len(got) != 1 {
+		t.Fatalf("the fake platform should still hold %v", got)
+	}
+	c.Close()
+	waitFor(t, func() bool { return len(fp.routeSnapshot()) == 0 }, "the failed clear to be retried on disconnect")
+	if _, routeN := fp.counts(); routeN != 2 {
+		t.Fatalf("RouteClear ran %d times, want the retry", routeN)
+	}
+}
+
+// TestPfClearKeepsTheSessionWhenTheRouteSurvives: pf.clear hands the machine
+// to the next CLI, so it may only do that once nothing this session
+// installed is left. Releasing with the pin still in place would strand it -
+// cleanup() only runs for the active connection.
+func TestPfClearKeepsTheSessionWhenTheRouteSurvives(t *testing.T) {
+	sock, fp := startServer(t, func(Peer) bool { return true })
+	c, err := Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RouteSet([]netip.Addr{netip.MustParseAddr("169.254.170.2")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PfApply(spec()); err != nil {
+		t.Fatal(err)
+	}
+	fp.setRouteClearErrOnce(errors.New("route: writing to routing socket: not in table"))
+	if err := c.PfClear(); err != nil {
+		t.Fatalf("pf itself was cleared, so pf.clear reports success: %v", err)
+	}
+	second, err := Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	var busy *BusyError
+	if err := second.PfApply(spec()); !errors.As(err, &busy) {
+		t.Fatalf("err = %v, want a BusyError: the machine is not clean yet", err)
+	}
+	c.Close()
+	waitFor(t, func() bool { return len(fp.routeSnapshot()) == 0 }, "the pin to be retried on disconnect")
+}
+
+// TestRouteSetRejectsMoreHostsThanItPins: the pinned-already scan is linear
+// per host, so an unbounded list from a client is quadratic work in the
+// daemon.
+func TestRouteSetRejectsMoreHostsThanItPins(t *testing.T) {
+	sock, fp := startServer(t, func(Peer) bool { return true })
+	c, err := Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	many := make([]netip.Addr, 64)
+	for i := range many {
+		many[i] = netip.MustParseAddr("169.254.170.2")
+	}
+	if err := c.RouteSet(many); err == nil {
+		t.Fatal("an oversized route.set must be refused")
+	}
+	if got := fp.routeSnapshot(); len(got) != 0 {
+		t.Fatalf("the platform was asked to pin %v", got)
+	}
+}
+
+// TestServeDrainsConnectionsBeforeReturning is what makes the helper's
+// shutdown safe: main calls platform.Shutdown() as soon as Serve returns,
+// and the server's lock is not the platform's. If Serve returns while a
+// connection is still being served, Shutdown can find nothing pinned,
+// release, and an in-flight route.set can pin the address microseconds
+// before the process exits - leaving 169.254.170.2 on lo0 with nothing
+// listening and no helper left to clean it.
+func TestServeDrainsConnectionsBeforeReturning(t *testing.T) {
+	fp := &fakePlatform{}
+	dir, err := os.MkdirTemp("/tmp", "tetherd-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "h.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Platform: fp,
+		PeerFunc: func(net.Conn) (Peer, error) { return Peer{UID: 501, PID: 4242}, nil },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, ln) }()
+
+	c, err := Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.RouteSet([]netip.Addr{netip.MustParseAddr("169.254.170.2")}); err != nil {
+		t.Fatal(err)
+	}
+	// The client never disconnects: it is the signal that ends the server.
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after its context was cancelled")
+	}
+	if got := fp.routeSnapshot(); len(got) != 0 {
+		t.Fatalf("Serve returned with %v still pinned; Shutdown would run next and find nothing to clear", got)
 	}
 }

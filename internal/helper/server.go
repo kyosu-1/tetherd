@@ -25,6 +25,16 @@ type Server struct {
 
 	mu     sync.Mutex
 	active *connState
+
+	// conns tracks live connections so Serve can shut them down and wait
+	// for their cleanup before returning. main calls platform.Shutdown() as
+	// soon as Serve returns, and that lock is not this one: a Serve that
+	// returned with a connection still being served would let an in-flight
+	// route.set pin 169.254.170.2 just after Shutdown looked.
+	connMu  sync.Mutex
+	conns   map[net.Conn]struct{}
+	closing bool
+	serving sync.WaitGroup
 }
 
 type connState struct {
@@ -56,6 +66,11 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	go func() {
 		<-ctx.Done()
 		ln.Close()
+		// Closing the listener does not touch established connections, and
+		// a ServeConn parked on its scanner would never return - so the
+		// clients are disconnected here, which is what makes the wait
+		// below finite.
+		s.stopConns()
 	}()
 	peerFn := s.PeerFunc
 	if peerFn == nil {
@@ -65,6 +80,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
+				// Every connection's cleanup has run by the time this
+				// returns, so the caller's platform shutdown sees the
+				// machine as the sessions left it.
+				s.serving.Wait()
 				return nil
 			}
 			return err
@@ -75,7 +94,46 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			conn.Close()
 			continue
 		}
-		go s.ServeConn(conn, peer)
+		if !s.trackConn(conn) {
+			conn.Close() // shutting down; do not start a new session
+			continue
+		}
+		s.serving.Add(1)
+		go func() {
+			defer s.serving.Done()
+			defer s.untrackConn(conn)
+			s.ServeConn(conn, peer)
+		}()
+	}
+}
+
+// trackConn registers a connection, or reports false once shutdown started.
+func (s *Server) trackConn(c net.Conn) bool {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.closing {
+		return false
+	}
+	if s.conns == nil {
+		s.conns = make(map[net.Conn]struct{})
+	}
+	s.conns[c] = struct{}{}
+	return true
+}
+
+func (s *Server) untrackConn(c net.Conn) {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	delete(s.conns, c)
+}
+
+// stopConns disconnects every live client and refuses new ones.
+func (s *Server) stopConns() {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	s.closing = true
+	for c := range s.conns {
+		c.Close()
 	}
 }
 
@@ -166,24 +224,41 @@ func (s *Server) pfClear(st *connState) response {
 	if s.active != st {
 		return response{Code: CodeNoSession, Error: "this connection holds no pf session"}
 	}
+	// pf.clear ends the session and hands the machine to the next CLI, so
+	// everything this session installed goes with it, in the same order as
+	// the disconnect cleanup: resolver, then route, then pf. The route must
+	// come down *before* the rules, not after - while it is pinned with no
+	// rdr rule behind it, 169.254.170.2 resolves to lo0 and a packet to a
+	// non-local address on lo0 is dropped, so a child hangs where before
+	// the pin it got EHOSTUNREACH in a millisecond.
+	stuck := false
+	if st.resolverSet {
+		if err := s.Platform.ResolverClear(); err != nil {
+			s.logf("resolver clear on pf.clear: %v", err)
+			stuck = true
+		} else {
+			st.resolverSet = false
+		}
+	}
+	if st.routeSet {
+		if err := s.Platform.RouteClear(); err != nil {
+			s.logf("route clear on pf.clear: %v", err)
+			stuck = true
+		} else {
+			st.routeSet = false
+		}
+	}
 	if err := s.Platform.PfClear(); err != nil {
 		return response{Code: CodePlatform, Error: err.Error()}
 	}
 	st.applied = false
-	if st.resolverSet {
-		s.Platform.ResolverClear()
-		st.resolverSet = false
-	}
-	// pf.clear ends the session and hands the machine to the next CLI, so
-	// the pinned route goes too. Left behind it would point 169.254.170.2
-	// at lo0 with no rdr rule to catch it - worse than the unreachable-host
-	// error it was installed to fix - and the disconnect cleanup, which
-	// only runs for the active connection, would no longer remove it.
-	if st.routeSet {
-		if err := s.Platform.RouteClear(); err != nil {
-			s.logf("route clear on pf.clear: %v", err)
-		}
-		st.routeSet = false
+	if stuck {
+		// Something this session installed is still on the machine. The
+		// connection keeps the session - the disconnect cleanup is the
+		// retry, and it only runs for the active connection - and the next
+		// CLI stays locked out until the machine is clean.
+		s.logf("pf cleared for pid %d, but some state could not be removed; keeping the session for the disconnect retry", st.peer.PID)
+		return response{OK: true}
 	}
 	s.active = nil
 	s.logf("pf cleared for pid %d", st.peer.PID)
@@ -203,6 +278,12 @@ func (s *Server) busyResponse() response {
 func (s *Server) routeSet(st *connState, req request) response {
 	if len(req.Hosts) == 0 {
 		return response{Code: CodePlatform, Error: "route.set: missing hosts"}
+	}
+	// Bounded before anything is allocated or scanned: Router.Set checks
+	// each host against what it has already pinned, which is linear, so an
+	// unbounded list from a client is quadratic work in a root daemon.
+	if len(req.Hosts) > maxHosts {
+		return response{Code: CodePlatform, Error: fmt.Sprintf("route.set: %d hosts is more than tetherd pins (max %d)", len(req.Hosts), maxHosts)}
 	}
 	hosts := make([]netip.Addr, 0, len(req.Hosts))
 	for _, h := range req.Hosts {

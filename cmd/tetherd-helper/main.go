@@ -62,7 +62,10 @@ func main() {
 	log.Printf("group %s gid=%d, %s installed at %s", helper.GroupName, gid, helper.ExecName, execPath)
 
 	platform := newPlatform(*resolver, log.Printf)
-	if err := platform.Shutdown(); err != nil { // clear leftovers from a crashed run
+	// Not Shutdown: a helper that was killed rather than stopped left pf,
+	// /etc/resolver and a pinned host route behind, and the route is the one
+	// piece that cannot be found from this process's own state.
+	if err := platform.ClearLeftovers(); err != nil {
 		log.Printf("startup cleanup: %v", err)
 	}
 	srv := &helper.Server{Platform: platform, Allow: helper.AllowAdmin, Logf: log.Printf}
