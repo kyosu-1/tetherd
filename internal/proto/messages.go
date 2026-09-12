@@ -110,6 +110,24 @@ type DialReply struct {
 	Error string `json:"error,omitempty"`
 }
 
+// NoListenerHeader is how the CLI tells the agent's proxy that its 502
+// means "nothing is listening on the developer's own port", as opposed to
+// "the developer's application answered 502".
+//
+// The distinction decides whether the request may be served a second time.
+// The CLI sets this header only when the dial to the local port failed -
+// before a single byte of the request reached any application, so nothing
+// can have executed - and the agent then serves that request from the task
+// instead, which is what docs/e2e-aws.md row 24 asks for: a developer who
+// forgot to start their server sees the task's answer, not a 502 from their
+// own laptop. A 502 without this header may be the developer's own
+// application answering, and replaying a POST that has already run is worse
+// than relaying the 502.
+//
+// It belongs to the CLI-agent hop only. The agent strips it from every
+// response it relays, because that response goes out of a public ALB.
+const NoListenerHeader = "X-Tetherd-No-Listener"
+
 // HTTPHeader is the first line of an http stream, agent -> CLI.
 //
 // Put nothing load-bearing in here. The CLI reads the header only to learn

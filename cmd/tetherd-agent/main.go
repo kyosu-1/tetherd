@@ -25,7 +25,10 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := agent.New(cfg, log.Printf).ListenAndServe(ctx); err != nil {
+	// Run serves the control port and the ALB port together and returns as
+	// soon as either stops, so that ECS restarts an essential container
+	// instead of leaving one half of the agent running.
+	if err := agent.New(cfg, log.Printf).Run(ctx); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
 }
