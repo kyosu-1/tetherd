@@ -63,8 +63,13 @@ there is no way to attach to an existing one unchanged. Before the first
   the agent already reads the task's resolved environment for you.
 
 [`deploy/dev-env`](deploy/dev-env) is a working Terraform example of exactly
-this setup, and its `outputs` include a ready-made `.tetherd.yml`. The
-developer IAM policy is spelled out as JSON in
+this setup. It does not emit a `.tetherd.yml`; its `outputs` give you the
+values that go in one — `cluster_name`, `service_name`, `vpc_cidr`,
+`rds_endpoint`, `alb_dns_name`, `ecr_registry` and `developer_policy_arn` —
+plus `tetherd_run_example`, a complete `tetherd run` command line you can
+paste (`terraform output -raw tetherd_run_example`) to try the environment
+before writing any config at all.
+The developer IAM policy is spelled out as JSON in
 [the v1 macOS design spec](docs/specs/2026-09-12-v1-macos-design.md) (§4.4),
 the dev environment it belongs to is §9.1, and
 [design.md](docs/design.md) (§9) explains why each change is needed.
@@ -95,8 +100,10 @@ tetherd doctor
 walks the whole path from your laptop to the running task — the helper and
 the setgid `tetherd-exec` wrapper, `session-manager-plugin` on your `PATH`,
 your AWS identity, whether the service has an attachable task, the task
-definition's `pidMode`, whether the agent answers and what it reports (the
-task's environment, its IAM role, whether steal is wired up), the overlap
+definition's `pidMode`, whether the ALB target group in front of the service
+is one steal can work behind (`protocol_version HTTP1`, on the port the agent
+serves), whether the agent answers and what it reports (the task's
+environment, its IAM role, whether steal is wired up), the overlap
 between your local network and the captured address ranges, and whether
 `remote_domains` actually resolve through the agent. Each row prints one of
 four marks:
