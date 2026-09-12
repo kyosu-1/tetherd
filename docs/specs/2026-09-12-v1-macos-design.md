@@ -248,7 +248,9 @@ agent は root で動く（`SYS_PTRACE` を effective にするため。distrole
 
 ### 5.4 セッション管理
 
-- ユーザー名 → セッションのマップ。同名の二重接続は `error{code: "duplicate_user", from, since}` で拒否
+- ユーザー名 → セッションのマップ。**`incoming.enabled` を宣言したセッションのみ**を登録し、同名の二重接続は `error{code: "duplicate_user", from, since}` で拒否
+- `incoming.enabled` が無いセッション（`tetherd env` / `doctor` / `status`、および `tetherd run --no-incoming`）は**登録しない**ため、この拒否の対象にもならない。リクエストを受け取らないセッションは、この規則が防いでいるルーティングの曖昧さを作れない（steal の照合は `incoming.enabled` が無いセッションを最初から飛ばす）。登録しないことで `welcome.others` / `welcome.sessions` は「リクエストを受け取れるのは誰か」を意味する — `tetherd status` が答える問いそのもの。登録していないセッションもアタッチ/デタッチはログに出す（ログだけ、レジストリには入れない）
+- 1 台のマシンで `tetherd run` が二重に走らないことは CLI 側の pid ロックが保証する（agent のレジストリではない）
 - 制御ストリームで 5 秒おきに ping。3 回連続で pong が無ければセッションを破棄し、そのユーザーのルールを消す
 - `TETHERD_ENV` が無ければ起動しない。値は `welcome.env` で CLI に返す
 

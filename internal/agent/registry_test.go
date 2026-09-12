@@ -170,8 +170,11 @@ func TestSessionsAreSortedByUser(t *testing.T) {
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("Sessions() = %v, want %v", got, want)
 	}
-	if others := a.others("shota"); len(others) != len(want)-1 || others[0] != "akira" {
-		t.Errorf("others(\"shota\") = %v", others)
+	// Welcome.Others is this exact composition in handler.Hello, so the
+	// test asks for it the same way rather than through a parallel helper
+	// that could drift from what the wire carries.
+	if others := sessionUsers(a.sessionInfos("shota")); len(others) != len(want)-1 || others[0] != "akira" {
+		t.Errorf("Welcome.Others for shota = %v", others)
 	}
 }
 

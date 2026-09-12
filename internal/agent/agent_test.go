@@ -464,9 +464,11 @@ func TestAReadOnlySessionsCloseLeavesTheRunRegistered(t *testing.T) {
 	if got := a.Sessions(); len(got) != 1 || got[0].User != "shota" {
 		t.Errorf("sessions = %+v, want the run still attached", got)
 	}
-	// Structural, and not a window: a read-only session must not produce a
-	// detach line for a name it never held.
-	if strings.Contains(logged(), `user "shota" detached`) {
+	// Structural, and not a window: a read-only session must not produce
+	// the registered session's detach line for a name it never held.
+	// Compared line by line, because the read-only detach line is that
+	// line plus a suffix and strings.Contains would match it.
+	if hasLogLine(logged(), `user "shota" detached`) {
 		t.Errorf("the read-only session detached somebody else's registration:\n%s", logged())
 	}
 }
@@ -510,5 +512,68 @@ func TestAReadOnlyWelcomeListsEveryAttachedSession(t *testing.T) {
 	// always meant, and it is the session's own registration.
 	if w := colleague.Welcome(); len(w.Others) != 1 || w.Others[0] != "shota" {
 		t.Errorf("a session that can receive requests must not be listed its own: %v", w.Others)
+	}
+}
+
+// hasLogLine reports whether the captured log has a line that is exactly
+// want. Exact, because the agent's lines are deliberately prefixes of one
+// another - "user %q detached" and "user %q detached (read only)" mean
+// different things and a substring test cannot tell them apart.
+func hasLogLine(log, want string) bool {
+	for _, line := range strings.Split(log, "\n") {
+		if line == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAReadOnlyAttachAndDetachAreLogged pins the one consequence of not
+// recording read-only sessions that is not wanted: the agent's log is the
+// only place to see that a CLI reached the task at all, and
+// `tetherd run --no-incoming` is long-lived *and* read-only (docs
+// e2e-aws.md row 25), so a session that logged neither its attach nor its
+// detach would leave "my requests are not arriving" with no server-side
+// trace to check.
+//
+// The two wordings must stay distinguishable: a read-only session is in
+// nobody's `tetherd status` and can receive nothing, so a line that read
+// like a steal attach would have someone hunting for a registry entry
+// that never existed.
+func TestAReadOnlyAttachAndDetachAreLogged(t *testing.T) {
+	var mu sync.Mutex
+	var lines strings.Builder
+	a, addr := newAgent(t, func(f string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		fmt.Fprintf(&lines, f+"\n", args...)
+	})
+	logged := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return lines.String()
+	}
+
+	ro, err := connectReadOnly(t, addr, "shota")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return strings.Contains(logged(), `user "shota" attached`) }, "the read-only attach to be logged")
+	attach := logged()
+	if !strings.Contains(attach, "to read only") {
+		t.Errorf("a read-only attach must not read like a session that takes requests:\n%s", attach)
+	}
+	// It is logged without being recorded: the log line is not evidence of
+	// a registry entry, and must not become one.
+	if got := a.Sessions(); len(got) != 0 {
+		t.Errorf("a logged read-only attach must still not be registered: %+v", got)
+	}
+
+	ro.Close()
+	waitFor(t, func() bool { return hasLogLine(logged(), `user "shota" detached (read only)`) }, "the read-only detach to be logged")
+	// And it must not be the registered session's line, which would claim
+	// an unregister that did not happen.
+	if hasLogLine(logged(), `user "shota" detached`) {
+		t.Errorf("a read-only detach must not read like a registered session's:\n%s", logged())
 	}
 }

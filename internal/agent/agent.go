@@ -140,17 +140,15 @@ func (a *Agent) sessionInfos(user string) []proto.SessionInfo {
 	return out
 }
 
-// others is Welcome.Others: the user names of sessionInfos, which is what
-// every CLI up to v0.3a reads. Derived from the same slice rather than from
-// a second snapshot of the registry, so the two fields of one welcome can
-// never describe different sets.
-func (a *Agent) others(user string) []string {
-	return sessionUsers(a.sessionInfos(user))
-}
-
-// sessionUsers projects the user names out of infos. It returns nil for an
-// empty input, not an empty slice, so that Welcome.Others keeps being
-// omitted from the wire when nobody else is attached.
+// sessionUsers projects the user names out of infos: Welcome.Others, which
+// is what every CLI up to v0.3a reads. Deriving it from the slice
+// Welcome.Sessions carries, rather than from a second snapshot of the
+// registry, is what keeps the two fields of one welcome from ever
+// describing different sets.
+//
+// It returns nil for an empty input, not an empty slice, so that
+// Welcome.Others keeps being omitted from the wire when nobody else is
+// attached.
 func sessionUsers(infos []proto.SessionInfo) []string {
 	var out []string
 	for _, s := range infos {
@@ -161,8 +159,22 @@ func sessionUsers(infos []proto.SessionInfo) []string {
 
 // handler implements session.Handler for one connection.
 type handler struct {
-	a    *Agent
+	a *Agent
+	// user names this handler's registered session, and is what Closed
+	// unregisters. It stays empty for a read-only session, which the
+	// registry does not record (see register).
 	user string
+	// readOnlyUser names a read-only session, for the log and nothing
+	// else. It is a second field rather than a flag beside user so that
+	// nothing can reach unregister with it by mistake: that is the bug
+	// this split exists to make unrepresentable.
+	//
+	// It exists because the agent's log is the only place to see that a
+	// CLI reached the task at all. `tetherd run --no-incoming` is
+	// long-lived *and* read-only, so without these lines a developer
+	// whose `tetherd status` shows nothing has no server-side trace to
+	// check - and neither does whoever reads CloudWatch afterwards.
+	readOnlyUser string
 }
 
 // Hello registers the user's session: the user and where they attached
@@ -183,9 +195,12 @@ func (h *handler) Hello(hello proto.Hello, remote string, open session.Opener) (
 		h.user = hello.User
 		h.a.logf("user %q attached from %s", hello.User, remote)
 	} else {
-		// Said differently because this session is not in the registry and
-		// so gets no "detached" line either: the log would otherwise read
-		// as an attach that never ended.
+		// Said differently on purpose: the two mean different things to
+		// whoever reads the log. A read-only session takes no request, is
+		// not in the registry, and does not appear in anyone's `tetherd
+		// status` - so a line that read like a steal attach would have
+		// someone hunting for a session the registry never had.
+		h.readOnlyUser = hello.User
 		h.a.logf("user %q attached from %s to read only", hello.User, remote)
 	}
 	// One snapshot of the registry for both views of it: Others is the
@@ -241,5 +256,14 @@ func (h *handler) Closed() {
 	if h.user != "" {
 		h.a.unregister(h.user)
 		h.a.logf("user %q detached", h.user)
+		return
+	}
+	if h.readOnlyUser != "" {
+		// Nothing to unregister - this session was never recorded - but
+		// it is still said out loud, so that every attach in the log has
+		// an end and a session that is still open is distinguishable from
+		// one that finished. Suffixed, so it cannot be mistaken for the
+		// line above.
+		h.a.logf("user %q detached (read only)", h.readOnlyUser)
 	}
 }

@@ -226,6 +226,15 @@ func TestStatusListsWhoIsAttachedToEachTask(t *testing.T) {
 	// `status` had to attach in order to ask, and that session is not a
 	// developer working on this service: reporting itself would put a name
 	// in the table that vanishes the moment the command exits.
+	//
+	// Two independent things make this true, so no single mutation
+	// falsifies the check and it is a regression guard rather than a pin:
+	// the agent records no read-only session at all, so there is nothing
+	// of status's own in the welcome (registry.go's register), and the
+	// welcome leaves out the asking session besides (handler.Hello). Each
+	// mechanism has its own agent-side test -
+	// TestAReadOnlySessionIsNotReportedAsAttached and
+	// TestAReadOnlyWelcomeListsEveryAttachedSession.
 	if strings.Contains(report, "tester") {
 		t.Errorf("`status` must not report its own session:\n%s", report)
 	}
@@ -248,9 +257,13 @@ func TestStatusListsWhoIsAttachedToEachTask(t *testing.T) {
 // "it printed nothing, did it even work?" - which is the one thing a
 // diagnostic must never leave a reader wondering.
 //
-// It is also what pins that `status` leaves itself out of the report: its
-// own session is attached at the moment it asks, so a command that listed
-// every session the agent knows would print a developer here.
+// The "tester" check below is a regression guard, not this test's point.
+// It was written when a `status` attach did register at the agent, so that
+// listing every session the agent knew would have printed a developer
+// here; since the registry stopped recording read-only sessions that is no
+// longer what makes it true. What does: status's session is not in the
+// registry, and the welcome excludes the asking session anyway. See
+// TestStatusListsWhoIsAttachedToEachTask for where those are pinned.
 func TestStatusSaysSoWhenNobodyIsAttached(t *testing.T) {
 	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
 	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"}, agentAddr: ag.addr}
