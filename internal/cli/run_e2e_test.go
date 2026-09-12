@@ -33,8 +33,12 @@ import (
 
 // inProcessAgent runs a real tetherd-agent on a local listener and returns a
 // Transport that dials it, so Run's ssm branch can be exercised without AWS.
+//
+// proxyAddr is set only by startAgentForWithApp: it is the agent's real
+// reverse proxy, which is where the ALB puts a request.
 type inProcessAgent struct {
-	addr string
+	addr      string
+	proxyAddr string
 }
 
 func startAgentFor(t *testing.T, env map[string]string, envErr error, dial func(context.Context, string) (net.Conn, error)) *inProcessAgent {
@@ -52,6 +56,31 @@ func startAgentFor(t *testing.T, env map[string]string, envErr error, dial func(
 	t.Cleanup(func() { cancel(); ln.Close() })
 	go a.Serve(ctx, ln)
 	return &inProcessAgent{addr: ln.Addr().String()}
+}
+
+// startAgentForWithApp is startAgentFor plus the agent's own reverse proxy
+// on a second listener, with appAddr standing in for the application
+// container. proxyAddr is then where a request from the ALB arrives, so a
+// test can put the agent's real matching and real steal transport in front
+// of the CLI's real receiver rather than a stand-in's idea of either.
+func startAgentForWithApp(t *testing.T, env map[string]string, appAddr string) *inProcessAgent {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agent.New(agent.Config{Env: "dev", TaskARN: "arn:test", AppContainer: "app"}, nil)
+	a.SetEnvReader(fakeEnvReader{env: env, arn: "arn:test"})
+	ctx, cancel := context.WithCancel(context.Background())
+	proxy := &http.Server{Handler: (&agent.Proxy{Agent: a, AppAddr: appAddr}).Handler()}
+	t.Cleanup(func() { cancel(); proxy.Close(); ln.Close(); proxyLn.Close() })
+	go a.Serve(ctx, ln)
+	go proxy.Serve(proxyLn)
+	return &inProcessAgent{addr: ln.Addr().String(), proxyAddr: proxyLn.Addr().String()}
 }
 
 type fakeEnvReader struct {
@@ -2158,4 +2187,171 @@ func TestEnvAndDoctorAttachWithoutTakingRequests(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- the whole hop: the agent's real proxy in front of the CLI's real receiver
+
+// pairedRun stands up everything a stolen request actually passes through:
+// the application container, a real agent with its real reverse proxy in
+// front of it, and a real `tetherd run` attached with a real StealServer.
+// Requests go in at the agent's proxy address, which is where the ALB puts
+// them.
+//
+// Each side is already pinned in isolation - internal/agent/proxy_test.go
+// for the agent's half, steal_test.go for this one - and both read
+// proto.NoListenerHeader, so the spelling cannot drift. What only this can
+// check is the wire-level agreement: that what the CLI actually emits is
+// what the agent actually keys on.
+type pairedRun struct {
+	proxyAddr string
+	appHits   func() int
+	out       *safeLog
+}
+
+func startPair(t *testing.T, localPort int, app http.HandlerFunc) *pairedRun {
+	t.Helper()
+	var mu sync.Mutex
+	hits := 0
+	appSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		app(w, r)
+	}))
+	t.Cleanup(appSrv.Close)
+
+	ag := startAgentForWithApp(t, map[string]string{"A": "1"}, appSrv.Listener.Addr().String())
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+
+	opts := ssmOpts("sleep", "30")
+	opts.NoIncoming = false
+	opts.LocalPort = localPort
+	opts.User = "shota"
+	opts.Token = "tok-shota"
+	out := &safeLog{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() {
+		code, _ := RunWithDeps(ctx, opts, out, depsFor(p))
+		done <- code
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	waitFor(t, func() bool { return strings.Contains(out.String(), "✓ steal") }, "the steal line")
+	return &pairedRun{
+		proxyAddr: ag.proxyAddr,
+		appHits:   func() int { mu.Lock(); defer mu.Unlock(); return hits },
+		out:       out,
+	}
+}
+
+// do sends one request the way the ALB would and returns the response the
+// public caller sees.
+func (p *pairedRun) do(t *testing.T, method, path string, hdrs map[string]string) (*http.Response, string) {
+	t.Helper()
+	r, err := http.NewRequest(method, "http://"+p.proxyAddr+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Host = "api.example.com"
+	r.Header.Set("X-Forwarded-For", "203.0.113.5")
+	for k, v := range hdrs {
+		r.Header.Set(k, v)
+	}
+	// No keep-alives: each request is its own connection, so one case
+	// cannot inherit a pooled connection from the previous one.
+	c := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := c.Do(r)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp, string(b)
+}
+
+func devHeaders(user, token string) map[string]string {
+	return map[string]string{"X-Dev-User": user, "X-Dev-Token": token}
+}
+
+// The brief's integration case, against the agent's real matching rather
+// than a stand-in's: a request carrying this developer's name and token
+// reaches their laptop, and everything else stays with the application.
+func TestRunStealsThroughTheRealAgentProxy(t *testing.T) {
+	local := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "LOCAL %s xff=%s host=%s", r.URL.Path, r.Header.Get("X-Forwarded-For"), r.Host)
+	}))
+	pair := startPair(t, local, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "APP %s", r.URL.Path)
+	})
+
+	_, body := pair.do(t, "GET", "/api/orders", devHeaders("shota", "tok-shota"))
+	if !strings.Contains(body, "LOCAL /api/orders") {
+		t.Errorf("a matching request must reach the laptop, got %q", body)
+	} else if !strings.Contains(body, "xff=203.0.113.5") || !strings.Contains(body, "host=api.example.com") {
+		t.Errorf("the caller and the host must survive both hops, got %q", body)
+	}
+	if _, body := pair.do(t, "GET", "/api/orders", nil); !strings.Contains(body, "APP /api/orders") {
+		t.Errorf("an unmatched request must reach the app, got %q", body)
+	}
+	if _, body := pair.do(t, "GET", "/api/orders", devHeaders("shota", "wrong")); !strings.Contains(body, "APP /api/orders") {
+		t.Errorf("a wrong token must reach the app, got %q", body)
+	}
+	if _, body := pair.do(t, "GET", "/api/orders", devHeaders("someone-else", "tok-shota")); !strings.Contains(body, "APP /api/orders") {
+		t.Errorf("another developer's name must reach the app, got %q", body)
+	}
+	// The token must not be anywhere in what this developer's terminal saw.
+	if strings.Contains(pair.out.String(), "tok-shota") {
+		t.Errorf("the token leaked into the log: %s", pair.out.String())
+	}
+}
+
+// docs/e2e-aws.md row 24, end to end, across the one thing neither side can
+// check alone: that the 502 the CLI emits for a failed dial is the 502 the
+// agent keys on, and that a 502 which is not that one is relayed untouched.
+func TestRunRow24FallsBackToTheAppOnlyWhenNothingIsListening(t *testing.T) {
+	t.Run("nothing listening on the laptop: the caller gets the app's answer", func(t *testing.T) {
+		// Port 1 needs no listener of its own to be refused.
+		pair := startPair(t, 1, func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			fmt.Fprintf(w, "APP %s body=%q", r.URL.Path, string(b))
+		})
+		resp, body := pair.do(t, "GET", "/api/orders", devHeaders("shota", "tok-shota"))
+
+		// 1. the application's answer, body intact.
+		if resp.StatusCode != 200 || !strings.Contains(body, `APP /api/orders body=""`) {
+			t.Fatalf("status=%d body=%q, want the application's own answer", resp.StatusCode, body)
+		}
+		// 2. the hop's header must not reach the public caller.
+		if got := resp.Header.Get("X-Tetherd-No-Listener"); got != "" {
+			t.Errorf("X-Tetherd-No-Listener = %q on a response out of a public ALB", got)
+		}
+		// 3. exactly once - a fallback that ran the request twice would be
+		//    the bug the narrowness exists to prevent.
+		if n := pair.appHits(); n != 1 {
+			t.Errorf("the application handled the request %d times, want exactly 1", n)
+		}
+		// 4. and the developer is told, on their own terminal, why.
+		waitFor(t, func() bool {
+			return strings.Contains(pair.out.String(), "nothing is listening on 127.0.0.1:1")
+		}, "the CLI to name the port nothing is listening on")
+	})
+
+	t.Run("the laptop's own 502 is relayed, not replayed", func(t *testing.T) {
+		local := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The developer's own application answering 502: it has the
+			// request and may have acted on it.
+			w.WriteHeader(http.StatusBadGateway)
+			fmt.Fprint(w, "LOCAL 502 from my own app")
+		}))
+		pair := startPair(t, local, func(w http.ResponseWriter, r *http.Request) {
+			t.Errorf("the application must not be reached at all: %s", r.URL.Path)
+		})
+		resp, body := pair.do(t, "POST", "/api/orders", devHeaders("shota", "tok-shota"))
+		if resp.StatusCode != http.StatusBadGateway || !strings.Contains(body, "LOCAL 502 from my own app") {
+			t.Fatalf("status=%d body=%q, want the laptop's own 502 relayed", resp.StatusCode, body)
+		}
+		if n := pair.appHits(); n != 0 {
+			t.Errorf("the application handled the request %d times, want 0: replaying a POST that already ran is worse than relaying the 502", n)
+		}
+	})
 }

@@ -152,8 +152,8 @@ func stealSettings(opts RunOptions) (stealConfig, error) {
 // bounds is a stream the agent opened and then left open without sending a
 // second request - which nothing does today, so it should never fire. The
 // 90s figure in the old comment was net/http's default for a pool that is
-// not in play; the 30s IdleConnTimeout further down is a different thing
-// again, on our own transport to the developer's process.
+// not in play; the transport further down now has no pool of its own
+// either, deliberately (see DisableKeepAlives).
 var (
 	stealReadHeaderTimeout = 20 * time.Second
 	stealIdleTimeout       = 120 * time.Second
@@ -332,9 +332,37 @@ func (s *StealServer) transport() http.RoundTripper {
 			// send: the response would come back decompressed with the
 			// header stripped, and a body the application meant to be gzip
 			// is not this hop's decision.
-			DisableCompression:  true,
-			MaxIdleConnsPerHost: 4,
-			IdleConnTimeout:     30 * time.Second,
+			DisableCompression: true,
+			// No connection pool, and this is a correctness requirement
+			// rather than a tuning choice.
+			//
+			// errNoListener is attached per dial, but the claim it makes -
+			// proto.NoListenerHeader, "nothing reached an application, so
+			// replay this" - is about the request. Those two come apart the
+			// moment net/http retries: Transport.roundTrip retries a
+			// request whose connection turns out to be gone, and
+			// persistConn.shouldRetryRequest allows that for a replayable
+			// request (any GET, or a POST with no body and an
+			// Idempotency-Key) once the connection has been reused. If the
+			// retry's fresh dial then fails, the error handler is handed a
+			// dial error - and would stamp the replay claim on a request
+			// the developer's live application had already read in full on
+			// the first attempt. The agent would run it a second time
+			// against the deployed application. A server shutting down is
+			// exactly when that happens, and exactly when steal is in use.
+			//
+			// With keep-alives off the invariant holds again: a request
+			// handed a dial error has never been written to any
+			// connection. Either it was waiting for its first one, or the
+			// only retry net/http has left is the nothingWrittenError case
+			// - and that one is sound by construction, because nothing was
+			// written on the earlier attempt either.
+			//
+			// It costs nothing. The agent opens one fresh yamux stream per
+			// stolen request, so there is at most one request in flight
+			// here and there was never a pool on the other side for this
+			// one to amortise.
+			DisableKeepAlives: true,
 		}
 	})
 	return s.tr

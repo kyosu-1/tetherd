@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -228,6 +229,232 @@ func TestStealServerDoesNotMarkAFailureAfterTheAppAccepted(t *testing.T) {
 	}
 }
 
+// rawApp is the developer's process answering with bytes an http.Handler
+// could not produce: it reads the request in full - so an application has
+// certainly seen it - and then replies with whatever it was given, or hangs
+// up if that is empty.
+func rawApp(t *testing.T, reply string) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+				io.Copy(io.Discard, req.Body)
+				req.Body.Close()
+				io.WriteString(c, reply)
+			}()
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// Every way through the error handler, not just the one shape of error the
+// rest of the suite happens to produce. The rule is "a failed dial and
+// nothing else", and the way it gets broken is by a maintainer deciding the
+// error's text is good enough - which is what the comment on the guard
+// warns against, and what this table is here to catch. The second case
+// exists specifically because its error text contains "connection
+// refused": a guard widened to match that string passes every other test
+// in this file.
+func TestStealServerClaimsAReplayOnlyForAFailedDial(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		reply string // "" means hang up without answering
+		dead  bool   // nothing listening at all
+		want  string
+	}{
+		{
+			name: "nothing listening - the one case that may be replayed",
+			dead: true,
+			want: "1",
+		},
+		{
+			name:  "the app read the request and hung up without answering",
+			reply: "",
+			want:  "",
+		},
+		{
+			// net/http reports the offending line verbatim, so the error
+			// the handler sees contains "connection refused" while the
+			// connection was made and the request read. This is the case
+			// that fails a guard widened to match the error's text.
+			name:  "the app answered with a header line whose text looks like a dial failure",
+			reply: "HTTP/1.1 200 OK\r\nX-Ok: 1\r\nconnection refused\r\n\r\n",
+			want:  "",
+		},
+		{
+			name:  "the app answered with a garbage status line",
+			reply: "GARBAGE / NOT-HTTP\r\n\r\n",
+			want:  "",
+		},
+		{
+			name:  "the app answered with a status code that is not one",
+			reply: "HTTP/1.1 twenty OK\r\nContent-Length: 0\r\n\r\n",
+			want:  "",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var logs logSink
+			port := 1
+			if !c.dead {
+				port = rawApp(t, c.reply)
+			}
+			s := &StealServer{LocalPort: port, Logf: logs.logf}
+			resp := agentSide(t, s, httptest.NewRequest("POST", "http://tetherd/api/orders", strings.NewReader("{}")))
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("status = %d body = %s, want 502 on every one of these", resp.StatusCode, body)
+			}
+			if got := resp.Header.Get("X-Tetherd-No-Listener"); got != c.want {
+				t.Errorf("X-Tetherd-No-Listener = %q, want %q\n  the error was: %s", got, c.want, body)
+			}
+		})
+	}
+	// Two of the error handler's other callers are unreachable from the
+	// wire and so are not in the table, rather than being faked: net/http's
+	// own server answers an unprintable Upgrade value with 400 before the
+	// handler ever runs, and the ResponseWriter here is always hijackable,
+	// so "can't switch protocols using non-Hijacker" needs a mutation to
+	// reach (M16 does). A failure part way through copying a response body
+	// never reaches the error handler at all - httputil suppresses it - and
+	// a request the agent abandons ends with nobody left to read the 502.
+}
+
+// restartingApp is the developer's own server in the one state that makes
+// the replay claim dangerous: it answers the first request, and then - part
+// way through a restart - reads the next one in full and dies without
+// answering, taking its listener with it so that any redial fails.
+//
+// It is a raw listener rather than an http.Server because what matters is
+// counting requests it has read off the wire and then hanging up mid-flight,
+// neither of which net/http will do on request.
+type restartingApp struct {
+	ln net.Listener
+
+	mu    sync.Mutex
+	reads int
+	conns int
+}
+
+func startRestartingApp(t *testing.T) *restartingApp {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &restartingApp{ln: ln}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			a.mu.Lock()
+			a.conns++
+			a.mu.Unlock()
+			go a.serveConn(c)
+		}
+	}()
+	return a
+}
+
+func (a *restartingApp) serveConn(c net.Conn) {
+	defer c.Close()
+	br := bufio.NewReader(c)
+	for {
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		io.Copy(io.Discard, req.Body)
+		req.Body.Close()
+		a.mu.Lock()
+		a.reads++
+		n := a.reads
+		a.mu.Unlock()
+		if n == 1 {
+			io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+			continue
+		}
+		// The restart. This request has been read in full, so whatever it
+		// was going to do has happened; the listener goes with the
+		// connection so that anything redialling finds nothing there.
+		a.ln.Close()
+		return
+	}
+}
+
+func (a *restartingApp) port() int { return a.ln.Addr().(*net.TCPAddr).Port }
+
+func (a *restartingApp) counts() (reads, conns int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.reads, a.conns
+}
+
+// The claim proto.NoListenerHeader makes is about the request; errNoListener
+// is a fact about one dial. Pooling is what pulls the two apart:
+// net/http retries a replayable request whose reused connection turns out to
+// be gone, and if that retry's dial fails the error handler sees a dial
+// error for a request an application has already read in full. The agent
+// answers the header by running that request again against the deployed
+// application - the double execution this whole contract exists to prevent,
+// in the situation it exists for: a developer restarting their server.
+func TestStealServerNeverClaimsAReplayAfterAnApplicationReadTheRequest(t *testing.T) {
+	app := startRestartingApp(t)
+	var logs logSink
+	s := &StealServer{LocalPort: app.port(), Logf: logs.logf}
+
+	// Answered normally. With a pool this is what leaves a connection
+	// behind for the next request to be retried on.
+	first := agentSide(t, s, httptest.NewRequest("GET", "http://tetherd/one", nil))
+	io.Copy(io.Discard, first.Body)
+	first.Body.Close()
+	if first.StatusCode != 200 {
+		t.Fatalf("the first request must be answered normally, got %d", first.StatusCode)
+	}
+
+	// A plain GET, which is replayable, so net/http will retry it if the
+	// connection it went out on was a reused one.
+	second := agentSide(t, s, httptest.NewRequest("GET", "http://tetherd/two", nil))
+	body, _ := io.ReadAll(second.Body)
+	second.Body.Close()
+
+	reads, conns := app.counts()
+	if reads < 2 {
+		t.Fatalf("the app read %d requests, want it to have read the second one too: this is not the case under test", reads)
+	}
+	if second.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d body = %s, want 502", second.StatusCode, body)
+	}
+	if got := second.Header.Get("X-Tetherd-No-Listener"); got != "" {
+		t.Errorf("X-Tetherd-No-Listener = %q on a request the developer's application read in full: the agent would run it a second time against the task", got)
+	}
+	// The mechanism, asserted separately from the property above: one
+	// connection per stolen request means net/http has no reused connection
+	// to retry on, so a dial error can only ever describe this request's
+	// own single dial.
+	if conns != reads {
+		t.Errorf("the app saw %d connections for %d requests, want one each so there is nothing to retry on", conns, reads)
+	}
+}
+
 // The header is this hop's claim about its own dial. The developer's
 // process must not be able to make it on this hop's behalf - a local app
 // that sets it would otherwise have every one of its own responses
@@ -245,6 +472,71 @@ func TestStealServerStripsTheReplayClaimFromTheLocalApp(t *testing.T) {
 	}
 	if got := resp.Header.Get("X-Tetherd-No-Listener"); got != "" {
 		t.Errorf("X-Tetherd-No-Listener = %q: only a failed dial may claim a request is safe to replay", got)
+	}
+}
+
+// The strip applies to a protocol switch too. httputil takes the 101's
+// headers from the upstream response, so a local app that answered the
+// upgrade with the replay claim would put it on the wire toward the agent -
+// a different branch of the same contract item from the one above, and one
+// a reader would not guess is covered.
+func TestStealServerStripsTheReplayClaimFromAnUpgrade(t *testing.T) {
+	port := rawApp(t, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-Tetherd-No-Listener: 1\r\n\r\n")
+	s := &StealServer{LocalPort: port}
+
+	mine, theirs := net.Pipe()
+	t.Cleanup(func() { mine.Close() })
+	go s.Serve(theirs)
+
+	req := httptest.NewRequest("GET", "http://tetherd/ws", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	if err := req.Write(mine); err != nil {
+		t.Fatal(err)
+	}
+	mine.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufioReader(mine), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Tetherd-No-Listener"); got != "" {
+		t.Errorf("X-Tetherd-No-Listener = %q on a 101: the claim is this hop's alone, on every status", got)
+	}
+}
+
+// X-Forwarded-For may arrive as repeated header lines rather than one
+// comma-joined value, and both spellings mean the same chain. Copying with
+// Get/Set instead of Values/Add keeps only the first line and silently
+// shortens the chain the developer's process sees.
+func TestStealServerKeepsRepeatedForwardedHeaderLines(t *testing.T) {
+	got := make(chan http.Header, 1)
+	port := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Header.Clone()
+	}))
+	s := &StealServer{LocalPort: port}
+	mine, theirs := net.Pipe()
+	t.Cleanup(func() { mine.Close() })
+	go s.Serve(theirs)
+
+	// Written by hand: http.Header would join these into one value.
+	mine.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, err := mine.Write([]byte("GET / HTTP/1.1\r\nHost: tetherd\r\n" +
+		"X-Forwarded-For: 203.0.113.5\r\n" +
+		"X-Forwarded-For: 10.0.1.20\r\n\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := http.ReadResponse(bufioReader(mine), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	h := <-got
+	if want := []string{"203.0.113.5", "10.0.1.20"}; !slices.Equal(h.Values("X-Forwarded-For"), want) {
+		t.Errorf("X-Forwarded-For = %q, want both lines %q", h.Values("X-Forwarded-For"), want)
 	}
 }
 
