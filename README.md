@@ -119,9 +119,14 @@ Only `✗` rows affect the exit code.
   tetherd to attach somewhere it shouldn't.
 - **macOS only.** The capture layer is built on `pf`, `DIOCNATLOOK`, and
   `setregid`; there is no Linux or Windows implementation.
-- **The released binaries are not signed or notarized.** A Homebrew install
-  doesn't trigger Gatekeeper's quarantine, but downloading a binary from
-  GitHub Releases directly is not a supported way to run tetherd.
+- **The released binaries are not signed or notarized.** Homebrew quarantines
+  whatever a cask downloads, so the cask strips that attribute during install;
+  a binary fetched from GitHub Releases by hand keeps it, and running tetherd
+  that way is not supported.
+- **The root helper stays resident.** `sudo tetherd-helper install` registers a
+  LaunchDaemon that runs whether or not you are using tetherd. Having launchd
+  hold the socket and start the helper only on demand is the intended design
+  (spec §7) and is not implemented yet.
 
 ## Trust boundary
 
