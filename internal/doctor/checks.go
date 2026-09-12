@@ -144,18 +144,26 @@ func CheckOverlap(overlaps []string) Result {
 // CheckRemoteCIDRs warns about a captured set wide enough to send the laptop's
 // whole internet path through the dev task.
 //
-// The rule: warn about a prefix of /8 or shorter whose base address is not in
-// a private range (RFC 1918, or RFC 4193 fc00::/7). A private block that wide
-// — 10.0.0.0/8, fd00::/8 — is an ordinary VPC address plan and captures
-// nothing a laptop reaches directly. Anything else that wide (0.0.0.0/0,
-// ::/0, 128.0.0.0/1, a public /8) covers a large share of the public internet,
-// which turns the dev ENI into the laptop's gateway. Narrower public ranges
-// such as a /12 of EC2 space are ordinary targets and stay quiet.
+// The rule: warn about a prefix of /8 or shorter that is not wholly inside a
+// private block (RFC 1918, or RFC 4193 fc00::/7). A private block that wide —
+// 10.0.0.0/8, fd00::/8 — is an ordinary VPC address plan and captures nothing
+// a laptop reaches directly. Anything else that wide (0.0.0.0/0, ::/0,
+// 128.0.0.0/1, a public /8) covers a large share of the public internet, which
+// turns the dev ENI into the laptop's gateway. Narrower public ranges such as
+// a /12 of EC2 space are ordinary targets and stay quiet.
+//
+// "Wholly inside" is the load-bearing word, and netip.Addr.IsPrivate answers a
+// different question: it tests the base address alone. 10.0.0.0/7 has a
+// private base address but reaches 11.255.255.255, and 11.0.0.0/8 is routed
+// public space; 192.168.0.0/8 has one too but is almost entirely public. Both
+// are exactly the fat-finger this check exists to catch — a /8 typed where a
+// /16 was meant — so the prefix must be a subset of a private supernet, not
+// merely start inside one.
 func CheckRemoteCIDRs(cidrs []netip.Prefix) Result {
 	r := Result{Name: "remote CIDRs"}
 	var wide []string
 	for _, p := range cidrs {
-		if p.Bits() <= 8 && !p.Addr().IsPrivate() {
+		if p.Bits() <= 8 && !whollyPrivate(p) {
 			wide = append(wide, p.String())
 		}
 	}
@@ -196,6 +204,9 @@ func CheckDomains(domains []string, resolved map[string]error) Result {
 			r.Detail += "; not checked: " + strings.Join(unchecked, ", ")
 		}
 		r.Next = "check the name exists in the VPC (Cloud Map or a private hosted zone) and that remote_domains matches it"
+		if len(unchecked) > 0 {
+			r.Next += "; fix the rows above so the rest can be checked"
+		}
 		return r
 	}
 	if len(unchecked) > 0 {
@@ -206,6 +217,27 @@ func CheckDomains(domains []string, resolved map[string]error) Result {
 	}
 	r.Detail = strings.Join(domains, ", ") + " resolve through the agent"
 	return r
+}
+
+// privateSupernets are the blocks a wide prefix may sit inside without being a
+// warning: RFC 1918 and RFC 4193.
+var privateSupernets = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("fc00::/7"),
+}
+
+// whollyPrivate reports whether every address p covers is private. A prefix is
+// a subset of a supernet exactly when the supernet contains its base address
+// and the prefix is no wider than the supernet.
+func whollyPrivate(p netip.Prefix) bool {
+	for _, s := range privateSupernets {
+		if s.Contains(p.Addr()) && p.Bits() >= s.Bits() {
+			return true
+		}
+	}
+	return false
 }
 
 func joinPrefixes(cidrs []netip.Prefix) string {

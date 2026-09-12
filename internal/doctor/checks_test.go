@@ -249,6 +249,16 @@ func TestCheckRemoteCIDRsWarnsOnlyOnWidePublicRanges(t *testing.T) {
 		"52.0.0.0/8",  // a public /8
 		"52.0.0.0/6",  // wider still
 		"2000::/3",    // the whole global-unicast v6 space
+		// A prefix whose base address is private but which reaches well
+		// past the private block: 10.0.0.0/7 covers 11.0.0.0/8, routed
+		// public space, and 192.168.0.0/8 is private only in its first
+		// /16. Both are the fat-finger this check exists to catch - a /8
+		// typed where a /16 was meant - and a base-address-only test
+		// calls them private.
+		"10.0.0.0/7",
+		"192.168.0.0/8",
+		"172.16.0.0/8",
+		"fc00::/6",
 	}
 	for _, s := range loud {
 		p := netip.MustParsePrefix(s)
