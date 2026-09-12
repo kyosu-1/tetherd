@@ -28,3 +28,14 @@ func (e *RejectedError) Error() string {
 // NXDOMAIN instead of SERVFAIL, so a mistyped hostname reads as "host not
 // found" rather than something macOS retries.
 var ErrNameNotFound = errors.New("name not found")
+
+// notFoundError is how Client.Resolve reports a NotFound reply. It exists
+// only to keep the sentinel in the error chain without printing its text a
+// second time: the agent's own message already ends in "name not found", so
+// wrapping it with %w produced "resolve x via agent: x: name not found: name
+// not found". errors.Is still finds ErrNameNotFound through Unwrap.
+type notFoundError struct{ msg string }
+
+func (e *notFoundError) Error() string { return e.msg }
+
+func (e *notFoundError) Unwrap() error { return ErrNameNotFound }

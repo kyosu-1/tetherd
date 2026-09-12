@@ -13,6 +13,7 @@ import (
 
 	"github.com/kyosu-1/tetherd/internal/doctor"
 	"github.com/kyosu-1/tetherd/internal/helper"
+	"github.com/kyosu-1/tetherd/internal/proto"
 	"github.com/kyosu-1/tetherd/internal/session"
 	"github.com/kyosu-1/tetherd/internal/transport"
 )
@@ -27,16 +28,21 @@ import (
 // because the developer learns nothing at all.
 const DefaultDoctorTimeout = 10 * time.Second
 
-// DefaultDoctorBudget bounds the whole report, not just each row. Ten
+// DefaultDoctorBudget bounds the whole report, not just each row. Eleven
 // checks plus one resolve per configured domain, each allowed
 // DefaultDoctorTimeout, adds up to minutes in the worst case; nobody waits
-// that long for a diagnostic. Whatever has not been checked when the budget
-// runs out is reported as failing rather than silently dropped.
+// that long for a diagnostic. What the budget cuts short is reported as
+// unchecked or failed, never silently dropped.
 const DefaultDoctorBudget = 45 * time.Second
 
 // sessionManagerPluginName is the binary the ssm transport runs as a
 // subprocess (spec §6.1).
 const sessionManagerPluginName = "session-manager-plugin"
+
+// domainProbeLabel is prefixed to each configured remote domain to make a
+// name nothing can have registered, so the remote-domains check tests the
+// path to the VPC resolver instead of the existence of one record.
+const domainProbeLabel = "tetherd-doctor-probe"
 
 // DoctorOptions is `tetherd doctor`: the same target flags as run, plus the
 // two bounds on how long the report may take.
@@ -48,6 +54,12 @@ type DoctorOptions struct {
 	// Budget is how long the whole report may take. Zero means
 	// DefaultDoctorBudget.
 	Budget time.Duration
+	// SkipAgent leaves the agent alone: no session is opened, and the three
+	// rows that need one are reported as not checked rather than dropped.
+	// One doctor run is otherwise one SSM session, which shows up in
+	// CloudTrail and in the task's session history - noise a scripted or
+	// looped invocation may not want.
+	SkipAgent bool
 }
 
 // DoctorRun checks that this machine and the dev service are set up for
@@ -181,30 +193,50 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 	// finding the task: a developer whose --service is misspelled must not
 	// be told their credentials are broken. The session it does open is this
 	// one, handed to it below, so there is still only one.
+	//
+	// Each of these is bounded by a context, so each can come back with
+	// nothing but "context deadline exceeded" - from a VPN that blackholes
+	// STS, or from the overall budget. Handing that to the judgement would
+	// answer it with advice for a different problem ("authenticate for the
+	// profile", "grant ecs:DescribeTaskDefinition"), telling a developer to
+	// re-authenticate or to ask for an IAM grant they already hold, so a
+	// timeout is routed to a row that says what it is.
 	ictx, icancel := context.WithTimeout(ctx, timeout)
 	prov, provErr := d.NewAWSProvider(ictx, opts.RunOptions)
-	if provErr != nil {
-		results = append(results, doctor.CheckIdentity("", provErr))
-	} else {
-		arn, idErr := prov.Identity(ictx)
-		results = append(results, doctor.CheckIdentity(arn, idErr))
+	arn, idErr := "", provErr
+	if provErr == nil {
+		arn, idErr = prov.Identity(ictx)
 	}
 	icancel()
+	if isContextError(idErr) {
+		results = append(results, timedOut("AWS identity", checkTimedOut(ctx, "AWS GetCallerIdentity", timeout)))
+	} else {
+		results = append(results, doctor.CheckIdentity(arn, idErr))
+	}
 
 	dctx, dcancel := context.WithTimeout(ctx, timeout)
 	dd := d
 	dd.NewAWSProvider = func(context.Context, RunOptions) (awsProvider, error) { return prov, provErr }
 	prov, task, taskErr := discoverTask(dctx, opts.RunOptions, dd, quiet)
 	dcancel()
-	results = append(results, taskRow(task, taskErr, provErr))
-
-	if taskErr != nil {
-		results = append(results, notChecked("pidMode", "the task could not be found"))
+	if isContextError(taskErr) {
+		results = append(results, timedOut("attachable task", checkTimedOut(ctx, "the ECS task lookup", timeout)))
 	} else {
+		results = append(results, taskRow(task, taskErr, provErr))
+	}
+
+	switch {
+	case taskErr != nil:
+		results = append(results, notChecked("pidMode", "the task could not be found"))
+	default:
 		pctx, pcancel := context.WithTimeout(ctx, timeout)
 		mode, modeErr := prov.PIDMode(pctx, task.DefinitionARN)
 		pcancel()
-		results = append(results, doctor.CheckPIDMode(mode, modeErr))
+		if isContextError(modeErr) {
+			results = append(results, timedOut("pidMode", checkTimedOut(ctx, "ecs:DescribeTaskDefinition", timeout)))
+		} else {
+			results = append(results, doctor.CheckPIDMode(mode, modeErr))
+		}
 	}
 
 	// 5. tetherd's own handshake with the agent. CheckTask above only says
@@ -216,21 +248,37 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 	// never notice, while one with them would be told to go inspect Cloud
 	// Map.
 	var sess *session.Client
+	var welcome proto.Welcome
 	switch {
+	case opts.SkipAgent:
+		results = append(results, skipped("agent session", "--skip-agent"))
 	case taskErr != nil:
 		results = append(results, notChecked("agent session", "the task could not be found"))
 	default:
 		sctx, scancel := context.WithTimeout(ctx, timeout)
 		s, dialErr := dialAgent(sctx, opts.RunOptions, d, prov, task, quiet)
 		scancel()
-		var protocol, agentEnv string
 		if dialErr == nil {
 			sess = s
 			defer sess.Close()
-			w := sess.Welcome()
-			protocol, agentEnv = w.Version, w.Env
+			welcome = sess.Welcome()
 		}
-		results = append(results, doctor.CheckAgentSession(protocol, agentEnv, opts.TargetEnv, dialErr))
+		results = append(results, doctor.CheckAgentSession(welcome.Version, welcome.Env, opts.TargetEnv, dialErr))
+	}
+
+	// 5b. The task's environment, as the agent itself reports it. `tetherd
+	// run` treats this error as fatal under ssm, and its causes (the agent
+	// not running in ECS, TETHERD_APP_CONTAINER naming a container the task
+	// does not have, no process of that container visible) are invisible to
+	// every row above: the pidMode row reads the task definition, not the
+	// result. The welcome is already in hand, so this costs no I/O.
+	switch {
+	case opts.SkipAgent:
+		results = append(results, skipped("task env", "--skip-agent"))
+	case sess == nil:
+		results = append(results, notChecked("task env", "the agent did not answer"))
+	default:
+		results = append(results, doctor.CheckTaskEnv(len(welcome.AppEnv), welcome.EnvError))
 	}
 
 	// 6. The captured set - what goes to the task, and what it collides
@@ -245,7 +293,9 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 		cctx, ccancel := context.WithTimeout(ctx, timeout)
 		set, setErr := remoteSet(cctx, opts.RunOptions, prov, task, quiet)
 		ccancel()
-		if setErr != nil {
+		if isContextError(setErr) {
+			results = append(results, timedOut("remote CIDRs", checkTimedOut(ctx, "the VPC CIDR lookup", timeout)))
+		} else if setErr != nil {
 			results = append(results, doctor.Result{
 				Name:   "remote CIDRs",
 				Status: doctor.Fail,
@@ -290,16 +340,61 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 	//
 	// This row is printed last because its next step sends the developer to
 	// the rows above it.
-	resolved := map[string]error{}
+	probed := map[string]doctor.DomainProbe{}
 	if sess != nil {
-		for _, name := range opts.RemoteDomains {
+	probes:
+		for _, domain := range opts.RemoteDomains {
+			// A name that cannot exist, rather than the domain itself. The
+			// domain is usually a Cloud Map namespace or a hosted zone with
+			// no record at its apex, so asking about it got the resolver's
+			// correct "not found" and reported a healthy VPC as broken. What
+			// this row is about is whether the query reaches the resolver at
+			// all, and for that a "no such name" answer is as good as an
+			// address - better, in fact, because it depends on no record
+			// existing.
+			probe := domainProbeLabel + "." + domain
+			nameDeadline := time.Now().Add(timeout)
 			rctx, rcancel := context.WithTimeout(ctx, timeout)
-			_, _, resolveErr := sess.Resolve(rctx, name)
+			_, _, resolveErr := sess.Resolve(rctx, probe)
 			rcancel()
-			resolved[name] = resolveErr
+			switch {
+			case errors.Is(resolveErr, session.ErrNameNotFound):
+				probed[domain] = doctor.DomainProbe{NotFound: true}
+			case resolveErr != nil:
+				// Which clock, if any, is why this failed? The question is
+				// settled against the wall clock rather than by reading the
+				// error, because the layers race at the boundary: a read
+				// deadline is an absolute time and fires without waiting
+				// for a context's timer goroutine, so one expiry arrives
+				// sometimes as context.DeadlineExceeded and sometimes as
+				// the transport's own "i/o deadline reached", with
+				// ctx.Err() still nil for a moment after either.
+				if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+					// The budget is gone. Recording this would blame a
+					// dozen domains for the clock and send the developer to
+					// audit records that are fine, which is the
+					// misattribution the agent session row exists to
+					// prevent. Stopping leaves the rest out of the map, and
+					// CheckDomains reports them as not checked - which is
+					// what they are.
+					break probes
+				}
+				if !time.Now().Before(nameDeadline) {
+					// This domain's own bound expired with the budget
+					// intact: the agent is not answering, which is a
+					// failure - of the agent, not of the domain.
+					resolveErr = checkTimedOut(ctx, "the agent", timeout)
+				}
+				probed[domain] = doctor.DomainProbe{Err: resolveErr}
+			default:
+				// The probe name actually resolved - a wildcard record,
+				// most likely. The resolver answered, which is all this
+				// row is asking.
+				probed[domain] = doctor.DomainProbe{}
+			}
 		}
 	}
-	results = append(results, doctor.CheckDomains(opts.RemoteDomains, resolved))
+	results = append(results, doctor.CheckDomains(opts.RemoteDomains, probed))
 
 	if doctor.Render(stdout, results) > 0 {
 		return 1, nil
@@ -360,9 +455,9 @@ func timedOut(name string, err error) doctor.Result {
 	}
 }
 
-// checkTimeout is what bounded returns when a call did not answer in time.
-// It is a distinct type so a caller can tell "this check never came back"
-// from "this check came back with a failure", which need different advice.
+// checkTimeout is what a check returns when it did not answer in time. It is
+// a distinct type so a caller can tell "this check never came back" from
+// "this check came back with a failure", which need different advice.
 type checkTimeout struct{ msg string }
 
 func (e *checkTimeout) Error() string { return e.msg }
@@ -370,6 +465,34 @@ func (e *checkTimeout) Error() string { return e.msg }
 func isCheckTimeout(err error) bool {
 	var t *checkTimeout
 	return errors.As(err, &t)
+}
+
+// checkTimedOut names what did not answer and why the wait ended. The raw
+// error at hand is only ever "context deadline exceeded", which says neither.
+func checkTimedOut(ctx context.Context, what string, timeout time.Duration) *checkTimeout {
+	if ctx.Err() != nil {
+		return &checkTimeout{msg: what + " was not checked: tetherd doctor ran out of time"}
+	}
+	return &checkTimeout{msg: fmt.Sprintf("%s did not answer within %s", what, timeout)}
+}
+
+// isContextError reports whether err is (or wraps) a context deadline or
+// cancellation - "the clock ran out", as opposed to "the thing I asked
+// answered, and the answer was no".
+func isContextError(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
+
+// skipped is the row for a check the operator asked not to run. It says so
+// rather than disappearing: a report that silently loses rows depending on
+// the flags is one a developer cannot compare against anyone else's.
+func skipped(name, flag string) doctor.Result {
+	return doctor.Result{
+		Name:   name,
+		Status: doctor.Warn,
+		Detail: "not checked: " + flag,
+		Next:   "run tetherd doctor without " + flag + " to check this",
+	}
 }
 
 // notChecked is the row for a check that could not run because something it
@@ -417,31 +540,61 @@ func helperExecDefaultPath() string {
 // the two give-up branches re-check ch before declaring anything, so an
 // answer that has already landed always wins.
 func bounded[T any](ctx context.Context, timeout time.Duration, what string, f func(context.Context) (T, error), discard func(T)) (T, error) {
-	type result struct {
-		v   T
-		err error
-	}
-	ch := make(chan result, 1)
+	ch := make(chan boundedResult[T], 1)
+	delivered := make(chan struct{})
 	fctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	go func() {
 		v, err := f(fctx)
-		ch <- result{v, err}
+		ch <- boundedResult[T]{v: v, err: err}
+		close(delivered)
 	}()
+	select {
+	case r := <-ch:
+		return r.v, r.err
+	case <-boundedAfter(timeout, delivered):
+		return abandonBounded(ch, discard, checkTimedOut(ctx, what, timeout))
+	case <-ctx.Done():
+		return abandonBounded(ch, discard, checkTimedOut(ctx, what, timeout))
+	}
+}
 
-	abandon := func(msg string) (T, error) {
-		// One last look: a call that answered is an answer, whatever the
-		// clock says. A call that only answered "my context was cancelled"
-		// is this timeout seen from the inside, though - taking that as the
-		// answer would make the row's wording depend on which of the two
-		// won a race, and would hide the timeout from isCheckTimeout.
-		select {
-		case r := <-ch:
-			if !errors.Is(r.err, context.DeadlineExceeded) && !errors.Is(r.err, context.Canceled) {
-				return r.v, r.err
-			}
-		default:
+// boundedResult is what a bounded call delivers.
+type boundedResult[T any] struct {
+	v   T
+	err error
+}
+
+// boundedAfter is the bound's clock, and the seam the timing tests need.
+// delivered is closed once the call's result is in the channel; production
+// ignores it, and a test overrides this to fire the bound only *after* the
+// call has answered, which is the one interleaving that matters and the one
+// that cannot be produced on demand by loops or load.
+var boundedAfter = func(d time.Duration, delivered <-chan struct{}) <-chan time.Time {
+	return time.After(d)
+}
+
+// abandonBounded decides what to report for a call that outlived its bound.
+//
+// A result already sitting in the channel wins: a call that answered is an
+// answer, whatever the clock says. The exception is a call that answered only
+// "my context was cancelled", which is this very timeout seen from the
+// inside - taking that as the answer would make the row's wording depend on
+// which of two ready channels a select happened to pick, and would hide the
+// timeout from isCheckTimeout.
+//
+// The discard goroutine belongs on the *default* arm and nowhere else. The
+// channel holds exactly one result and nothing is ever sent twice, so once
+// the select above has drained it a receiver has nothing left to wait for:
+// spawning one there parks a goroutine forever (measured: 424 leaked over
+// 200,000 calls whose f returned context.Canceled).
+func abandonBounded[T any](ch chan boundedResult[T], discard func(T), timedOutErr *checkTimeout) (T, error) {
+	select {
+	case r := <-ch:
+		if !isContextError(r.err) {
+			return r.v, r.err
 		}
+	default:
 		if discard != nil {
 			go func() {
 				if r := <-ch; r.err == nil {
@@ -449,18 +602,7 @@ func bounded[T any](ctx context.Context, timeout time.Duration, what string, f f
 				}
 			}()
 		}
-		var zero T
-		return zero, &checkTimeout{msg: msg}
 	}
-
-	t := time.NewTimer(timeout)
-	defer t.Stop()
-	select {
-	case r := <-ch:
-		return r.v, r.err
-	case <-t.C:
-		return abandon(fmt.Sprintf("%s did not answer within %s", what, timeout))
-	case <-ctx.Done():
-		return abandon(what + " was not checked: tetherd doctor ran out of time")
-	}
+	var zero T
+	return zero, timedOutErr
 }

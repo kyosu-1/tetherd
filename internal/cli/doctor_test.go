@@ -8,7 +8,9 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,6 +83,7 @@ var everyDoctorRow = []string{
 	"attachable task",
 	"pidMode",
 	"agent session",
+	"task env",
 	"remote CIDRs",
 	"local addresses",
 	"remote domains",
@@ -199,10 +202,14 @@ func TestDoctorPrintsEveryRowAndExitsOnAFailure(t *testing.T) {
 		"attachable task":        "✓",
 		"pidMode":                "✓",
 		"agent session":          "✓",
+		"task env":               "✓",
 		"remote CIDRs":           "✓",
 		"local addresses":        "✓",
 		"remote domains":         "✓",
 	})
+	if e := findRow(t, rows, "task env").detail; !strings.Contains(e, "1 variable") {
+		t.Errorf("the task env row must report what the agent read, got %q", e)
+	}
 	if s := findRow(t, rows, "agent session").detail; !strings.Contains(s, "handshake ok") || !strings.Contains(s, "TETHERD_ENV=dev") {
 		t.Errorf("the agent session row must report the handshake it completed, got %q", s)
 	}
@@ -679,6 +686,165 @@ func TestBoundedNeverReportsAnAnsweredCheckAsTimedOut(t *testing.T) {
 	}
 }
 
+// --- the give-up path, tested directly ------------------------------------
+//
+// The timing that breaks this cannot be produced on demand by loops or load,
+// so the decision itself is a function taking the channel, and these tests
+// hand it exactly the state that matters.
+
+// TestAbandonBoundedPrefersADeliveredResult is the guard that does the work:
+// whatever the clock says, a call that answered is an answer. Without it, a
+// healthy check whose result landed just as the bound expired is reported as
+// "did not answer".
+func TestAbandonBoundedPrefersADeliveredResult(t *testing.T) {
+	ch := make(chan boundedResult[int], 1)
+	ch <- boundedResult[int]{v: 42}
+	v, err := abandonBounded(ch, nil, &checkTimeout{msg: "probe did not answer"})
+	if err != nil {
+		t.Fatalf("a delivered result must win: err = %v", err)
+	}
+	if v != 42 {
+		t.Fatalf("v = %d, want the delivered value", v)
+	}
+
+	// A failure that is the call's own answer wins too - it is a fact about
+	// the thing being checked, not about the clock.
+	boom := errors.New("dscl: eDSPermissionError")
+	ch <- boundedResult[int]{err: boom}
+	if _, err := abandonBounded(ch, nil, &checkTimeout{msg: "probe did not answer"}); !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the call's own failure", err)
+	}
+
+	// A call that answered only "my context was cancelled" is this timeout
+	// seen from the inside: taking it would make the row's wording depend on
+	// a race and hide the timeout from the callers that check for it.
+	ch <- boundedResult[int]{err: context.DeadlineExceeded}
+	_, err = abandonBounded(ch, nil, &checkTimeout{msg: "probe did not answer"})
+	if !isCheckTimeout(err) {
+		t.Fatalf("err = %v, want the timeout to survive", err)
+	}
+}
+
+// TestAbandonBoundedDoesNotLeakAfterDrainingTheChannel: the channel carries
+// exactly one result and nothing is ever sent twice, so a receiver spawned
+// after it has been drained waits forever. Latent until a discard-carrying
+// check gets a context-aware call, and then one parked goroutine per wedged
+// check.
+func TestAbandonBoundedDoesNotLeakAfterDrainingTheChannel(t *testing.T) {
+	settle := func() {
+		for range 50 {
+			runtime.Gosched()
+			time.Sleep(time.Millisecond)
+		}
+	}
+	settle()
+	before := runtime.NumGoroutine()
+
+	const runs = 500
+	for range runs {
+		ch := make(chan boundedResult[int], 1)
+		// The shape that leaks: the result is there, and it is the context
+		// error, so the re-check drains it without returning it.
+		ch <- boundedResult[int]{err: context.Canceled}
+		if _, err := abandonBounded(ch, func(int) {}, &checkTimeout{msg: "probe did not answer"}); !isCheckTimeout(err) {
+			t.Fatalf("err = %v", err)
+		}
+	}
+
+	settle()
+	if leaked := runtime.NumGoroutine() - before; leaked > runs/10 {
+		t.Fatalf("%d goroutines leaked over %d calls", leaked, runs)
+	}
+}
+
+// TestAbandonBoundedDiscardsALateResource: a helper client that arrives after
+// the bound has passed is nobody's, and closing it is the only thing that
+// keeps a wedged dial from leaving a connection open for the life of the
+// process.
+func TestAbandonBoundedDiscardsALateResource(t *testing.T) {
+	ch := make(chan boundedResult[int], 1) // empty: the call has not answered
+	discarded := make(chan int, 1)
+	if _, err := abandonBounded(ch, func(v int) { discarded <- v }, &checkTimeout{msg: "probe did not answer"}); !isCheckTimeout(err) {
+		t.Fatalf("err = %v, want a timeout", err)
+	}
+	ch <- boundedResult[int]{v: 7} // the late answer
+	select {
+	case got := <-discarded:
+		if got != 7 {
+			t.Fatalf("discarded %d, want the late value", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a resource that arrived late was never discarded")
+	}
+}
+
+// TestBoundedIsBoundedByItsClockNotTheCallsContext pins which channel ends
+// the wait. The call's own context is cancelled the moment the call returns,
+// so selecting on it leaves two ready cases for a call that answered in
+// time - and select picks between ready cases at random. Here the clock is
+// made to fire at once while the call's context has an hour left: if the
+// wait watched that context instead, this would hang for the hour.
+func TestBoundedIsBoundedByItsClockNotTheCallsContext(t *testing.T) {
+	fired := make(chan time.Time)
+	close(fired)
+	restoreBoundedAfter(t, func(time.Duration, <-chan struct{}) <-chan time.Time { return fired })
+
+	blocked := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := bounded(context.Background(), time.Hour, "probe",
+			func(c context.Context) (int, error) {
+				close(blocked)
+				<-c.Done()
+				return 0, c.Err()
+			}, nil)
+		done <- err
+	}()
+	<-blocked
+	select {
+	case err := <-done:
+		if !isCheckTimeout(err) {
+			t.Fatalf("err = %v, want a check timeout", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the bound did not come from the clock: the wait outlived it")
+	}
+}
+
+// TestBoundedKeepsAnAnswerThatLandedBeforeTheBoundFired is the interleaving
+// itself, made deterministic by the seam: the clock is held until the call's
+// result is in the channel, so the bound expires with an answer already
+// waiting - exactly the state that used to be reported as "did not answer"
+// about half the time.
+func TestBoundedKeepsAnAnswerThatLandedBeforeTheBoundFired(t *testing.T) {
+	restoreBoundedAfter(t, func(_ time.Duration, delivered <-chan struct{}) <-chan time.Time {
+		<-delivered // the result is in the channel before the bound can fire
+		fired := make(chan time.Time)
+		close(fired)
+		return fired
+	})
+
+	// Looped because which of the two ready cases the select takes is still
+	// a coin flip; both must give the answer.
+	for i := range 200 {
+		v, err := bounded(context.Background(), time.Hour, "probe",
+			func(context.Context) (int, error) { return 42, nil }, nil)
+		if err != nil {
+			t.Fatalf("run %d: an answer that landed first was reported as failed: %v", i, err)
+		}
+		if v != 42 {
+			t.Fatalf("run %d: v = %d", i, v)
+		}
+	}
+}
+
+func restoreBoundedAfter(t *testing.T, fn func(time.Duration, <-chan struct{}) <-chan time.Time) {
+	t.Helper()
+	prev := boundedAfter
+	boundedAfter = fn
+	t.Cleanup(func() { boundedAfter = prev })
+}
+
 // TestBoundedCancelsTheCallItAbandons: the point of the bound is to stop
 // waiting, and the point of cancelling is that whatever was being waited on
 // (a dscl subprocess, an AWS request) stops too. A bound that returned while
@@ -821,7 +987,7 @@ func TestDoctorBoundsASilentAgent(t *testing.T) {
 	rows := wantRowSet(t, out.String())
 	// The handshake is what failed, and the domains were never asked - so
 	// they must not be reported as broken DNS records.
-	wantMarks(t, rows, map[string]string{"agent session": "✗", "attachable task": "✓", "remote domains": "!"})
+	wantMarks(t, rows, map[string]string{"agent session": "✗", "attachable task": "✓", "task env": "!", "remote domains": "!"})
 	if d := findRow(t, rows, "remote domains").detail; !strings.Contains(d, "not checked") {
 		t.Errorf("remote domains = %q, want it named as not checked", d)
 	}
@@ -871,7 +1037,200 @@ func TestDoctorFailsWhenTheAgentIsUnreachable(t *testing.T) {
 	}
 	// Everything ECS could see is still fine, which is exactly why this row
 	// is needed.
-	wantMarks(t, rows, map[string]string{"attachable task": "✓", "pidMode": "✓", "remote CIDRs": "✓"})
+	wantMarks(t, rows, map[string]string{"attachable task": "✓", "pidMode": "✓", "remote CIDRs": "✓", "task env": "!"})
+}
+
+// TestDoctorFailsWhenTheAgentCannotReadTheTaskEnv is the last bug of the
+// agent-session class. resolveTaskEnv makes a non-empty EnvError fatal under
+// ssm, and the agent sets it for causes no other row can see: it is not
+// running in ECS at all, TETHERD_APP_CONTAINER names a container the task
+// does not have, or no process of that container is visible. The pidMode row
+// reads the task definition, so it stays green through all of them - leaving
+// a report of green rows above a `tetherd run` that dies with "env: ...".
+func TestDoctorFailsWhenTheAgentCannotReadTheTaskEnv(t *testing.T) {
+	const reason = `container "app" is not in the task (containers: web, tetherd-agent); set TETHERD_APP_CONTAINER`
+	ag := startAgentFor(t, nil, errors.New(reason), nil)
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, healthyDoctorDeps(healthyProvider(ag.addr)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	rows := wantRowSet(t, out.String())
+	r := findRow(t, rows, "task env")
+	if r.mark != "✗" || r.detail != reason {
+		t.Fatalf("task env = %q %q, want the agent's own reason verbatim", r.mark, r.detail)
+	}
+	// The point of the row: everything that could see this before it stays
+	// green, so nothing else would have caught it.
+	wantMarks(t, rows, map[string]string{"pidMode": "✓", "agent session": "✓", "attachable task": "✓"})
+}
+
+// TestDoctorSkipAgentReportsTheRowsItGivesUp: --skip-agent is for scripted or
+// looped use, where one SSM session per invocation is noise. The three rows
+// that need a session must then say they were not checked - a report that
+// silently loses the only rows proving `tetherd run` can attach would be
+// worse than a slower one. The provider points at a dead address, so a dial
+// that happened anyway would show up as a failure rather than a warning.
+func TestDoctorSkipAgentReportsTheRowsItGivesUp(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := ln.Addr().String()
+	ln.Close()
+
+	opts := doctorOpts()
+	opts.SkipAgent = true
+	opts.RemoteDomains = []string{"api.myapp.internal"}
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(dead)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	wantMarks(t, rows, map[string]string{"agent session": "!", "task env": "!", "remote domains": "!"})
+	for _, name := range []string{"agent session", "task env"} {
+		r := findRow(t, rows, name)
+		if !strings.Contains(r.detail, "--skip-agent") {
+			t.Errorf("%s must say why it was skipped, got %q", name, r.detail)
+		}
+		if !strings.Contains(r.next, "--skip-agent") {
+			t.Errorf("%s must say how to get the check back, got %q", name, r.next)
+		}
+	}
+	// Everything that does not need the agent is still checked.
+	wantMarks(t, rows, map[string]string{"helper": "✓", "attachable task": "✓", "pidMode": "✓", "remote CIDRs": "✓"})
+	if code != 0 {
+		t.Fatalf("skipping is not failing: code = %d\n%s", code, out.String())
+	}
+}
+
+// TestDoctorRoutesAWSTimeoutsToTheirOwnRow: a VPN that blackholes STS, or a
+// budget that ran out, leaves these calls with nothing but "context deadline
+// exceeded". Handed to the judgements, that becomes "re-authenticate" and
+// "ask for ecs:DescribeTaskDefinition" - telling a developer to fix
+// credentials that are fine and to request a grant they already hold.
+func TestDoctorRoutesAWSTimeoutsToTheirOwnRow(t *testing.T) {
+	check := func(t *testing.T, out string, want map[string]string) {
+		t.Helper()
+		rows := wantRowSet(t, out)
+		for name, advice := range want {
+			r := findRow(t, rows, name)
+			if r.mark != "✗" {
+				t.Errorf("%s must fail: %q %q", name, r.mark, r.detail)
+			}
+			if !strings.Contains(r.detail, "did not answer") {
+				t.Errorf("%s = %q, want it named as a timeout rather than the bare context error", name, r.detail)
+			}
+			if strings.Contains(r.next, advice) {
+				t.Errorf("%s: a timeout must not be answered with %q: %q", name, advice, r.next)
+			}
+		}
+	}
+
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	p := healthyProvider(ag.addr)
+	p.identityErr = context.DeadlineExceeded
+	p.pidModeErr = context.DeadlineExceeded
+	p.vpcErr = context.DeadlineExceeded
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, healthyDoctorDeps(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	check(t, out.String(), map[string]string{
+		"AWS identity": "aws sso login",
+		"pidMode":      "ecs:DescribeTaskDefinition",
+		"remote CIDRs": ".tetherd.yml",
+	})
+
+	// Discovery timing out is its own run: it makes every row below it
+	// unchecked, so it cannot be combined with the three above.
+	slow := healthyProvider(ag.addr)
+	slow.discErr = context.DeadlineExceeded
+	out.Reset()
+	if _, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, healthyDoctorDeps(slow)); err != nil {
+		t.Fatal(err)
+	}
+	check(t, out.String(), map[string]string{"attachable task": "ECS Exec"})
+}
+
+// TestDoctorDoesNotBlameTheDomainsWhenTheBudgetRunsOut: once the budget is
+// gone every resolve fails instantly with the context error, and recording
+// those turns "tetherd doctor ran out of time" into "these names do not
+// exist in the VPC" - sending a developer with a dozen domains on a slow
+// link to audit Cloud Map records that are fine.
+func TestDoctorDoesNotBlameTheDomainsWhenTheBudgetRunsOut(t *testing.T) {
+	// The agent answers, slowly: the handshake completes well inside the
+	// budget and the first resolve outlives it.
+	addr := startResolvingAgent(t, map[string]string{"api.myapp.internal": "10.0.11.229"}, 500*time.Millisecond)
+
+	opts := doctorOpts()
+	opts.Timeout = 5 * time.Second // generous: only the budget can end this
+	opts.Budget = 300 * time.Millisecond
+	opts.RemoteDomains = []string{"api.myapp.internal", "db.myapp.internal"}
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(addr)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	r := findRow(t, rows, "remote domains")
+	if r.mark != "!" || !strings.Contains(r.detail, "not checked") {
+		t.Fatalf("remote domains = %q %q, want them reported as not checked", r.mark, r.detail)
+	}
+	if strings.Contains(r.detail, "context deadline") {
+		t.Errorf("the clock running out must not be reported as a name that failed: %q", r.detail)
+	}
+	if strings.Contains(r.next, "Cloud Map") {
+		t.Errorf("nothing here says the names are wrong, so the next step must not: %q", r.next)
+	}
+	// The agent session itself was fine, and says so.
+	wantMarks(t, rows, map[string]string{"agent session": "✓"})
+	_ = code
+}
+
+// TestDoctorBlamesTheAgentWhenAResolveTimesOut is the other clock: the
+// budget is fine and this one name's bound expired, which is a failure of
+// the agent's resolver rather than of the name. The raw error is whatever
+// layer noticed first ("context deadline exceeded", or the transport's "i/o
+// deadline reached"), neither of which tells the developer anything.
+func TestDoctorBlamesTheAgentWhenAResolveTimesOut(t *testing.T) {
+	addr := startResolvingAgent(t, map[string]string{"api.myapp.internal": "10.0.11.229"}, 2*time.Second)
+
+	opts := doctorOpts()
+	opts.Timeout = 150 * time.Millisecond
+	opts.Budget = 30 * time.Second // plenty: only the per-name bound can fire
+	opts.RemoteDomains = []string{"api.myapp.internal"}
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(addr)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	r := findRow(t, wantRowSet(t, out.String()), "remote domains")
+	if r.mark != "✗" || !strings.Contains(r.detail, "api.myapp.internal") {
+		t.Fatalf("remote domains = %q %q, want a failure naming the name", r.mark, r.detail)
+	}
+	if !strings.Contains(r.detail, "the agent did not answer") {
+		t.Errorf("the row must say the agent went quiet, got %q", r.detail)
+	}
+	if strings.Contains(r.detail, "context deadline") || strings.Contains(r.detail, "i/o deadline") {
+		t.Errorf("the raw error from whichever layer noticed first tells the developer nothing: %q", r.detail)
+	}
 }
 
 // TestDoctorFailsOnAnEnvironmentMismatch: run refuses to attach when the
@@ -897,32 +1256,82 @@ func TestDoctorFailsOnAnEnvironmentMismatch(t *testing.T) {
 	}
 }
 
-// TestDoctorResolvesEachRemoteDomainThroughTheAgent pins that the domains
-// row is the agent's own answer, name by name: one name the VPC knows and
-// one it does not, against a real in-process agent. A row built from
-// anything other than a per-name resolve (a single dial, a guess, the
-// config) cannot tell these two apart.
-func TestDoctorResolvesEachRemoteDomainThroughTheAgent(t *testing.T) {
-	addr := startResolvingAgent(t, map[string]string{"api.myapp.internal": "10.0.11.229"})
+// TestDoctorAsksTheVPCResolverAQuestionNoRecordCanAnswer pins the shape of
+// this check. It used to resolve the configured domain itself, which failed
+// a healthy machine: myapp.internal is a Cloud Map namespace with no record
+// at its apex, so the resolver answered "no such name" - correctly - and
+// doctor reported the VPC as broken while every service name under it
+// resolved fine. The question is whether queries for the domain reach the
+// resolver, so the probe is a name nothing can have registered, and any
+// answer at all is a pass.
+func TestDoctorAsksTheVPCResolverAQuestionNoRecordCanAnswer(t *testing.T) {
+	var mu sync.Mutex
+	var asked []string
+	// The agent answers exactly as a VPC resolver does for a name that is
+	// not there.
+	addr := startAgentWithResolver(t, func(_ context.Context, name string) ([]net.IPAddr, error) {
+		mu.Lock()
+		asked = append(asked, name)
+		mu.Unlock()
+		return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+	})
 
 	opts := doctorOpts()
-	opts.RemoteDomains = []string{"api.myapp.internal"}
+	opts.RemoteDomains = []string{"myapp.internal"}
 	var out strings.Builder
 	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(addr)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows := wantRowSet(t, out.String())
-	if r := findRow(t, rows, "remote domains"); r.mark != "✓" || !strings.Contains(r.detail, "api.myapp.internal") {
-		t.Fatalf("a name the agent resolves must pass: %q %q", r.mark, r.detail)
+	r := findRow(t, wantRowSet(t, out.String()), "remote domains")
+	if r.mark != "✓" || !strings.Contains(r.detail, "myapp.internal") {
+		t.Fatalf("the resolver answered, so the path works: %q %q", r.mark, r.detail)
 	}
 	if code != 0 {
 		t.Fatalf("code = %d, want 0\n%s", code, out.String())
 	}
+	// The probe must be a name under the domain, not the domain: asking
+	// about the domain is what produced the false negative.
+	mu.Lock()
+	got := append([]string(nil), asked...)
+	mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("the agent was asked %v, want exactly one probe", got)
+	}
+	if got[0] == "myapp.internal" {
+		t.Fatalf("doctor asked for the domain itself, which has no record at its apex: %q", got[0])
+	}
+	if !strings.HasSuffix(got[0], ".myapp.internal") {
+		t.Errorf("the probe must sit under the configured domain, so it is routed to that resolver: %q", got[0])
+	}
 
-	opts.RemoteDomains = []string{"api.myapp.internal", "gone.myapp.internal"}
+	// A domain whose probe name somehow does resolve is just as much proof
+	// that the resolver answered, and must read identically.
+	answering := startAgentWithResolver(t, func(_ context.Context, _ string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("10.0.11.229")}}, nil
+	})
 	out.Reset()
-	code, err = DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(addr)))
+	if _, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(answering))); err != nil {
+		t.Fatal(err)
+	}
+	if withAddr := findRow(t, wantRowSet(t, out.String()), "remote domains"); withAddr.detail != r.detail {
+		t.Errorf("both answers mean the path works:\n%q\n%q", withAddr.detail, r.detail)
+	}
+}
+
+// TestDoctorFailsWhenTheVPCResolverCannotAnswer is the other half: a
+// resolver that errors for a reason other than "no such name" (SERVFAIL, a
+// broken resolv.conf in the task, an agent too old to resolve at all) means
+// the path does not work, and that is the only thing this row fails on.
+func TestDoctorFailsWhenTheVPCResolverCannotAnswer(t *testing.T) {
+	addr := startAgentWithResolver(t, func(_ context.Context, _ string) ([]net.IPAddr, error) {
+		return nil, errors.New("resolv.conf in the task names no nameserver")
+	})
+
+	opts := doctorOpts()
+	opts.RemoteDomains = []string{"myapp.internal"}
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(addr)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -930,18 +1339,44 @@ func TestDoctorResolvesEachRemoteDomainThroughTheAgent(t *testing.T) {
 		t.Fatalf("code = %d, want 1\n%s", code, out.String())
 	}
 	r := findRow(t, wantRowSet(t, out.String()), "remote domains")
-	if r.mark != "✗" || !strings.Contains(r.detail, "gone.myapp.internal") {
-		t.Fatalf("the unresolvable name must fail and be named: %q %q", r.mark, r.detail)
+	if r.mark != "✗" || !strings.Contains(r.detail, "myapp.internal") {
+		t.Fatalf("remote domains = %q %q, want a failure naming the domain", r.mark, r.detail)
 	}
-	if strings.Contains(r.detail, "api.myapp.internal") {
-		t.Errorf("the name that does resolve must not be blamed: %q", r.detail)
+	if !strings.Contains(r.detail, "resolv.conf") {
+		t.Errorf("the resolver's own reason must survive: %q", r.detail)
+	}
+	// The reason is on the VPC side of the session, so the advice must not
+	// send the developer looking for a missing record.
+	if strings.Contains(r.next, "the name exists") {
+		t.Errorf("nothing here says a record is missing: %q", r.next)
 	}
 }
 
 // startResolvingAgent runs a real agent that answers only the names in
 // known, so a doctor run can ask it about both a name that exists in the
-// "VPC" and one that does not.
-func startResolvingAgent(t *testing.T, known map[string]string) string {
+// "VPC" and one that does not. delay is how long each answer takes, for
+// tests about what happens when the clock runs out mid-resolve.
+func startResolvingAgent(t *testing.T, known map[string]string, delay time.Duration) string {
+	t.Helper()
+	return startAgentWithResolver(t, func(rctx context.Context, name string) ([]net.IPAddr, error) {
+		if delay > 0 {
+			select {
+			case <-time.After(delay):
+			case <-rctx.Done():
+				return nil, rctx.Err()
+			}
+		}
+		if ip, ok := known[name]; ok {
+			return []net.IPAddr{{IP: net.ParseIP(ip)}}, nil
+		}
+		return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+	})
+}
+
+// startAgentWithResolver runs a real agent whose name resolution is fn, so a
+// test can answer a probe the way a VPC resolver would - with addresses,
+// with "no such name", or with a failure - and see what doctor makes of it.
+func startAgentWithResolver(t *testing.T, fn func(context.Context, string) ([]net.IPAddr, error)) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -949,12 +1384,7 @@ func startResolvingAgent(t *testing.T, known map[string]string) string {
 	}
 	a := agent.New(agent.Config{Env: "dev", TaskARN: "arn:test", AppContainer: "app"}, nil)
 	a.SetEnvReader(fakeEnvReader{env: map[string]string{"A": "1"}, arn: "arn:test"})
-	a.SetResolver(func(_ context.Context, name string) ([]net.IPAddr, error) {
-		if ip, ok := known[name]; ok {
-			return []net.IPAddr{{IP: net.ParseIP(ip)}}, nil
-		}
-		return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
-	})
+	a.SetResolver(fn)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); ln.Close() })
 	go a.Serve(ctx, ln)
@@ -1134,7 +1564,7 @@ func TestDoctorCommandOverridesTheTargetFromFlags(t *testing.T) {
 	t.Cleanup(func() { doctorFn = defaultDoctor })
 
 	root := NewRootCommand()
-	root.SetArgs([]string{"doctor", "--config", filepath.Join(dir, ".tetherd.yml"), "--service", "flag-api", "--exec-path", "/tmp/x"})
+	root.SetArgs([]string{"doctor", "--config", filepath.Join(dir, ".tetherd.yml"), "--service", "flag-api", "--exec-path", "/tmp/x", "--skip-agent"})
 	if err := root.Execute(); err != nil {
 		t.Fatal(err)
 	}
@@ -1143,5 +1573,10 @@ func TestDoctorCommandOverridesTheTargetFromFlags(t *testing.T) {
 	}
 	if captured.ExecPath != "/tmp/x" {
 		t.Errorf("--exec-path must reach doctor: %q", captured.ExecPath)
+	}
+	// A flag wired to nothing would leave this false and silently check the
+	// agent anyway.
+	if !captured.SkipAgent {
+		t.Errorf("--skip-agent must reach doctor")
 	}
 }

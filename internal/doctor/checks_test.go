@@ -243,6 +243,33 @@ func TestCheckAgentSession(t *testing.T) {
 	}
 }
 
+func TestCheckTaskEnv(t *testing.T) {
+	if r := CheckTaskEnv(37, ""); r.Status != OK || !strings.Contains(r.Detail, "37") {
+		t.Errorf("a successful read is fine and says how much it read: %+v", r)
+	}
+	if r := CheckTaskEnv(37, ""); r.Next != "" {
+		t.Errorf("a healthy row must not nag: %q", r.Next)
+	}
+	// run refuses to start the child when the agent could not read the
+	// environment, so every one of these has to be a failure here.
+	for _, envErr := range []string{
+		"no ECS metadata endpoint (agent is not running in ECS)",
+		`container "app" is not in the task (containers: web, tetherd-agent); set TETHERD_APP_CONTAINER`,
+		`no process of container "app" is visible from the agent; is pidMode "task" set on the task definition (and SYS_PTRACE added to the agent)?`,
+	} {
+		r := CheckTaskEnv(0, envErr)
+		if r.Status != Fail {
+			t.Errorf("%q must fail: %+v", envErr, r)
+		}
+		if r.Detail != envErr {
+			t.Errorf("the agent's own reason must survive verbatim: %q", r.Detail)
+		}
+		if !strings.Contains(r.Next, "pidMode") || !strings.Contains(r.Next, "TETHERD_APP_CONTAINER") {
+			t.Errorf("the next step must name both causes the developer can act on: %q", r.Next)
+		}
+	}
+}
+
 func TestCheckOverlapAndRemoteCIDRs(t *testing.T) {
 	if r := CheckOverlap(nil); r.Status != OK {
 		t.Errorf("got %+v", r)
@@ -347,13 +374,51 @@ func TestCheckDomains(t *testing.T) {
 	if r := CheckDomains(nil, nil); r.Status != OK || !strings.Contains(r.Detail, "none") {
 		t.Errorf("got %+v", r)
 	}
-	ok := CheckDomains([]string{"myapp.internal"}, map[string]error{"myapp.internal": nil})
+	ok := CheckDomains([]string{"myapp.internal"}, map[string]DomainProbe{"myapp.internal": {}})
 	if ok.Status != OK {
 		t.Errorf("got %+v", ok)
 	}
-	bad := CheckDomains([]string{"myapp.internal"}, map[string]error{"myapp.internal": errors.New("NXDOMAIN")})
+	bad := CheckDomains([]string{"myapp.internal"}, map[string]DomainProbe{"myapp.internal": {Err: errors.New("session: control stream closed")}})
 	if bad.Status != Fail || !strings.Contains(bad.Detail, "myapp.internal") {
 		t.Errorf("got %+v", bad)
+	}
+}
+
+// The check asks whether queries for the domain reach the VPC resolver, not
+// whether a particular record exists - so every answer the resolver can give
+// is a pass, and only failing to get an answer is a failure. Asking about the
+// domain itself failed a healthy setup: a Cloud Map namespace has no record
+// at its apex, so "not found" was the correct answer and doctor reported it
+// as a broken VPC.
+func TestCheckDomainsPassesWheneverTheResolverAnswered(t *testing.T) {
+	notFound := CheckDomains([]string{"myapp.internal"}, map[string]DomainProbe{"myapp.internal": {NotFound: true}})
+	if notFound.Status != OK {
+		t.Errorf("a resolver that answered \"no such name\" still answered: %+v", notFound)
+	}
+	if notFound.Next != "" {
+		t.Errorf("nothing to do: %q", notFound.Next)
+	}
+	withAddrs := CheckDomains([]string{"myapp.internal"}, map[string]DomainProbe{"myapp.internal": {}})
+	if withAddrs.Status != OK {
+		t.Errorf("addresses are an answer too: %+v", withAddrs)
+	}
+	if withAddrs.Detail != notFound.Detail {
+		t.Errorf("both answers mean the same thing and must read the same:\n%q\n%q", withAddrs.Detail, notFound.Detail)
+	}
+	broken := CheckDomains([]string{"myapp.internal"}, map[string]DomainProbe{"myapp.internal": {Err: errors.New("session: resolve: i/o deadline reached")}})
+	if broken.Status != Fail || !strings.Contains(broken.Detail, "i/o deadline reached") {
+		t.Errorf("only a missing answer is a failure: %+v", broken)
+	}
+	// The advice must not send the developer looking for a record; nothing
+	// here says one is missing.
+	if strings.Contains(broken.Next, "the name exists") {
+		t.Errorf("a transport failure is not a missing record: %q", broken.Next)
+	}
+	// macOS keeps negative answers, which is how a healthy path still looks
+	// broken from the application's side; the row that says the path works is
+	// the only place that hint can help.
+	if !strings.Contains(notFound.Detail, "dscacheutil") {
+		t.Errorf("the healthy row should say how to clear a stale negative cache: %q", notFound.Detail)
 	}
 }
 
@@ -361,14 +426,14 @@ func TestCheckDomains(t *testing.T) {
 // resolving: the agent was unreachable, which is not the same as a name that
 // works.
 func TestCheckDomainsDoesNotClaimUncheckedDomainsWork(t *testing.T) {
-	r := CheckDomains([]string{"a.internal", "b.internal"}, map[string]error{"a.internal": nil})
+	r := CheckDomains([]string{"a.internal", "b.internal"}, map[string]DomainProbe{"a.internal": {NotFound: true}})
 	if r.Status == OK {
 		t.Fatalf("an unchecked domain must not read as healthy: %+v", r)
 	}
 	if !strings.Contains(r.Detail, "b.internal") || r.Next == "" {
 		t.Errorf("the unchecked domain must be named with a next step: %+v", r)
 	}
-	if strings.Contains(r.Detail, "resolve through the agent") {
+	if strings.Contains(r.Detail, "reach the VPC resolver") {
 		t.Errorf("must not claim resolution it never attempted: %+v", r)
 	}
 }
@@ -378,17 +443,17 @@ func TestCheckDomainsDoesNotClaimUncheckedDomainsWork(t *testing.T) {
 func TestCheckDomainsListsEveryFailureWithItsReason(t *testing.T) {
 	r := CheckDomains(
 		[]string{"a.internal", "b.internal", "c.internal"},
-		map[string]error{"a.internal": nil, "b.internal": errors.New("NXDOMAIN"), "c.internal": errors.New("timeout")},
+		map[string]DomainProbe{"a.internal": {}, "b.internal": {Err: errors.New("session closed")}, "c.internal": {Err: errors.New("timeout")}},
 	)
 	if r.Status != Fail {
 		t.Fatalf("got %+v", r)
 	}
-	for _, want := range []string{"b.internal", "NXDOMAIN", "c.internal", "timeout"} {
+	for _, want := range []string{"b.internal", "session closed", "c.internal", "timeout"} {
 		if !strings.Contains(r.Detail, want) {
 			t.Errorf("detail %q does not mention %q", r.Detail, want)
 		}
 	}
-	all := CheckDomains([]string{"a.internal", "b.internal"}, map[string]error{"a.internal": nil, "b.internal": nil})
+	all := CheckDomains([]string{"a.internal", "b.internal"}, map[string]DomainProbe{"a.internal": {}, "b.internal": {NotFound: true}})
 	if all.Status != OK || all.Next != "" {
 		t.Errorf("every name resolving is fine: %+v", all)
 	}
@@ -419,9 +484,10 @@ func TestEveryFailureNamesAnActionTheDeveloperCanTake(t *testing.T) {
 		{"pidMode wrong", CheckPIDMode("host", nil), `"pidMode": "task"`},
 		{"agent unreachable", CheckAgentSession("", "", "dev", errors.New("connection refused")), "tetherd-agent"},
 		{"agent env mismatch", CheckAgentSession("1", "prod", "dev", nil), "--env"},
+		{"task env", CheckTaskEnv(0, "no ECS metadata endpoint"), "TETHERD_APP_CONTAINER"},
 		{"overlap", CheckOverlap([]string{"en0 10.0.3.14/24 overlaps 10.0.0.0/16"}), "local_cidrs"},
 		{"wide cidr", CheckRemoteCIDRs([]netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}), "remote_cidrs"},
-		{"domain", CheckDomains([]string{"x.internal"}, map[string]error{"x.internal": errors.New("NXDOMAIN")}), "remote_domains"},
+		{"domain", CheckDomains([]string{"x.internal"}, map[string]DomainProbe{"x.internal": {Err: errors.New("session closed")}}), "remote_domains"},
 	}
 	for _, c := range cases {
 		if c.got.Status == OK {
@@ -446,6 +512,7 @@ func TestEveryFailureNamesAnActionTheDeveloperCanTake(t *testing.T) {
 		CheckTask(transport.Task{ID: "abc"}, nil),
 		CheckPIDMode("task", nil),
 		CheckAgentSession("1", "dev", "dev", nil),
+		CheckTaskEnv(3, ""),
 		CheckOverlap(nil),
 		CheckRemoteCIDRs([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}),
 		CheckDomains(nil, nil),
@@ -475,6 +542,7 @@ func TestCheckNamesAreStableAndDistinct(t *testing.T) {
 		"attachable task":        CheckTask(transport.Task{ID: "abc"}, nil),
 		"pidMode":                CheckPIDMode("task", nil),
 		"agent session":          CheckAgentSession("1", "dev", "dev", nil),
+		"task env":               CheckTaskEnv(1, ""),
 		"local addresses":        CheckOverlap(nil),
 		"remote CIDRs":           CheckRemoteCIDRs(nil),
 		"remote domains":         CheckDomains(nil, nil),

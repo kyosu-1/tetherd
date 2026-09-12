@@ -297,6 +297,18 @@ func TestResolveNotFoundThroughSession(t *testing.T) {
 	if !errors.Is(err, ErrNameNotFound) {
 		t.Fatalf("err = %v, want it to satisfy errors.Is(err, ErrNameNotFound)", err)
 	}
+	// The sentinel goes in the chain, not into the text a second time: the
+	// handler's own message already ends in "name not found", and wrapping
+	// it with %w printed it twice ("... name not found: name not found"),
+	// which is what `tetherd doctor` was showing an operator.
+	if n := strings.Count(err.Error(), ErrNameNotFound.Error()); n != 1 {
+		t.Errorf("%q says %q %d times, want once", err.Error(), ErrNameNotFound.Error(), n)
+	}
+	// And the handler's own wording survives, so the reason is not lost to
+	// the tidy-up.
+	if !strings.Contains(err.Error(), "lookup nope.internal") {
+		t.Errorf("the handler's message must survive: %q", err.Error())
+	}
 }
 
 // TestResolveOtherFailuresAreNotErrNameNotFound guards the other direction:

@@ -129,7 +129,7 @@ func TestRenderWholeReportOfABrokenMachine(t *testing.T) {
 		CheckPIDMode("", nil),
 		CheckOverlap([]string{"en0 10.0.3.14/24 overlaps 10.0.0.0/16"}),
 		CheckRemoteCIDRs([]netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}),
-		CheckDomains([]string{"myapp.internal"}, map[string]error{"myapp.internal": errors.New("NXDOMAIN")}),
+		CheckDomains([]string{"myapp.internal"}, map[string]DomainProbe{"myapp.internal": {Err: errors.New("session: control stream closed")}}),
 	})
 	if failed != 5 {
 		t.Errorf("failed = %d, want 5", failed)
@@ -148,8 +148,8 @@ func TestRenderWholeReportOfABrokenMachine(t *testing.T) {
                           → add the overlapping range to local_cidrs in .tetherd.yml
 ! remote CIDRs            0.0.0.0/0 is captured: every connection goes through the dev task
                           → list only the ranges you need in remote_cidrs / remote_services
-✗ remote domains          myapp.internal: NXDOMAIN
-                          → check the name exists in the VPC (Cloud Map or a private hosted zone) and that remote_domains matches it
+✗ remote domains          myapp.internal: session: control stream closed
+                          → check the agent can reach the VPC resolver, and that remote_domains names a domain the VPC serves (Cloud Map, or a private hosted zone associated with the VPC)
 `
 	if b.String() != want {
 		t.Errorf("report:\n%s\nwant:\n%s", b.String(), want)

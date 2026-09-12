@@ -185,6 +185,9 @@ func newDoctorCommand() *cobra.Command {
 	f.StringArrayVar(&opts.RemoteCIDRs, "remote-cidr", nil, "additional destination CIDR the run being checked would route through the agent (repeatable)")
 	f.StringVar(&opts.HelperSocket, "helper-socket", helper.DefaultSocket, "tetherd-helper socket")
 	f.StringVar(&opts.ExecPath, "exec-path", helper.ExecInstallDir+"/"+helper.ExecName, "path of the setgid tetherd-exec")
+	// No backticks in this help text: cobra reads a backquoted word as the
+	// flag's argument name, which for a bool flag prints as nonsense.
+	f.BoolVar(&opts.SkipAgent, "skip-agent", false, "do not open a session to the agent; the agent session, task env and remote domain rows are then reported as not checked, and they are the only ones that prove tetherd run can attach at all")
 	return cmd
 }
 

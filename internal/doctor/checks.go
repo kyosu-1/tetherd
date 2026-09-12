@@ -161,6 +161,31 @@ func CheckAgentSession(protocol, agentEnv, wantEnv string, dialErr error) Result
 	return r
 }
 
+// CheckTaskEnv reports whether the agent could actually read the application
+// container's environment, which is the agent's own answer and the only
+// authoritative one. `tetherd run` treats a non-empty EnvError as fatal under
+// ssm - it refuses rather than start a child with the wrong environment - so
+// a developer must be able to see it here.
+//
+// This is a different fact from CheckPIDMode, which reads the task
+// definition: pidMode can be "task" and the read still fail, because the
+// agent is not running in ECS at all (no metadata endpoint), because
+// TETHERD_APP_CONTAINER names a container the task does not have, or because
+// no process of the application container is visible to the agent. Without
+// this row all of those show up as a green pidMode row above a `tetherd run`
+// that dies with "env: ...".
+func CheckTaskEnv(vars int, envError string) Result {
+	r := Result{Name: "task env"}
+	if envError != "" {
+		r.Status = Fail
+		r.Detail = envError
+		r.Next = `set "pidMode": "task" on the task definition (with SYS_PTRACE on the agent), and check the agent's TETHERD_APP_CONTAINER names the application container`
+		return r
+	}
+	r.Detail = fmt.Sprintf("%d variables read from the application container", vars)
+	return r
+}
+
 // CheckOverlap reports local interfaces whose addresses fall inside the
 // captured set: traffic to those addresses would go to the VPC instead of the
 // LAN (spec §11). tetherd still runs, so this is a warning.
@@ -212,11 +237,38 @@ func CheckRemoteCIDRs(cidrs []netip.Prefix) Result {
 	return r
 }
 
-// CheckDomains reports whether every configured remote domain resolves through
-// the agent. resolved holds one entry per name the caller actually asked
-// about; a name with no entry was never asked, which is not the same as a name
-// that works.
-func CheckDomains(domains []string, resolved map[string]error) Result {
+// DomainProbe is what asking the agent about one configured remote domain
+// produced.
+//
+// The question this check asks is "do queries for this domain reach the VPC
+// resolver at all", not "does some particular name under it exist" - so an
+// answer of "no such name" counts as a yes: something in the VPC answered.
+// Asking about the domain itself was a false-negative machine: a Cloud Map
+// namespace has no record at its apex, so the resolver's correct "not found"
+// read as a broken setup on a machine where every service name under it
+// resolved fine.
+type DomainProbe struct {
+	// NotFound is set when the resolver answered that the probe name does
+	// not exist, which proves the path works exactly as well as an address
+	// does. It is recorded separately from an ordinary answer because
+	// deciding that it is a pass is this package's judgement to make, not
+	// the caller's.
+	NotFound bool
+	// Err is why the question could not be put, or its answer not read: a
+	// dead session, a timeout, a resolver that could not answer at all.
+	// This alone is a failure.
+	Err error
+}
+
+// answered reports whether the VPC resolver replied at all, which is the
+// only thing this check is about.
+func (p DomainProbe) answered() bool { return p.Err == nil }
+
+// CheckDomains reports whether every configured remote domain reaches the VPC
+// resolver through the agent. probed holds one entry per domain the caller
+// actually asked about; a domain with no entry was never asked, which is not
+// the same as one that works.
+func CheckDomains(domains []string, probed map[string]DomainProbe) Result {
 	r := Result{Name: "remote domains"}
 	if len(domains) == 0 {
 		r.Detail = "none configured"
@@ -224,12 +276,12 @@ func CheckDomains(domains []string, resolved map[string]error) Result {
 	}
 	var bad, unchecked []string
 	for _, d := range domains {
-		err, asked := resolved[d]
+		p, asked := probed[d]
 		switch {
 		case !asked:
 			unchecked = append(unchecked, d)
-		case err != nil:
-			bad = append(bad, fmt.Sprintf("%s: %v", d, err))
+		case !p.answered():
+			bad = append(bad, fmt.Sprintf("%s: %v", d, p.Err))
 		}
 	}
 	if len(bad) > 0 {
@@ -238,7 +290,10 @@ func CheckDomains(domains []string, resolved map[string]error) Result {
 		if len(unchecked) > 0 {
 			r.Detail += "; not checked: " + strings.Join(unchecked, ", ")
 		}
-		r.Next = "check the name exists in the VPC (Cloud Map or a private hosted zone) and that remote_domains matches it"
+		// Not "check that the name exists": nothing here says a record is
+		// missing, because a missing record is not a failure of this check.
+		// What failed is the path to the resolver.
+		r.Next = "check the agent can reach the VPC resolver, and that remote_domains names a domain the VPC serves (Cloud Map, or a private hosted zone associated with the VPC)"
 		if len(unchecked) > 0 {
 			r.Next += "; fix the rows above so the rest can be checked"
 		}
@@ -250,7 +305,12 @@ func CheckDomains(domains []string, resolved map[string]error) Result {
 		r.Next = "fix the rows above, then run tetherd doctor again so these can be resolved through the agent"
 		return r
 	}
-	r.Detail = strings.Join(domains, ", ") + " resolve through the agent"
+	// The cache note goes in the detail, not the next step: Render prints a
+	// next step only where something is wrong, and this is exactly the case
+	// where doctor says the path works while the developer's own lookups
+	// still fail - macOS keeps negative answers, so a name queried before
+	// the agent could resolve it stays NXDOMAIN until that entry expires.
+	r.Detail = strings.Join(domains, ", ") + " reach the VPC resolver through the agent. If a name still fails locally: sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder"
 	return r
 }
 
