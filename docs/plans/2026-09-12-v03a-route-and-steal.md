@@ -2065,3 +2065,468 @@ git commit -m "feat(dev-env): put the agent on the ALB's path, and document stea
 - `tetherd status`（誰がどのタスクに繋いでいるか）と `tetherd token rotate`
 - doctor にターゲットグループの HTTP1 検査（developer policy に `elasticloadbalancing:DescribeTargetGroups` を足す → Terraform の再適用）と steal 要件の検査
 - 持ち越し: `run` が DNS の経路を主張する前に一度引いて確かめる、`⚠` と `!` の統一、`--no-network` が `remote_domains` を黙って無視する点、`needsDotenvQuotes` がバックスラッシュ単独に反応しない点
+
+---
+
+### Task 7: ループバックで配るタスクロール（実行順は Task 1 の直後、Task 2 より前）
+
+**この節は計画の途中で追加した。** Task 1 のレビューで、`169.254.170.2` を lo0 に固定する仕組みには構造的な影響範囲があると分かった: 固定したルートはマシン全体に効き、`rdr` ルールは `group` 句を受け付けない（`pfctl -n -f -` で確認: filter ルールは受け付け、rdr は syntax error）。つまりセッション中は `tetherd` グループ以外のプロセスも `169.254.170.2` で dev タスクの認証情報を掴む。`amazon-ecs-local-container-endpoints`（design.md の比較表に載っているツール）はこのアドレスを lo0 に alias して使うので、衝突相手が実在する。
+
+**Files:**
+- Create: `internal/cli/credproxy.go`, `internal/cli/credproxy_test.go`
+- Modify: `internal/cli/run.go`（ループバック口の起動と env の書き換え、ルート固定を opt-in に）、`internal/config/config.go`（`network.pin_credential_route`）、`internal/cli/config.go`
+- Test: `internal/cli/credproxy_test.go`, `internal/cli/run_e2e_test.go` に追記
+
+**Interfaces:**
+- Consumes: `session.Client.DialTCP`、`proto.Welcome.AppEnv`、`awsid.CredentialsHost`（既存の定数 `169.254.170.2`）
+- Produces:
+  ```go
+  // cli/credproxy.go
+  type CredProxy struct {
+      Dial func(ctx context.Context, addr string) (net.Conn, error)
+      Logf func(string, ...any)
+  }
+  func (p *CredProxy) Start(ctx context.Context) (netip.AddrPort, error)
+  func (p *CredProxy) Close() error
+
+  // RewriteContainerEndpoints returns the environment entries that point the
+  // child at addr instead of 169.254.170.2. Only variables the task
+  // actually has are rewritten.
+  func RewriteContainerEndpoints(taskEnv map[string]string, addr netip.AddrPort) map[string]string
+
+  // RunOptions に追加
+  //   PinCredentialRoute bool // network.pin_credential_route。既定 false
+  ```
+
+**なぜこれで SDK が動くか**（前提なので確認済みの事実を書く）: aws-sdk-go-v2 の `config` パッケージは `AWS_CONTAINER_CREDENTIALS_FULL_URI` のホストを `isAllowedHost` で検査し、**ループバック**・ECS のリンクローカル・EKS のアドレスを許可する（`resolve_credentials.go` の `ip.IsLoopback() || ip.Equal(ecsContainerIPv4) || …`）。`http://127.0.0.1:<port>/...` は追加のトークンなしで受理される。他言語の SDK も同じ規則。
+
+- [ ] **Step 1: 失敗するテストを書く**
+
+`internal/cli/credproxy_test.go`:
+
+```go
+package cli
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"strings"
+	"testing"
+	"time"
+)
+
+// taskEndpoint stands in for 169.254.170.2 inside the task: the proxy's Dial
+// is pointed at it, the way the session's DialTCP reaches the real one.
+func taskEndpoint(t *testing.T) (dial func(context.Context, string) (net.Conn, error), asked *[]string) {
+	t.Helper()
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.Host != "169.254.170.2" {
+			t.Errorf("the request must still be addressed to the endpoint, got Host %q", r.Host)
+		}
+		fmt.Fprintf(w, `{"AccessKeyId":"AKIA","Path":%q}`, r.URL.Path)
+	}))
+	t.Cleanup(srv.Close)
+	addr := srv.Listener.Addr().String()
+	return func(ctx context.Context, want string) (net.Conn, error) {
+		if want != "169.254.170.2:80" {
+			return nil, fmt.Errorf("the proxy must dial the endpoint, got %q", want)
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}, &paths
+}
+
+func TestCredProxyForwardsToTheTaskEndpoint(t *testing.T) {
+	dial, asked := taskEndpoint(t)
+	p := &CredProxy{Dial: dial, Logf: t.Logf}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); p.Close() })
+	addr, err := p.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !addr.Addr().IsLoopback() {
+		t.Fatalf("the credential proxy must bind loopback only, got %s", addr)
+	}
+	resp, err := http.Get(fmt.Sprintf("http://%s/v2/credentials/abc", addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || !strings.Contains(string(b), `"AKIA"`) {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, b)
+	}
+	// The same port serves the metadata paths: one proxy, four variables.
+	if _, err := http.Get(fmt.Sprintf("http://%s/v4/task-id/task", addr)); err != nil {
+		t.Fatal(err)
+	}
+	if got := *asked; len(got) != 2 || got[0] != "/v2/credentials/abc" || got[1] != "/v4/task-id/task" {
+		t.Fatalf("the endpoint saw %v", got)
+	}
+}
+
+func TestCredProxyStopsWhenTheRunEnds(t *testing.T) {
+	dial, _ := taskEndpoint(t)
+	p := &CredProxy{Dial: dial}
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, err := p.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	waitFor(t, func() bool {
+		c, err := net.DialTimeout("tcp", addr.String(), 200*time.Millisecond)
+		if err != nil {
+			return true
+		}
+		c.Close()
+		return false
+	}, "the credential proxy to stop listening")
+}
+
+func TestCredProxyReportsAnUnreachableSession(t *testing.T) {
+	// The session died mid-run. The child must get an answer, not a hang,
+	// and the log must say the tunnel is what failed - not the credentials.
+	var logs strings.Builder
+	p := &CredProxy{
+		Dial: func(context.Context, string) (net.Conn, error) {
+			return nil, fmt.Errorf("session: control stream closed")
+		},
+		Logf: func(f string, a ...any) { fmt.Fprintf(&logs, f+"\n", a...) },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); p.Close() })
+	addr, err := p.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Get(fmt.Sprintf("http://%s/v2/credentials/abc", addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if !strings.Contains(logs.String(), "control stream closed") {
+		t.Errorf("the log must name the transport failure: %q", logs.String())
+	}
+}
+
+func TestRewriteContainerEndpointsPointsTheChildAtLoopback(t *testing.T) {
+	addr := netip.MustParseAddrPort("127.0.0.1:51234")
+	taskEnv := map[string]string{
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/abc-123",
+		"ECS_CONTAINER_METADATA_URI_V4":          "http://169.254.170.2/v4/task-id",
+		"ECS_CONTAINER_METADATA_URI":             "http://169.254.170.2/v3/task-id",
+		"ECS_AGENT_URI":                          "http://169.254.170.2/v1",
+		"PORT":                                   "8080",
+	}
+	got := RewriteContainerEndpoints(taskEnv, addr)
+
+	if got["AWS_CONTAINER_CREDENTIALS_FULL_URI"] != "http://127.0.0.1:51234/v2/credentials/abc-123" {
+		t.Errorf("FULL_URI = %q", got["AWS_CONTAINER_CREDENTIALS_FULL_URI"])
+	}
+	// The relative form must be blanked: the SDK prefers FULL_URI, but
+	// leaving both set means any tool that reads the relative one still
+	// goes to 169.254.170.2, which is the address we no longer route.
+	if v, ok := got["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]; !ok || v != "" {
+		t.Errorf("the relative URI must be cleared, got %q (present=%v)", v, ok)
+	}
+	for _, k := range []string{"ECS_CONTAINER_METADATA_URI_V4", "ECS_CONTAINER_METADATA_URI", "ECS_AGENT_URI"} {
+		if !strings.HasPrefix(got[k], "http://127.0.0.1:51234/") {
+			t.Errorf("%s = %q, want the loopback host with the path kept", k, got[k])
+		}
+	}
+	if strings.Contains(got["ECS_CONTAINER_METADATA_URI_V4"], "169.254") {
+		t.Errorf("no rewritten value may still name the endpoint: %q", got["ECS_CONTAINER_METADATA_URI_V4"])
+	}
+	// Nothing else is touched.
+	if _, ok := got["PORT"]; ok {
+		t.Errorf("only the container endpoint variables belong here: %v", got)
+	}
+}
+
+func TestRewriteContainerEndpointsSkipsWhatTheTaskDoesNotHave(t *testing.T) {
+	addr := netip.MustParseAddrPort("127.0.0.1:51234")
+	// A task with no role at all: nothing to rewrite, and no invented
+	// variable - a FULL_URI pointing at a path the endpoint does not serve
+	// would make every SDK call fail slowly instead of falling through to
+	// the developer's own identity.
+	got := RewriteContainerEndpoints(map[string]string{"PORT": "8080"}, addr)
+	if len(got) != 0 {
+		t.Fatalf("got %v, want nothing", got)
+	}
+	// Metadata but no credentials: rewrite what exists.
+	got = RewriteContainerEndpoints(map[string]string{
+		"ECS_CONTAINER_METADATA_URI_V4": "http://169.254.170.2/v4/x",
+	}, addr)
+	if len(got) != 1 || !strings.HasPrefix(got["ECS_CONTAINER_METADATA_URI_V4"], "http://127.0.0.1:51234/") {
+		t.Fatalf("got %v", got)
+	}
+}
+```
+
+`internal/cli/run_e2e_test.go` に追記:
+
+```go
+func TestRunPointsTheChildAtTheLoopbackCredentialProxy(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/abc",
+		"ECS_CONTAINER_METADATA_URI_V4":          "http://169.254.170.2/v4/task",
+	}, nil, nil)
+	p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+	// The child's exit status carries the assertion: a loopback FULL_URI,
+	// no mention of the endpoint's address, and the relative form cleared.
+	opts := ssmOpts("sh", "-c", `case "$AWS_CONTAINER_CREDENTIALS_FULL_URI" in http://127.0.0.1:*/v2/credentials/abc) ;; *) exit 11;; esac
+		[ -z "$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" ] || exit 12
+		case "$ECS_CONTAINER_METADATA_URI_V4" in *169.254*) exit 13;; esac`)
+	var out strings.Builder
+	code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p))
+	if err != nil || code != 0 {
+		t.Fatalf("the child rejected its environment: code=%d err=%v log=%s", code, err, out.String())
+	}
+	if !strings.Contains(out.String(), "127.0.0.1:") {
+		t.Errorf("the iam line must say where the child was pointed: %s", out.String())
+	}
+}
+
+func TestRunDoesNotPinTheRouteUnlessAsked(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/abc"}, nil, nil)
+	p := &fakeProvider{
+		region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
+	hc := &fakeHelperClient{}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return hc, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.ExecPath = "/usr/bin/true"
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if len(hc.routes) != 0 {
+		t.Fatalf("routes = %v: the machine-wide pin is opt-in now", hc.routes)
+	}
+
+	// With the opt-in set it is pinned - the escape hatch for a tool inside
+	// the child's tree that hardcodes the address.
+	hc2 := &fakeHelperClient{}
+	d.DialHelper = func(string) (HelperClient, error) { return hc2, nil }
+	opts.PinCredentialRoute = true
+	if code, err := RunWithDeps(context.Background(), opts, io.Discard, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if len(hc2.routes) != 1 || hc2.routes[0].String() != "169.254.170.2" {
+		t.Fatalf("routes = %v, want the endpoint pinned when asked", hc2.routes)
+	}
+}
+```
+
+- [ ] **Step 2: テストが失敗することを確認**
+
+Run: `go test ./internal/cli/`
+Expected: FAIL（`undefined: CredProxy` / `RewriteContainerEndpoints` / `RunOptions.PinCredentialRoute`）
+
+- [ ] **Step 3: 実装**
+
+`internal/cli/credproxy.go`:
+
+```go
+// The task's credential and metadata endpoint, served on loopback.
+//
+// The task's environment points at 169.254.170.2, which only exists inside
+// the task. v0.2b reached it by capturing the address with pf, which needed
+// a root-installed host route: connect()'s route lookup runs before pf's
+// output rules, so macOS's ARP-failed reject route for that address beat
+// the rdr rule. That route is machine-wide and pf's rdr rule cannot be
+// scoped by gid - pf rejects a group clause on a translation rule - so
+// every process on the Mac reached the dev task's credentials during a
+// session, and a local ECS endpoint emulator would be handed the task's
+// role instead of the laptop's own.
+//
+// Pointing the child at a loopback port by environment variable instead
+// reaches exactly the child's process tree, needs no root, and cannot
+// collide with anything that owns 169.254.170.2 locally. aws-sdk-go-v2
+// accepts a loopback AWS_CONTAINER_CREDENTIALS_FULL_URI over plain HTTP
+// with no token (isAllowedHost in config/resolve_credentials.go), and the
+// other SDKs follow the same rule.
+package cli
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/netip"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/kyosu-1/tetherd/internal/awsid"
+)
+
+// CredProxy forwards loopback requests to the task's endpoint through the
+// session.
+type CredProxy struct {
+	Dial func(ctx context.Context, addr string) (net.Conn, error)
+	Logf func(string, ...any)
+
+	mu  sync.Mutex
+	srv *http.Server
+	ln  net.Listener
+}
+
+// Start binds 127.0.0.1 on a free port and serves until ctx is done.
+func (p *CredProxy) Start(ctx context.Context) (netip.AddrPort, error) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	rp := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.Out.URL.Scheme = "http"
+			// Keep addressing the endpoint: the agent dials it by address,
+			// and a Host header of 127.0.0.1 would be a lie on the wire.
+			r.Out.URL.Host = awsid.CredentialsHost
+			r.Out.Host = awsid.CredentialsHost
+		},
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				return p.Dial(ctx, addr)
+			},
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, e error) {
+			p.logf("⚠ iam      %s %s through the agent: %v", r.Method, r.URL.Path, e)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		},
+	}
+	srv := &http.Server{Handler: rp, ReadHeaderTimeout: 10 * time.Second}
+	p.mu.Lock()
+	p.srv, p.ln = srv, ln
+	p.mu.Unlock()
+	go srv.Serve(ln)
+	go func() {
+		<-ctx.Done()
+		p.Close()
+	}()
+	return netip.MustParseAddrPort(ln.Addr().String()), nil
+}
+
+// Close stops serving. Safe to call more than once.
+func (p *CredProxy) Close() error {
+	p.mu.Lock()
+	srv, ln := p.srv, p.ln
+	p.srv, p.ln = nil, nil
+	p.mu.Unlock()
+	if srv != nil {
+		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		srv.Shutdown(sctx)
+	}
+	if ln != nil {
+		ln.Close()
+	}
+	return nil
+}
+
+func (p *CredProxy) logf(format string, args ...any) {
+	if p.Logf != nil {
+		p.Logf(format, args...)
+	}
+}
+
+// RewriteContainerEndpoints points the child at addr instead of
+// 169.254.170.2. Only variables the task actually has are rewritten:
+// inventing a FULL_URI for a task with no role would make every SDK call
+// fail slowly instead of falling through to the developer's own identity.
+func RewriteContainerEndpoints(taskEnv map[string]string, addr netip.AddrPort) map[string]string {
+	out := map[string]string{}
+	base := "http://" + addr.String()
+
+	if rel := taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]; rel != "" {
+		out["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = base + rel
+		// Blank the relative form rather than leaving it: the SDK prefers
+		// FULL_URI, but anything that reads the relative one would still go
+		// to an address nothing routes any more.
+		out["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] = ""
+	}
+	for _, k := range []string{"ECS_CONTAINER_METADATA_URI_V4", "ECS_CONTAINER_METADATA_URI", "ECS_AGENT_URI"} {
+		if rewritten, ok := swapHost(taskEnv[k], addr); ok {
+			out[k] = rewritten
+		}
+	}
+	return out
+}
+
+// swapHost replaces the authority of a http://169.254.170.2/... URL, keeping
+// the path. A value that is not that shape is left alone: passing the task's
+// own value through is better than guessing.
+func swapHost(v string, addr netip.AddrPort) (string, bool) {
+	const prefix = "http://" + awsid.CredentialsHost
+	if v == "" || !strings.HasPrefix(v, prefix) {
+		return "", false
+	}
+	return "http://" + addr.String() + strings.TrimPrefix(v, prefix), true
+}
+
+var _ = fmt.Sprintf
+```
+
+（最後の `var _ = fmt.Sprintf` は書かない。使わない import は入れない。)
+
+`internal/cli/run.go`:
+- セッション確立後、capture の前に `CredProxy` を起動する（pf に依存しないので capture より前でよい）:
+  ```go
+  	cp := &CredProxy{Dial: sess.DialTCP, Logf: logf}
+  	credAddr, err := cp.Start(ctx)
+  	if err != nil {
+  		return 1, fmt.Errorf("serve the task's credential endpoint on loopback: %w", err)
+  	}
+  	defer cp.Close()
+  ```
+- `taskRoleEnv` の代わりに `RewriteContainerEndpoints(taskEnv, credAddr)` の結果を override に足す。`AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` を空ファイルに向ける処理と、ローカル認証情報変数の `StripLocal` は**そのまま残す**（開発者の `~/.aws` がタスクロールを覆い隠す問題は別件で、実機で踏んだもの）
+- `✓ iam` 行はどこに向けたかを言う: `✓ iam      <arn>  (via 127.0.0.1:<port> → the task)`
+- 「169.254.170.2 が捕捉されていない」警告と `taskRoleReachable` / `capturesTaskRole` の判定は不要になるので削除する（capture の有無に依存しなくなった）
+- ルート固定は `opts.PinCredentialRoute` のときだけ:
+  ```go
+  		// Opt-in escape hatch: a tool inside the child's tree that
+  		// hardcodes 169.254.170.2 instead of reading the environment. It
+  		// pins a machine-wide route, so it is off by default (spec §11).
+  		if opts.PinCredentialRoute {
+  			if err := hc.RouteSet([]netip.Addr{ecsprov.TaskRoleAddr}); err != nil {
+  				return 1, fmt.Errorf("pin the route to %s: %w", ecsprov.TaskRoleAddr, err)
+  			}
+  			defer hc.RouteClear()
+  		}
+  ```
+
+`internal/config/config.go` の `Network` に `PinCredentialRoute bool`（yaml タグ `pin_credential_route`）を足し、`applyConfig` が `opts.PinCredentialRoute` に反映する。フラグは足さない（設定ファイルだけ。滅多に使わない）。
+
+- [ ] **Step 4: テストが通ることを確認**
+
+Run: `go test -race -count=1 ./... && go test -race -count=5 ./internal/cli/ && make lint && GOOS=linux go vet ./... && make build && go mod tidy`
+Expected: 全部 PASS
+
+- [ ] **Step 5: ドキュメント**
+
+- `docs/config.md`: `network.pin_credential_route` を追加し、既定で不要な理由（ループバックで配る）と、有効にしたときの影響範囲（マシン全体。セッション中は全プロセスが dev タスクの認証情報に到達する）を書く
+- `docs/specs/2026-09-12-v1-macos-design.md` §4.1 と §11: 「169.254.170.2 を透過で通す」→「ループバックで配り、env を書き換える」に改訂。§11 には、ループバック口が無認証であること（既存の `127.0.0.1:9900` と同じ信頼境界）と、`pin_credential_route` を有効にしたときの影響範囲を書く
+- `docs/design.md` の「副産物: タスクロールが自動で効く」を実態に合わせる（「追加実装なしで」は成り立たなかった）
+
+- [ ] **Step 6: Commit**
+
+コミットメッセージの件名は `feat(cli): serve the task's credential endpoint on loopback`。
