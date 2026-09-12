@@ -359,51 +359,85 @@ func tokenFieldPos(e ast.Expr) (token.Pos, bool) {
 }
 
 // checkConstantTimeHelper asserts that the helper every token comparison
-// goes through compares with crypto/subtle and with nothing else - the
-// rule above is worth nothing if tokenEqual's own body says got == want.
+// goes through compares with crypto/subtle and with nothing else - the rule
+// above is worth nothing if tokenEqual's own body says got == want.
+//
+// The rule is a whitelist of what a constant-time comparison may look like,
+// not a list of ways to get it wrong, so it does not have to anticipate the
+// next evasion:
+//
+//   - every == / != in the body must have an operand that is a call to
+//     subtle.ConstantTimeCompare or to len. That admits the two shapes a
+//     correct implementation needs - `subtle.ConstantTimeCompare(a, b) == 1`
+//     and a `len(a) != len(b)` guard - and rejects everything else;
+//   - at least one == / != must have a subtle.ConstantTimeCompare operand,
+//     so a call whose result is discarded does not count as the comparison.
+//
+// Both clauses are about the *shape* of the comparison and never about
+// identifiers, which is what makes them indifferent to renamed parameters
+// and to values laundered through locals: `g, w := got, want; return g == w`
+// is rejected by the first clause no matter what the locals are called, and
+// `_ = subtle.ConstantTimeCompare(...)` as a decoy is rejected by the
+// second.
 func checkConstantTimeHelper(t *testing.T, fset *token.FileSet, fn *ast.FuncDecl) {
 	t.Helper()
-	params := map[string]bool{}
-	for _, field := range fn.Type.Params.List {
-		for _, name := range field.Names {
-			params[name.Name] = true
-		}
-	}
-	constantTime := false
+	comparisons, constantTime := 0, 0
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.CallExpr:
-			sel, ok := x.Fun.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			pkg, ok := sel.X.(*ast.Ident)
-			if !ok {
-				return true
-			}
-			if pkg.Name == "subtle" && sel.Sel.Name == "ConstantTimeCompare" {
-				constantTime = true
-			}
-			switch pkg.Name + "." + sel.Sel.Name {
+			switch callee := calleeName(x); callee {
 			case "bytes.Equal", "strings.Compare", "strings.EqualFold", "strings.Contains", "strings.HasPrefix", "strings.HasSuffix":
-				t.Errorf("%s: %s compares the token with %s.%s, which is not constant time",
-					fset.Position(x.Pos()), fn.Name.Name, pkg.Name, sel.Sel.Name)
+				t.Errorf("%s: %s compares the token with %s, which is not constant time",
+					fset.Position(x.Pos()), fn.Name.Name, callee)
 			}
 		case *ast.BinaryExpr:
 			if x.Op != token.EQL && x.Op != token.NEQ {
 				return true
 			}
+			comparisons++
+			ct, allowed := false, false
 			for _, side := range []ast.Expr{x.X, x.Y} {
-				if id, ok := side.(*ast.Ident); ok && params[id.Name] {
-					t.Errorf("%s: %s compares %s with %s, which is not constant time",
-						fset.Position(x.Pos()), fn.Name.Name, id.Name, x.Op)
+				switch calleeName(side) {
+				case "subtle.ConstantTimeCompare":
+					ct, allowed = true, true
+				case "len":
+					allowed = true
 				}
+			}
+			if ct {
+				constantTime++
+			}
+			if !allowed {
+				t.Errorf("%s: %s compares with %s on operands that are not a "+
+					"subtle.ConstantTimeCompare result or a len; a constant-time helper may only "+
+					"compare subtle.ConstantTimeCompare(a, b) == 1 or len(a) != len(b)",
+					fset.Position(x.Pos()), fn.Name.Name, x.Op)
 			}
 		}
 		return true
 	})
-	if !constantTime {
-		t.Errorf("%s: %s must compare with crypto/subtle.ConstantTimeCompare",
-			fset.Position(fn.Pos()), fn.Name.Name)
+	if comparisons == 0 || constantTime == 0 {
+		t.Errorf("%s: %s must compare with crypto/subtle.ConstantTimeCompare and use its "+
+			"result, as in subtle.ConstantTimeCompare(a, b) == 1 (a call whose result is "+
+			"discarded compares nothing)", fset.Position(fn.Pos()), fn.Name.Name)
 	}
+}
+
+// calleeName names the function a call expression calls ("len",
+// "subtle.ConstantTimeCompare"), or "" when the expression is not a call to
+// a plain identifier or a pkg.Func selector.
+func calleeName(e ast.Expr) string {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return ""
+	}
+	switch fun := call.Fun.(type) {
+	case *ast.Ident:
+		return fun.Name
+	case *ast.SelectorExpr:
+		if pkg, ok := fun.X.(*ast.Ident); ok {
+			return pkg.Name + "." + fun.Sel.Name
+		}
+	}
+	return ""
 }
