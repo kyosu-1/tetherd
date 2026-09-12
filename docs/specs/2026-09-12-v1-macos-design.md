@@ -256,7 +256,8 @@ agent は root で動く（`SYS_PTRACE` を effective にするため。distrole
 
 ### 5.5 設定と配布
 
-- env のみ: `TETHERD_ENV`（必須）、`TETHERD_LISTEN`（`:8080`）、`TETHERD_UPSTREAM`（`127.0.0.1:8081`）、`TETHERD_CONTROL`（`127.0.0.1:9900`）、`TETHERD_APP_CONTAINER`（`app`）
+- env のみ: `TETHERD_ENV`（必須）、`TETHERD_PROXY`（`0.0.0.0:8080`。ALB を受ける口）、`TETHERD_APP_ADDR`（`127.0.0.1:8081`。app への転送先）、`TETHERD_CONTROL`（`127.0.0.1:9900`）、`TETHERD_APP_CONTAINER`（`app`）、`TETHERD_TASK_ARN`（任意。メタデータが取れればそちらが優先）
+- `TETHERD_CONTROL` は**実装上は固定**。CLI の `ssm` トランスポートが転送先ポートに 9900 を固定で入れる（`internal/transport/ssm` の `controlPort`）ので、これを変えた agent は誰も繋げない listen になり、失敗は「agent に届かない」として出る。テストと埋め込み用の口であり、デプロイのつまみではない（トランスポート側に教えるのは v0.4）
 - AWS API は呼ばない
 - イメージ `ghcr.io/kyosu-1/tetherd-agent`、distroless static、linux/arm64 + linux/amd64
 - タスク定義の推奨: `essential: true`、`restartPolicy.enabled: true`、`linuxParameters.capabilities.add: ["SYS_PTRACE"]`、`pidMode: task`
@@ -331,11 +332,13 @@ tetherd token rotate
 ```
 
 - `env`: 既定は secrets をマスク。どれが secret かはタスク定義（`DescribeTaskDefinition`）の `secrets` ブロックの名前で判定
-- `status`: タスクごとに接続中のユーザー、自分のルール、primary かどうか。agent の `status` メッセージで取る
+- `status`: タスクごとに接続中のユーザー、どこから、いつから。v0.3b で実装。専用のメッセージは足さず、attach の `welcome` に載る `sessions` を読む（`hello` 1 往復で済み、追加の状態も持たないため）。読むためだけに attach するので `incoming` を無効にし、トークンも送らない — `status` 自身が steal の宛先にならないことが要件（§11）。タスクごとに 1 行以上出し、読めなかったタスクも理由付きで出す
 - `doctor` の検査項目（各項目に「次に何をするか」を付ける）:
   helper が応答しバージョンが一致 / `tetherd` グループと setgid `tetherd-exec` / session-manager-plugin の有無 / AWS 認証 / サービスの `enableExecuteCommand` / タスクの agent コンテナと ExecuteCommandAgent / タスク定義の `pidMode: task` / ターゲットグループが HTTP1 / ECS・EC2 の読み取り権限 / VPC CIDR とローカル IF の重なり / `remote_domains` が agent 側で解けるか / `remote_cidrs` に `0.0.0.0/0` が無いか
 
-  v0.2b で実装したのは 9 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲の広さ / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査は v0.3** — developer policy に `elasticloadbalancing:DescribeTargetGroups` を足す必要があり、検証環境が動いている間は Terraform を再適用しない方針のため。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
+  v0.2b で実装したのは 9 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲の広さ / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査はまだ入っていない** — developer policy に `elasticloadbalancing:DescribeTargetGroups` が要るためで、その付与は v0.3b で入れた（`deploy/dev-env/iam-developer.tf` の `InspectTargetGroup`）。行そのものが残っている理由は §12 の v0.3b に書いた。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
+
+  v0.3a / v0.3b で足したのは、`agent session`（tetherd 自身が通した handshake。ECS の見解とは別）・`task env`（agent が読めた変数と `env_error`）・`task role`（子プロセスと同じ経路でループバック口から取った認証情報の ARN）・`steal`（一致条件と、ラップトップ側に listener が居るか）の 4 行と、**`?`（検査できなかった）ステータス**。`?` は「動くが注意」の `⚠` と分けてあり、**どの行でも exit code を動かさない**（失敗した行は既にそれ自身で数えられているため）。`pin_credential_route` の行は入っていない
 
 ### 6.6 出力
 
@@ -644,6 +647,30 @@ design.md §10 に加えて:
 `remote:` に `169.254.170.0/24` が入らないこと（既定ではループバック口から配るため）、そして §12 の既知の穴 3 番（ARP 失敗の拒否ルートで間欠的に壊れる）の原因アドレスに**もう誰も接続しない**ことが実機で確認できた。
 
 **`terraform apply` で 1 回失敗した。** ターゲットグループの `port` 変更は置き換えを強制するが、リスナが転送先にしている間は削除できないため `ResourceInUse` になる。しかも失敗が綺麗ではなく、セキュリティグループの更新だけ先に適用済みで、ALB からのインバウンドが 8080 のみ許可・ターゲットグループはまだ 8081 をヘルスチェック、という状態で止まり、dev 環境が一時的に 5xx になった。`create_before_destroy` と `name_prefix`（ターゲットグループは 6 文字まで）で解決（`f099788`）。次に同種の置き換えを含む変更を当てる者は、plan の `# forces replacement` を見た時点でこれを疑うこと。
+
+### v0.3b（全タスク接続・deploy 追従・`status`・`token rotate`・`doctor`）
+
+**§6.2 / §6.3 は最初から「対象タスク全部に接続」と書いてあり、実装が追いついていなかった。** v0.3a までの `run` は最も古い 1 本にしか繋いでおらず、`desired_count` が 2 以上のサービスでは ALB がどのタスクに落とすかで steal が当たるか外れるかが決まっていた。v0.3b で実装が仕様に一致した（`internal/cli/sessionset.go` の `SessionSet` が primary と secondary を持ち、`internal/cli/follow.go` の `Follower` が 10 秒おきにタスク一覧を読み直す）。**§6.2 / §6.3 の本文は書き換えていない** — 仕様が正しく、コードが後から揃った側なので、記録はこの節に置く。
+
+あわせて入ったもの: `tetherd status`（§6.5。`welcome` の `sessions` を読む。専用メッセージは足していない）、`tetherd token rotate`（§5.2。0600 を保ち、`user` / `aws` を残す）、`doctor` の `?` ステータスと `steal` / `task role` の行（§6.5）。
+
+Terraform の変更は 1 点だけ: developer policy に `elasticloadbalancing:DescribeTargetGroups`（`deploy/dev-env/iam-developer.tf` の `InspectTargetGroup`）。`doctor` のターゲットグループの行（31 行）だけが使う。ELB の `Describe*` はリソースレベルの権限を取らないので `Resource` は `*` になる。
+
+**ターゲットグループの行そのものは v0.3b に入っていない**（持ち越し）。判定は「`protocol_version` が `HTTP1` でなければ `✗`（§5.1）／agent の既定ポートと違えば `⚠`（`TETHERD_PROXY` で変えられるので `✗` にはできない）／権限が無ければ `?`」で決まっているが、事実を集める側が二重に詰まっている: (1) `DescribeTargetGroups` を呼ぶ SDK（`aws-sdk-go-v2/service/elasticloadbalancingv2`）が `go.mod` に無く、この計画は「依存追加なし・`go.mod` は 1 行も変えない」を条件にしている。(2) agent の既定プロキシポートは `internal/agent` の非公開定数 `defaultProxy`（`0.0.0.0:8080`）で、`internal/doctor` から読めない。どちらも方針の決定が要るので、決めてから入れる。
+
+**ポート検査の限界は v0.4 で埋める。** agent のプロキシポートは `TETHERD_PROXY` で変えられるのに、`doctor` にはそれを知る手段が無い（`welcome` は `Version` / `TaskARN` / `Env` / `AppEnv` / `EnvError` / `Others` / `Sessions` だけで、CLI が繋ぐのは**制御**ポート）。だから既定と違うポートは `⚠` にしかできない。安いのはタスク定義の agent コンテナの env から `TETHERD_PROXY` を読むこと（`awsProvider` は `SecretNames` / `PIDMode` で既にタスク定義を読んでいるので同じ呼び出し形）。もう一方は `welcome` にフィールドを 1 つ足すこと（追加のみなので互換は保てる）。
+
+**検証には `desired_count` を 2 にする必要がある**（27・28 行）。ALB がタスクを選ぶ以上、1 タスクでは「どのタスクに落ちても届く」は検証できない。**検証が終わったら 1 に戻す** — Fargate の課金が倍になるため。
+
+検証手順は `docs/e2e-aws.md` の 27〜31 行。結果は実施後にここに記録する。
+
+| 行 | 検証 | 結果 |
+|---|---|---|
+| 27 | `desired_count = 2` で、一致するヘッダーのリクエストがどのタスクに落ちてもラップトップに届く | 未実施 |
+| 28 | rolling deploy 中に `run` が生き続け、新しいタスクに繋ぎ、古いタスクが落ちても終わらない | 未実施 |
+| 29 | `tetherd status` が各タスクの接続者を出し、トークンを送らない | 未実施 |
+| 30 | `token rotate` の直後は走行中のセッションが古いトークンのまま steal し続ける | 未実施 |
+| 31 | ターゲットグループを HTTP2 にすると `doctor` が `✗` で `protocol_version` を名指しする | 未実施 |
 
 ---
 

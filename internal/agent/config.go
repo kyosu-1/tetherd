@@ -14,6 +14,16 @@ type Config struct {
 	// control port unreachable from the task's ENI without a
 	// security-group change, and the SSM port forward terminates inside
 	// the task, on 127.0.0.1 (docs/design.md: ":9900 (lo only)").
+	//
+	// It is not a deployment setting, despite reading like one: the CLI's
+	// ssm transport forwards to a fixed 9900 (internal/transport/ssm's
+	// controlPort, sent as the port-forwarding document's portNumber), so
+	// a task that sets TETHERD_CONTROL=127.0.0.1:9901 listens where no CLI
+	// looks and the failure arrives as "the agent is unreachable" -
+	// pointing at the transport rather than at the setting that was
+	// changed. So this exists for tests and for an embedded agent; making
+	// it a real deployment knob means teaching the transport the port
+	// (v0.4, with the distribution work).
 	Control      string
 	AppContainer string // TETHERD_APP_CONTAINER, default defaultAppContainer.
 	MetadataURL  string // ECS_CONTAINER_METADATA_URI_V4, set by ECS; empty outside ECS.

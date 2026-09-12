@@ -52,8 +52,19 @@ v0.3a から、agent は常に ALB のデータパス上に居る（§5.1）。�
 | 24 | ラップトップのサーバだけ落として `curl`（`$RUN` は生かす） | タスクの応答。CLI に `502 nothing is listening on 127.0.0.1:8080` | dial 失敗はそのリクエストだけ app にフォールバック |
 | 25 | `$RUN --no-incoming -- sleep 60` 中に一致するヘッダーで `curl` | タスクの応答。CLI に `✓ steal` 行が無い | `--no-incoming` は何も取らない |
 | 26 | ALB のヘルスチェックが 2 分間 healthy のまま | ターゲットが healthy | ヘルスチェックは常に app に届く（agent 経由。§5.1） |
+
+v0.3b から、`tetherd run` は**サービスの対象タスク全部**に接続し、rolling deploy に追従する（§6.2 / §6.3）。以下はそれと `status` / `token rotate` / `doctor` の確認。
+
+**27 と 28 は `desired_count = 2` が必要**（`terraform apply -var desired_count=2`）。ALB がどのタスクにリクエストを落とすかを決めるので、1 タスクでは「どのタスクに落ちても届く」を検証できない。**終わったら 1 に戻す** — Fargate の課金が倍になる。31 はターゲットグループを HTTP2 にするので、**dev 環境を一時的に壊す**（agent は HTTP/1.1 サーバなので ALB が h2c で話すとヘルスチェックが落ちる）。31 は最後に実施し、すぐ HTTP1 に戻すこと。
+
+| # | コマンド | 期待 | 確認すること |
+|---|---|---|---|
+| 27 | `desired_count = 2` にして、まず**ヘッダー無し**で `for i in $(seq 20); do curl -s http://<alb>/; done \| sort \| uniq -c`。次に `$RUN -- <自分のサーバ>` を起動し、一致するヘッダーで同じ 20 回 | ヘッダー無しの 20 回が**2 つのタスク両方**から答える（`sampleapp on ip-10-0-…` が 2 種類出る）。`$RUN` の `target` 行が `2 tasks (<id>… primary, <id>…)`。一致するヘッダーの 20 回は**20 回すべて**ラップトップのプロセスが答え、CLI に `←` が 20 行出る。ラップトップ側の受信数も 20 | **どのタスクに落ちても steal できる（v0.3b の本体）。** ヘッダー無しの 1 周目を先に取るのが要点 — ALB が実際に 2 タスクへ振り分けていることを確かめずに 20/20 を見ても、たまたま片方に寄っただけで通ってしまう。v0.3a のコードは最も古い 1 本にしか繋がないので、この形では繋いでいないタスクに落ちた分が app の応答になる |
+| 28 | `$RUN -- <自分のサーバ>` を動かしたまま別端末で `aws ecs update-service --cluster tetherd-dev --service api --force-new-deployment`。入れ替わりの間、一致するヘッダーで `curl` を続ける | 新しいタスクに `↻ session   task <id>… attached (N total)`（primary でなければ `(N total)`、primary なら `attached and is now the primary`）が出て繋がり、古いタスクが落ちると `↻ session   task <id>… went away (…); N left`。**`run` は生き続け、子プロセスも動き続ける**。primary が入れ替わった場合は `dial and DNS now go through task <id>…` が出る。`curl` はその間もラップトップに届く | deploy 追従。タスク一覧は 10 秒おきなので反映に最大 10 秒の遅れがある。**secondary が 1 本落ちても `run` は終わらない**こと（`✗ agent session lost` が出ないこと）が見どころ — 終わるのは全セッションを失ったときだけ |
+| 29 | `$RUN` を別端末で生かしたまま `./bin/tetherd status`。続けて `$RUN` を止めてもう一度 | 1 回目はタスクごとの節に自分の名前・`from <自分の IP>`・`attached <n>s ago` が出る（`run` は全タスクに繋ぐので**両方のタスクに**出る）。2 回目は両タスクが `(nobody attached)`。exit 0。helper（sudo）は要らない | 共有時の診断。`status` は読むためだけに attach するので、**トークンを送らず steal の対象にならない**（29 の実行中に一致するヘッダーで `curl` してもタスクの応答になり、`status` 側には何も来ない）。タスクが 1 本読めなくても残りが出ること（`(not read: …)`）も、片方を `aws ecs stop-task` して確認できる |
 | 30 | `$RUN` を生かしたまま別の端末で `./bin/tetherd token rotate`、その後 **古い**トークンのヘッダーで `curl` | 新しいトークンが表示され、`~/.tetherd/config.yml` は 0600 のまま `user` と `aws` も残る。**古いトークンの `curl` はまだラップトップに届く**（`$RUN` を再起動すると届かなくなり、新しいトークンで届くようになる） | 回転はファイルを差し替えるだけで、走行中のセッションは attach 時の `hello` の値で照合し続ける — 漏洩を閉じるには再起動が必要（出力もそう言う） |
+| 31 | developer policy を当てる**前**に `./bin/tetherd doctor`、当てた**後**にもう一度、最後に `alb.tf` の `aws_lb_target_group.app` に `protocol_version = "HTTP2"` を足して `terraform apply` してもう一度 | 当てる前は `? target group  not checked: …`（`elasticloadbalancing:DescribeTargetGroups` を名指しし、**exit code は 0 のまま**）。当てた後は `✓`。HTTP2 にすると `✗` で `protocol_version` を名指しして exit 1 | steal の要件検査（spec §5.1 が gRPC / HTTP2 を対象外としている）。`?` が exit code を動かさないこと — 権限が古い開発者の環境は壊れていないので `✗` にしてはいけない — が 1 段目の要点。**実施後すぐ HTTP1 に戻す**こと。`protocol_version` は作成時にしか設定できない属性なので（`ModifyTargetGroup` では変えられない）Terraform は置き換えになるが、`create_before_destroy` + `name_prefix` が入っているので v0.3a の `ResourceInUse`（§12）は起きない。この行はターゲットグループの検査が `doctor` に入ってから実施する（§12 の v0.3b） |
 
 所要時間の目安: `StartSession` → `welcome` まで 2〜4 秒、psql の接続確立 +50〜100 ms。
 
-結果は `docs/specs/2026-09-12-v1-macos-design.md` §12 の 5・6、および v0.3a の節に追記する。
+結果は `docs/specs/2026-09-12-v1-macos-design.md` §12 の 5・6、および v0.3a / v0.3b の節に追記する。
