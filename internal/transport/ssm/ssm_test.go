@@ -15,6 +15,7 @@ import (
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
 	smithy "github.com/aws/smithy-go"
 
+	"github.com/kyosu-1/tetherd/internal/agent"
 	"github.com/kyosu-1/tetherd/internal/transport"
 )
 
@@ -253,4 +254,36 @@ func (f *accessDeniedAPI) StartSession(context.Context, *awsssm.StartSessionInpu
 
 func (f *accessDeniedAPI) TerminateSession(context.Context, *awsssm.TerminateSessionInput, ...func(*awsssm.Options)) (*awsssm.TerminateSessionOutput, error) {
 	return &awsssm.TerminateSessionOutput{}, nil
+}
+
+// The forward's portNumber has to be the port the agent listens on, and
+// this test asks the agent rather than restating a number: it reads the
+// control address a task with no TETHERD_CONTROL ends up with and compares
+// the port half against what Dial puts in the document's parameters.
+//
+// Stating "9900" on both sides would pass with the two sides hardcoded
+// separately, which is the bug this guards - an agent listening on one port
+// while the CLI forwards to another, with nothing answering and no error
+// from either side. Written this way, moving proto.DefaultControlPort fails
+// here unless *both* sides moved with it. It is also why this file imports
+// internal/agent: the invariant spans the two packages and belongs where
+// the side that can be wrong lives.
+func TestForwardedPortIsThePortTheAgentListensOn(t *testing.T) {
+	cfg, err := agent.ConfigFromEnv(func(k string) string {
+		if k == "TETHERD_ENV" {
+			return "dev"
+		}
+		return "" // no TETHERD_CONTROL: the default is what the CLI assumes
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, agentPort, err := net.SplitHostPort(cfg.Control)
+	if err != nil {
+		t.Fatalf("agent control address %q: %v", cfg.Control, err)
+	}
+	if controlPort != agentPort {
+		t.Fatalf("ssm forwards to portNumber %q but the agent listens on %q (%s); both must come from proto.DefaultControlPort, or the forward reaches a port nothing serves",
+			controlPort, agentPort, cfg.Control)
+	}
 }

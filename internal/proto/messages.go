@@ -14,10 +14,12 @@ const Version = "1"
 // They live in this package rather than in internal/agent because both
 // sides read them and neither side may hold its own copy. The agent applies
 // them (internal/agent's Config.withDefaults); `tetherd doctor` compares the
-// deployment against them, because a fact about the deployment - which port
-// the ALB's target group sends to - is only a finding next to the port the
-// agent actually serves. A literal in both places is a literal that drifts,
-// and the copy that drifts is the one no task definition mentions.
+// deployment against the proxy port, because a fact about the deployment -
+// which port the ALB's target group sends to - is only a finding next to the
+// port the agent actually serves, and the CLI's ssm transport forwards to
+// the control port, because a forward to any other port reaches nothing. A
+// literal in both places is a literal that drifts, and the copy that drifts
+// is the one no task definition mentions.
 //
 // This is the wire-adjacent package rather than a new one because it is
 // already imported by the agent, the CLI and internal/doctor, so no import
@@ -28,6 +30,24 @@ const (
 	// and reverse-proxies to the application behind it (spec §5.1), so
 	// this is the port the task's target group is expected to name.
 	DefaultProxyPort = 8080
+
+	// DefaultControlPort is the port tetherd-agent accepts CLI sessions on
+	// unless TETHERD_CONTROL says otherwise, and the port the CLI's ssm
+	// transport asks AWS-StartPortForwardingSession to terminate on inside
+	// the task (internal/transport/ssm's controlPort). The agent binds it
+	// on loopback, which is what keeps it unreachable from the task's ENI
+	// without a security-group change (docs/design.md: ":9900 (lo only)").
+	//
+	// Sharing the constant stops the two sides from drifting; it does not
+	// make TETHERD_CONTROL a deployment setting. A deployment that changes
+	// it moves the agent's listener and the CLI cannot follow, because the
+	// only channel on which it could learn the new port is the control
+	// port itself - so the agent listens where no CLI looks and the
+	// failure arrives as "the agent is unreachable", pointing at the
+	// transport rather than at the setting that was changed. Carrying a
+	// changed port properly means putting it in .tetherd.yml, which the
+	// CLI reads before it connects, and that is a v1 decision.
+	DefaultControlPort = 9900
 )
 
 // Message types.

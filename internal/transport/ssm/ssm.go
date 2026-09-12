@@ -21,6 +21,7 @@ import (
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
 	smithy "github.com/aws/smithy-go"
 
+	"github.com/kyosu-1/tetherd/internal/proto"
 	"github.com/kyosu-1/tetherd/internal/transport"
 )
 
@@ -40,8 +41,7 @@ type Transport struct {
 }
 
 const (
-	document    = "AWS-StartPortForwardingSession"
-	controlPort = "9900"
+	document = "AWS-StartPortForwardingSession"
 
 	// StartupWait is how long Dial allows the session-manager-plugin to
 	// open the forwarded local port before giving up on it.
@@ -53,6 +53,23 @@ const (
 	// perfectly well as unreachable.
 	StartupWait = 20 * time.Second
 )
+
+// controlPort is the port the forward terminates on inside the task, sent
+// as the port-forwarding document's portNumber. It is the agent's default
+// control port and not a literal of this package's own: the agent applies
+// the same constant (internal/agent's defaultControl), and a second copy
+// here is the one that drifts - the two would then disagree silently, the
+// agent listening on one port while this forward reaches another, and
+// nothing would answer.
+//
+// Sharing the constant does not let this follow a deployment that sets
+// TETHERD_CONTROL to something else: there is no channel on which to learn
+// the agent's port before connecting to it, because that channel would be
+// the control port. See proto.DefaultControlPort.
+//
+// A var rather than a const because portNumber is a string parameter and
+// the constant is a port number; nothing assigns to it.
+var controlPort = strconv.Itoa(proto.DefaultControlPort)
 
 // SessionTargets formats the ECS Exec targets to try, in order. Every
 // container in the task is a candidate because awsvpc shares one network

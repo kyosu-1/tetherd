@@ -257,7 +257,7 @@ agent は root で動く（`SYS_PTRACE` を effective にするため。distrole
 ### 5.5 設定と配布
 
 - env のみ: `TETHERD_ENV`（必須）、`TETHERD_PROXY`（`0.0.0.0:8080`。ALB を受ける口）、`TETHERD_APP_ADDR`（`127.0.0.1:8081`。app への転送先）、`TETHERD_CONTROL`（`127.0.0.1:9900`）、`TETHERD_APP_CONTAINER`（`app`）、`TETHERD_TASK_ARN`（任意。メタデータが取れればそちらが優先）
-- `TETHERD_CONTROL` は**実装上は固定**。CLI の `ssm` トランスポートが転送先ポートに 9900 を固定で入れる（`internal/transport/ssm` の `controlPort`）ので、これを変えた agent は誰も繋げない listen になり、失敗は「agent に届かない」として出る。テストと埋め込み用の口であり、デプロイのつまみではない（トランスポート側に教えるのは v0.4）
+- `TETHERD_CONTROL` は**実装上は固定**。agent 側の既定と CLI の `ssm` トランスポートが転送先ポートに入れる値は v0.4 で 1 つの定数（`internal/proto` の `DefaultControlPort`、`internal/transport/ssm` の `controlPort` がこれを参照）になったので両者がずれることは無いが、**これを変えた agent は依然として誰も繋げない listen になる** — CLI が新しいポートを知る経路は制御ポート自身しか無いため（循環）。失敗は「agent に届かない」として出る。テストと埋め込み用の口であり、デプロイのつまみではない。真に追随させるには CLI が接続前に読める場所（`.tetherd.yml`）に書かせる必要があり、それは v1 の判断
 - AWS API は呼ばない
 - イメージは distroless static、linux/arm64 + linux/amd64。**このリポジトリには公開レジストリへ push するパイプラインが無い**（v0.4 実測: `.goreleaser.yml` に `dockers:` / `kos:` は無く、イメージを扱うのは `make push-images` だけで、呼び出し元が渡す ECR レジストリへ push する）。利用者は `make push-images ECR_REGISTRY=...` で自分のレジストリに置く。公開レジストリでの配布は v1.0 に持ち越し
 - タスク定義の推奨: `essential: true`、`restartPolicy.enabled: true`、`linuxParameters.capabilities.add: ["SYS_PTRACE"]`、`pidMode: task`

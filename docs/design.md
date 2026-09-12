@@ -97,7 +97,7 @@ mirror（共有 DB への二重書き込みの扱いを決めてから）、UDP 
 - セッションが切れたら即座に素通しに戻す（リクエスト途中のものは完了まで待つ）
 - AWS API は呼ばない。Linux capability は env 読み取りのための `SYS_PTRACE` のみ。root で動かす（capability を effective にするため）
 - 常時データパスにいるので `essential: true` と `restartPolicy` を推奨
-- ALB を受けるポートは env で変更可（`TETHERD_PROXY`、既定 `0.0.0.0:8080`）。制御ポートの `TETHERD_CONTROL` も env にあるが**実質固定** — CLI の SSM トランスポートが 9900 を固定で転送するので、変えると誰も繋げなくなる（v0.4 でトランスポート側に教える）
+- ALB を受けるポートは env で変更可（`TETHERD_PROXY`、既定 `0.0.0.0:8080`）。制御ポートの `TETHERD_CONTROL` も env にあるが**実質固定**。v0.4 で agent 側の既定と CLI の SSM トランスポートが転送するポートを 1 つの定数（`internal/proto` の `DefaultControlPort`）にまとめたので両者がずれることは無くなったが、**デプロイが `TETHERD_CONTROL` を変えても CLI は追随できない** — 新しいポートを知るための唯一の経路が制御ポート自身なので、変えた agent は誰も繋げない listen になる。真に追随させるには `.tetherd.yml` に書かせる（CLI が接続前に読める場所）必要があり、それは v1 の判断
 
 ### 3.2 環境変数と secrets の取得 — 実行中のプロセスから読む
 
