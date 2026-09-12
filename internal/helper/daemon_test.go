@@ -414,18 +414,52 @@ func testPaths(t *testing.T) Paths {
 	return p
 }
 
+// srcBodies is what fakeSrcDir writes, and what the installed files are
+// compared against. The two bodies are deliberately different and neither is
+// a substring of the other, because the assertion these exist for is that
+// Install did not swap its two copy sources: with identical bodies a swap
+// installs the right bytes at both paths and passes.
+func srcBodies() map[string]string {
+	return map[string]string{
+		HelperName: "#!/bin/sh\necho this-is-the-launchdaemon-helper\n",
+		ExecName:   "#!/bin/sh\necho this-is-the-setgid-wrapper\n",
+	}
+}
+
 func fakeSrcDir(t *testing.T) string {
 	t.Helper()
 	d := t.TempDir()
-	for name, body := range map[string]string{
-		HelperName: "#!/bin/sh\necho helper\n",
-		ExecName:   "#!/bin/sh\necho exec\n",
-	} {
-		if err := os.WriteFile(filepath.Join(d, name), []byte(body), 0o755); err != nil {
+	writeSrcDir(t, d, srcBodies())
+	return d
+}
+
+// writeSrcDir fills a source directory. The upgrade path is simulated by
+// calling it a second time with different bodies: that is what `brew upgrade
+// tetherd` does to the directory the next `install` copies from.
+func writeSrcDir(t *testing.T, dir string, bodies map[string]string) {
+	t.Helper()
+	for name, body := range bodies {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return d
+}
+
+// assertInstalledBytes compares an installed file against the bytes it was
+// supposed to be copied from.
+//
+// Nothing else in this file reads either installed binary. Without this,
+// Install can swap its two copy sources, skip the copy entirely when the
+// destination already exists, or copy zero bytes, and every other assertion
+// here still passes - mode, path, the reported InstallResult and the plist
+// are identical in all three cases. All three were confirmed to survive the
+// suite before this existed.
+func assertInstalledBytes(t *testing.T, path, want string) {
+	t.Helper()
+	got := readFile(t, path)
+	if string(got) != want {
+		t.Errorf("%s holds %q, want the %d bytes it was copied from: %q", path, got, len(want), want)
+	}
 }
 
 // fakeSystem stands in for the process runner main.go passes in. It records
@@ -564,6 +598,13 @@ func TestInstallPlacesBothBinariesAndThePlist(t *testing.T) {
 		t.Errorf("%s is mode %v, want 02755", ExecName, est.Mode())
 	}
 
+	// The bytes, not just the paths and the modes. A 0-byte
+	// tetherd-helper is what ProgramArguments[0] would point launchd at,
+	// and the two sources being swapped would give the root LaunchDaemon
+	// the setgid wrapper's bytes and vice versa.
+	assertInstalledBytes(t, res.HelperPath, srcBodies()[HelperName])
+	assertInstalledBytes(t, res.ExecPath, srcBodies()[ExecName])
+
 	// The plist must point at the root-owned copies, not at whatever
 	// directory install happened to be run from: a LaunchDaemon that starts
 	// a binary under the user-writable Homebrew prefix hands that user root.
@@ -617,11 +658,28 @@ func TestInstallIsIdempotentAndUpgradesInPlace(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := readFile(t, first.PlistPath)
+	assertInstalledBytes(t, first.HelperPath, srcBodies()[HelperName])
+	assertInstalledBytes(t, first.ExecPath, srcBodies()[ExecName])
+
+	// What `brew upgrade tetherd` does before the second install: the
+	// source directory now holds different binaries. If Install skips a
+	// copy whose destination already exists, everything else about the
+	// second run still looks right - same result, same plist, same modes,
+	// same launchctl sequence - and the old daemon stays resident, so the
+	// CLI hits the protocol-mismatch error that tells the user to run the
+	// command that just did nothing.
+	upgraded := map[string]string{
+		HelperName: "#!/bin/sh\necho upgraded-launchdaemon-helper\n",
+		ExecName:   "#!/bin/sh\necho upgraded-setgid-wrapper\n",
+	}
+	writeSrcDir(t, src, upgraded)
 
 	second, err := Install(p, alwaysRootOwned, f.run, src)
 	if err != nil {
 		t.Fatalf("the second install failed, so there is no upgrade path: %v", err)
 	}
+	assertInstalledBytes(t, first.HelperPath, upgraded[HelperName])
+	assertInstalledBytes(t, first.ExecPath, upgraded[ExecName])
 	if second != first {
 		t.Errorf("second install reported %+v, first reported %+v", second, first)
 	}
