@@ -1199,6 +1199,19 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 		// surfaces cannot drift again - and so neither prints the whole
 		// managed prefix list on one line.
 		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s · DNS: %s", doctor.FormatPrefixes(cidrs), dnsStatus)
+	} else if len(opts.RemoteDomains) > 0 {
+		// --no-network starts no resolver and writes no /etc/resolver
+		// files, so network.remote_domains has no effect whatsoever: those
+		// names are resolved by this laptop, which for a private hosted
+		// zone or a Cloud Map name is NXDOMAIN rather than the VPC's
+		// answer. Saying nothing is what makes that hard to find - the
+		// config is there, so it reads as working - and the ✓ network line
+		// that would have named the resolver is not printed either.
+		//
+		// One line, and only when there is something to ignore: a config
+		// with no remote_domains has nothing to warn about, and a warning
+		// on every --no-network run would train developers to skip it.
+		logf("⚠ network  --no-network ignores remote_domains (%s); those names resolve on this laptop", strings.Join(opts.RemoteDomains, ", "))
 	}
 
 	// 6. child. The rewritten endpoints reach it through override, so they

@@ -1658,6 +1658,67 @@ func TestRunNoNetworkSkipsTheResolverEvenWithRemoteDomains(t *testing.T) {
 	}
 }
 
+// TestRunNoNetworkWarnsThatItIsIgnoringRemoteDomains is the other half of
+// the test above. Skipping the resolver is right; doing it silently is not.
+// A developer who put network.remote_domains in .tetherd.yml and runs with
+// --no-network gets those names resolved by their laptop - NXDOMAIN for a
+// private hosted zone or a Cloud Map name - with nothing in the output
+// saying so, and the ✓ network line that would have named the resolver is
+// not printed either.
+func TestRunNoNetworkWarnsThatItIsIgnoringRemoteDomains(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"}, agentAddr: ag.addr}
+	opts := ssmOpts("true")
+	opts.RemoteDomains = []string{"myapp.internal", "db.myapp.internal"}
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p)); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	// The whole line, not a substring of it: the mark says whether this is
+	// a warning or a green status, and the domains have to be the ones
+	// that were ignored. A "contains remote_domains" assertion would pass
+	// for a ✓ naming the wrong names.
+	want := "tetherd  ⚠ network  --no-network ignores remote_domains (myapp.internal, db.myapp.internal); those names resolve on this laptop"
+	if got := findLogLine(out.String(), "remote_domains"); got != want {
+		t.Errorf("the warning line is\n  %q\nwant\n  %q", got, want)
+	}
+}
+
+// TestRunNoNetworkSaysNothingWhenThereAreNoRemoteDomains pins the other
+// direction: a config with no remote_domains has nothing being ignored, and
+// a warning printed on every --no-network run is one developers learn to
+// skip past.
+func TestRunNoNetworkSaysNothingWhenThereAreNoRemoteDomains(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"}, agentAddr: ag.addr}
+	opts := ssmOpts("true")
+	if len(opts.RemoteDomains) != 0 {
+		t.Fatal("this test is about a config with no remote_domains")
+	}
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p)); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if got := findLogLine(out.String(), "remote_domains"); got != "" {
+		t.Errorf("nothing may be said about remote_domains when there are none: %q", got)
+	}
+}
+
+// findLogLine returns the one line of a run's output containing want, or ""
+// if no line does. It fails the comparison rather than hiding it when more
+// than one line matches, by returning them joined - a test asserting on one
+// line must not silently pass because it happened to pick the right one of
+// two.
+func findLogLine(log, want string) string {
+	var found []string
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, want) {
+			found = append(found, line)
+		}
+	}
+	return strings.Join(found, " | ")
+}
+
 // --- fakes for the helper and the capturer ---
 
 type fakeHelperClient struct {
