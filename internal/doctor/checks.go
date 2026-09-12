@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"strings"
 
+	"github.com/kyosu-1/tetherd/internal/helper"
 	"github.com/kyosu-1/tetherd/internal/proto"
 	"github.com/kyosu-1/tetherd/internal/transport"
 )
@@ -17,7 +18,10 @@ func CheckHelper(protocol string, dialErr error) Result {
 	if dialErr != nil {
 		r.Status = Fail
 		r.Detail = dialErr.Error()
-		r.Next = "sudo tetherd-helper install  (then: sudo launchctl kickstart -k system/dev.tetherd.helper)"
+		// The label is helper.DaemonLabel's, not a second copy of it:
+		// this line tells the user what to kickstart, and a literal here
+		// would keep printing the old name after a rename.
+		r.Next = "sudo tetherd-helper install  (then: sudo launchctl kickstart -k system/" + helper.DaemonLabel + ")"
 		return r
 	}
 	r.Detail = "answered, protocol " + protocol

@@ -40,7 +40,9 @@ type VersionError struct {
 }
 
 func (e *VersionError) Error() string {
-	return fmt.Sprintf("tetherd-helper speaks protocol %s but this CLI expects %s; run: brew upgrade tetherd && sudo tetherd-helper install  (then: sudo launchctl kickstart -k system/dev.tetherd.helper)", e.Helper, e.CLI)
+	// system/DaemonLabel, not a literal: internal/doctor prints the same
+	// remediation from the same constant.
+	return fmt.Sprintf("tetherd-helper speaks protocol %s but this CLI expects %s; run: brew upgrade tetherd && sudo tetherd-helper install  (then: sudo launchctl kickstart -k system/%s)", e.Helper, e.CLI, DaemonLabel)
 }
 
 // Dial connects and checks the protocol version.

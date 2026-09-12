@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/kyosu-1/tetherd/internal/helper"
@@ -22,6 +23,77 @@ func runCmd(name string, args ...string) (string, error) {
 		return string(out), fmt.Errorf("%s %v: %w: %s", name, args, err, out)
 	}
 	return string(out), nil
+}
+
+// paths is the layout install and uninstall work on: the real filesystem,
+// with the two values a caller can move.
+func paths(socket, installDir string) helper.Paths {
+	if !filepath.IsAbs(installDir) {
+		log.Fatalf("--install-dir %q must be absolute: the plist launchd reads is not relative to anything", installDir)
+	}
+	p := helper.DefaultPaths()
+	p.InstallDir = installDir
+	p.Socket = socket
+	return p
+}
+
+// refuseUnusableFlags fails when the caller typed a flag this subcommand
+// cannot act on. flag.Visit reports only the flags that were actually given,
+// so a flag whose value would be dropped is refused rather than ignored: a
+// flag that silently changes nothing is the same defect as a document that is
+// no longer true.
+func refuseUnusableFlags(sub string, usable ...string) {
+	ok := make(map[string]bool, len(usable))
+	for _, u := range usable {
+		ok[u] = true
+	}
+	var bad []string
+	flag.Visit(func(f *flag.Flag) {
+		if !ok[f.Name] {
+			bad = append(bad, "--"+f.Name)
+		}
+	})
+	if len(bad) > 0 {
+		log.Fatalf("%s cannot act on %s; it takes --%s (the rest apply to the resident daemon)",
+			sub, strings.Join(bad, ", "), strings.Join(usable, ", --"))
+	}
+}
+
+// doInstall places both binaries in a root-owned directory and registers the
+// LaunchDaemon, and prints what it put where: on a first install those lines
+// are the only record of what happened.
+func doInstall(p helper.Paths) {
+	self, err := os.Executable()
+	if err != nil {
+		log.Fatalf("install: cannot find my own path: %v", err)
+	}
+	// Homebrew puts tetherd-helper in its bin as a symlink to the staged
+	// path. Left unresolved, the directory beside it has no tetherd-exec.
+	self, err = filepath.EvalSymlinks(self)
+	if err != nil {
+		log.Fatalf("install: %s: %v", self, err)
+	}
+	res, err := helper.Install(p, helper.OSStatOwner, runCmd, filepath.Dir(self))
+	if err != nil {
+		log.Fatalf("install: %v", err)
+	}
+	log.Printf("group %s: gid %d", helper.GroupName, res.GID)
+	log.Printf("%s: %s", helper.HelperName, res.HelperPath)
+	log.Printf("%s: %s (setgid %s)", helper.ExecName, res.ExecPath, helper.GroupName)
+	log.Printf("plist: %s", res.PlistPath)
+	log.Printf("launchd: bootstrapped system/%s, resident, logging to %s", helper.DaemonLabel, p.LogPath)
+	log.Printf("run this again after every `brew upgrade tetherd`; then: tetherd doctor")
+}
+
+// doUninstall removes the four things spec §8 lists and reports whatever it
+// could not remove, so that the manual steps in docs/uninstall.md are only
+// needed for what is actually left.
+func doUninstall(p helper.Paths) {
+	if err := helper.Uninstall(p, runCmd); err != nil {
+		log.Fatalf("uninstall: %v", err)
+	}
+	log.Printf("removed system/%s, %s, group %s and %s", helper.DaemonLabel, p.PlistPath(), helper.GroupName, p.InstallDirPath())
+	log.Printf("`brew uninstall --cask tetherd` removes the binaries themselves")
 }
 
 func main() {
@@ -44,6 +116,22 @@ func main() {
 	}
 	if os.Geteuid() != 0 {
 		log.Fatal("must run as root (sudo tetherd-helper, or via launchd)")
+	}
+
+	// install and uninstall are one-shot; no arguments means the resident
+	// daemon, which is what launchd starts from the plist install writes.
+	switch sub := flag.Arg(0); sub {
+	case "install":
+		refuseUnusableFlags(sub, "socket", "install-dir")
+		doInstall(paths(*socket, *installDir))
+		return
+	case "uninstall":
+		refuseUnusableFlags(sub, "install-dir")
+		doUninstall(paths(*socket, *installDir))
+		return
+	case "":
+	default:
+		log.Fatalf("unknown subcommand %q (want install, uninstall or version)", sub)
 	}
 
 	gid, err := helper.EnsureGroup(runCmd, helper.GroupName)
