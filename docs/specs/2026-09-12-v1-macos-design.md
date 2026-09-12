@@ -612,6 +612,12 @@ design.md §10 に加えて:
 
 `tetherd env` がタスクの env を**そのまま**出していたため、`eval "$(tetherd env --format shell)"` が開発者のシェルを壊した。実測で `HOME` が `/home/nonroot`、`PATH` がコンテナの `PATH` に置き換わり、v0.2a で Go の子プロセスの TLS を全部壊した `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` もそのまま出ていた。`tetherd run` は同じ変数を除外して注入しているので、**`env` と `run` が違う env を作っていた** — `env` の存在理由（run が注入するものを見る・シェルに取り込む）に反する。`env` も §6.4 の除外・上書きを通すように修正。
 
+### v0.3a（ルート固定と steal）
+
+配線: ALB のターゲットグループを app の `:8081` から agent の `:8080` に移した（`deploy/dev-env/alb.tf` / `ecs.tf` / `rds.tf` の sg-app）。agent は `TETHERD_APP_ADDR=127.0.0.1:8081` で app へリバースプロキシし（§5.1）、`X-Dev-User` / `X-Dev-Token` が一致するリクエストだけを steal してラップトップへ転送する（§5.2）。ヘルスチェックのパスを `/healthz` から `/`・matcher `200` に変更し、agent 経由でも常に app に届くようにした。
+
+検証手順は `docs/e2e-aws.md` の 20〜26 行。**未実施** — Go 側（`internal/agent` の steal、`internal/cli` の `--no-incoming` / `--local-port` / `--as` と `hello` へのトークン同梱）の実装が終わり、`terraform apply` で上記の配線を反映し、agent イメージを再ビルド・再デプロイした後に実施する（本計画の Task 6 Step 4）。結果は実施後にここへ追記する。
+
 ---
 
 ---

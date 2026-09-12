@@ -41,6 +41,18 @@ v0.2b から、cluster / service / profile / region / env は `.tetherd.yml` か
 | 18 | `local_cidrs: [10.0.0.0/8]`（VPC を丸ごと消す）で `$RUN -- true` | `network.local_cidrs excludes the entire remote set` で exit 2（設定の誤りなので usage 扱い） | 設定ミスで捕捉範囲が空になったら黙って起動しない。タスクロールのエンドポイントを足し戻して「1 件あるから OK」にしない |
 | 19 | `$RUN -- python3 -c "import socket,time; t=time.time()\ntry: socket.gethostbyname('nope.myapp.internal')\nexcept socket.gaierror as e: print('gaierror in %.1fs' % (time.time()-t))"` | 1 秒未満で `gaierror` | 存在しない名前が NXDOMAIN として返る。SERVFAIL だと macOS がリトライして数秒待たされる |
 
+v0.3a から、agent は常に ALB のデータパス上に居る（§5.1）。一致するヘッダーが無い限り app への素通しなので、これまでの 0〜19 行の挙動はそのまま変わらない。以下は steal（一致時にラップトップへ届く経路）の確認。
+
+| # | コマンド | 期待 | 確認すること |
+|---|---|---|---|
+| 20 | `$RUN -- <自分のサーバ>` を起動した状態で `curl -H 'X-Dev-User: abe' -H "X-Dev-Token: $(grep token ~/.tetherd/config.yml \| awk '{print $2}')" http://<alb>/` | ラップトップのプロセスの応答。CLI に `← GET / 200 <ms> (from <自分の IP>)` が出る | ALB → agent → yamux → ラップトップが通る |
+| 21 | ヘッダー無しで `curl http://<alb>/` | `sampleapp on ip-10-0-…`（タスクの応答） | 一致しないリクエストは素通し |
+| 22 | トークンを 1 文字変えて `curl` | タスクの応答。ラップトップには来ない | 公開 ALB でユーザー名だけでは届かない |
+| 23 | `$RUN` を Ctrl-C した直後に `curl -H 'X-Dev-User: abe' -H 'X-Dev-Token: …' http://<alb>/` | タスクの応答（502 ではない） | セッション断で即時に素通しへ復帰 |
+| 24 | ラップトップのサーバだけ落として `curl`（`$RUN` は生かす） | タスクの応答。CLI に `502 nothing is listening on 127.0.0.1:8080` | dial 失敗はそのリクエストだけ app にフォールバック |
+| 25 | `$RUN --no-incoming -- sleep 60` 中に一致するヘッダーで `curl` | タスクの応答。CLI に `✓ steal` 行が無い | `--no-incoming` は何も取らない |
+| 26 | ALB のヘルスチェックが 2 分間 healthy のまま | ターゲットが healthy | ヘルスチェックは常に app に届く（agent 経由。§5.1） |
+
 所要時間の目安: `StartSession` → `welcome` まで 2〜4 秒、psql の接続確立 +50〜100 ms。
 
-結果は `docs/specs/2026-09-12-v1-macos-design.md` §12 の 5・6 に追記する。
+結果は `docs/specs/2026-09-12-v1-macos-design.md` §12 の 5・6、および v0.3a の節に追記する。

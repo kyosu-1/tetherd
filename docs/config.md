@@ -34,7 +34,7 @@ network:
   remote_domains: []            # /etc/resolver 経由で agent 側に解決させるドメイン
   remote_services: []           # s3 | dynamodb
   pin_credential_route: false   # env を読まないツールのための逃げ道（下記。マシン全体に効く）
-incoming:                       # v0.3。今は読まれるだけで使われない
+incoming:                       # v0.3a で有効。steal（下記）の受け口
   local_port: 8080
   match:
     header: X-Dev-User
@@ -55,6 +55,7 @@ incoming:                       # v0.3。今は読まれるだけで使われな
 - `network.remote_domains` — このドメインの名前解決を agent に任せる。Cloud Map やプライベートホストゾーンの名前がここに入る
 - `network.remote_services` — `s3` と `dynamodb` のみ。その managed prefix list の範囲をリモート集合に足す
 - `network.pin_credential_route` — 既定 `false`。`169.254.170.2` を lo0 に固定して、env を読まずにこのアドレスを直書きしているツールにもタスクロールを届ける。**マシン全体に効く**ので、必要なときだけ（下記）
+- `incoming` — v0.3a で有効。ALB に届いたリクエストのうち、`incoming.match.header`（既定 `X-Dev-User`）と `incoming.match.token_header`（既定 `X-Dev-Token`）の両方が一致するものだけを `run` 中のラップトップの `incoming.local_port`（既定 `8080`）に転送する（agent 側の steal。spec §5.2）。一致しないリクエストと、ヘッダーの無いヘルスチェック / WebSocket upgrade は常にタスクの app へ素通しする。既定値はこの CLI が適用するもので、`internal/config` 自体は何も既定を持たない（キーを省略すればそのフィールドはゼロ値のまま CLI に渡る）。フラグとの対応は `--no-incoming`（steal を止めて常時素通しにする）、`--local-port <port>`（`incoming.local_port` の上書き）、`--as <user>`（`~/.tetherd/config.yml` の `user` の上書き。一致条件の片方になる）。この配線により agent は誰も繋いでいなくても常に ALB のデータパス上に居続ける（素通しになるだけで、経路から外れるわけではない）ので、ALB のヘルスチェックは常に agent 経由で app に届く必要があり、agent が死ねばヘルスチェックも失敗する — agent の健全性がそのままサービスの健全性になる
 
 ## `~/.tetherd/config.yml`
 
@@ -67,9 +68,13 @@ aws:
   profile: myapp-dev-shota      # 共有設定より強い
 ```
 
-- `user` — agent に名乗る名前。`--user` で上書きできる。ALB から自分宛のリクエストを識別するのにも使う（v0.3）
-- `token` — v0.3 の steal で `X-Dev-Token` として照合される秘密。**ファイルは 0600 で、一度作られたトークンは再生成されない**。手で作ったファイルにトークンが無ければ、他のキーを保ったまま書き足す
+- `user` — agent に名乗る名前（`hello.user` ＝ `X-Dev-User` に載る値）。`--as` で上書きできる。ALB から自分宛のリクエストを識別する steal の一致条件の片方（v0.3a）
+- `token` — steal の一致条件の片方になる秘密。`run` の開始時に `hello` で agent に渡り、`X-Dev-Token` ヘッダーと比較される。**ファイルは 0600 で、一度作られたトークンは再生成されない**。手で作ったファイルにトークンが無ければ、他のキーを保ったまま書き足す。ALB は public なので `X-Dev-User` と `X-Dev-Token` の両方が一致しない限りラップトップには届かない — `user` は秘密ではなく誰でも知り得る名前なので、片方だけでは steal は起きない。**トークンは任意ではなく必須の照合条件**であり、無くても動く利便のための仕組みではない
 - `aws.profile` / `aws.region` — 共有設定の `aws` ブロックを個人的に上書きする。チームで 1 つのアカウントを共有していない場合に使う
+
+### ブラウザから steal を試す
+
+`curl` と違い、ブラウザは `X-Dev-User` / `X-Dev-Token` を自分では付けない。ModHeader のような拡張機能で、dev の ALB のドメインだけに絞ったプロファイルを作り、2 つのヘッダーを常時付与するのが手っ取り早い。プロファイルを他のドメインに広げないこと（`token` はその拡張機能の設定に平文で残るため、dev 用の ALB 以外に漏らす意味も理由も無い）。チームで配るなら、ドメインは書いてもトークンは書かない ModHeader プロファイルを配布し、各自が自分の `~/.tetherd/config.yml` の `token` を値として入れる運用にする。
 
 ### 信頼境界
 

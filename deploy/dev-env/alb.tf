@@ -22,16 +22,22 @@ resource "aws_lb" "this" {
   subnets            = aws_subnet.public[*].id
 }
 
-# v0.2: the target is the app directly. v0.3 moves this to the agent's :8080.
+# The agent is always on the data path: it reverse-proxies to the app on
+# 8081 and steals only requests whose user and token match an attached
+# session. With nobody attached this is a pass-through (spec §5.1).
 resource "aws_lb_target_group" "app" {
   name        = "${var.name}-app"
-  port        = 8081
+  port        = 8080
   protocol    = "HTTP"
   target_type = "ip"
   vpc_id      = aws_vpc.this.id
+
   health_check {
-    path     = "/healthz"
-    interval = 15
+    path                = "/"
+    matcher             = "200"
+    interval            = 15
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
   }
 }
 
