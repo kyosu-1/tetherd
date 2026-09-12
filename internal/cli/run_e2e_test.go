@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -115,17 +116,37 @@ func (f fakeEnvReader) Read(context.Context) (map[string]string, string, error) 
 
 type agentTransport struct{ addr string }
 
-func (a agentTransport) Dial(ctx context.Context, _ transport.Task) (net.Conn, error) {
-	return (&net.Dialer{}).DialContext(ctx, "tcp", a.addr)
+// Dial connects to the one agent this transport was built for, or - when it
+// was built without an address - to the agent the task itself names. The
+// second form is what a multi-task fixture needs: each task has its own
+// agent, and which one a session reaches is the whole question.
+func (a agentTransport) Dial(ctx context.Context, t transport.Task) (net.Conn, error) {
+	addr := a.addr
+	if addr == "" {
+		addr = t.Addr
+	}
+	return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 }
 
 // fakeProvider stands in for AWS.
 type fakeProvider struct {
 	region string
 	task   transport.Task
-	vpc    []netip.Prefix
-	svc    []netip.Prefix
-	// discErr and vpcErr are for later tasks; nothing sets them yet.
+	// tasks is what DiscoverAll answers: a service with more than one
+	// RUNNING task, which is what `tetherd run` attaches to all of. When it
+	// is empty both Discover and DiscoverAll fall back to the single task
+	// above, so every fixture written before v0.3b still means what it did.
+	//
+	// mu guards tasks and discErr, because DiscoverAll is called from the
+	// follower's goroutine as well as the run's: a test that changes the
+	// task list mid-run (a deploy) must do it through setTasks.
+	mu    sync.Mutex
+	tasks []transport.Task
+	vpc   []netip.Prefix
+	svc   []netip.Prefix
+	// discErr fails discovery - both Discover and DiscoverAll - which is
+	// how a test gets "no attachable task" at startup, or a task list that
+	// stops being readable while a run is live.
 	discErr   error
 	vpcErr    error
 	agentAddr string
@@ -165,8 +186,52 @@ type fakeProvider struct {
 var errAlwaysFails = errors.New("simulated AWS failure")
 
 func (f *fakeProvider) Region() string { return f.region }
-func (f *fakeProvider) Discover(context.Context, ecsprov.Target) (transport.Task, error) {
-	return f.task, f.discErr
+func (f *fakeProvider) Discover(ctx context.Context, t ecsprov.Target) (transport.Task, error) {
+	all, err := f.DiscoverAll(ctx, t)
+	if err != nil {
+		return transport.Task{}, err
+	}
+	return all[0], nil
+}
+
+// DiscoverAll answers like the real one: oldest task first, only the pinned
+// task when Target.TaskID names one, and never an empty list with a nil
+// error.
+func (f *fakeProvider) DiscoverAll(_ context.Context, t ecsprov.Target) ([]transport.Task, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.discErr != nil {
+		return nil, f.discErr
+	}
+	all := f.tasks
+	if len(all) == 0 {
+		all = []transport.Task{f.task}
+	}
+	out := make([]transport.Task, 0, len(all))
+	for _, tk := range all {
+		if t.TaskID != "" && tk.ID != t.TaskID {
+			continue
+		}
+		out = append(out, tk)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("task %s is not RUNNING in %s/%s", t.TaskID, t.Cluster, t.Service)
+	}
+	return out, nil
+}
+
+// setTasks and setDiscoverErr are how a test changes what discovery says
+// while a run is live: the follower polls from its own goroutine.
+func (f *fakeProvider) setTasks(tasks ...transport.Task) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tasks = tasks
+}
+
+func (f *fakeProvider) setDiscoverErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.discErr = err
 }
 func (f *fakeProvider) VPCCIDRs(context.Context, string) ([]netip.Prefix, error) {
 	f.vpcCalls++
@@ -608,29 +673,52 @@ func TestRunStripsLocalAWSCredentialsFromTheChild(t *testing.T) {
 // it hands out, so a test can cut the session while the child is still
 // running. Nothing outside Run can arrange that otherwise: the session is
 // built and owned inside it.
+// The connections are kept per task, because with more than one session
+// only one task's is what a rolling deploy takes away at a time.
 type breakableTransport struct {
 	addr  string
 	mu    sync.Mutex
-	conns []net.Conn
+	conns map[string][]net.Conn
 }
 
-func (b *breakableTransport) Dial(ctx context.Context, _ transport.Task) (net.Conn, error) {
-	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", b.addr)
+func (b *breakableTransport) Dial(ctx context.Context, t transport.Task) (net.Conn, error) {
+	addr := b.addr
+	if addr == "" {
+		// A multi-task fixture: each task has its own agent, and the task
+		// says which one (see agentTransport.Dial).
+		addr = t.Addr
+	}
+	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 	b.mu.Lock()
-	b.conns = append(b.conns, c)
+	if b.conns == nil {
+		b.conns = map[string][]net.Conn{}
+	}
+	b.conns[t.ID] = append(b.conns[t.ID], c)
 	b.mu.Unlock()
 	return c, nil
 }
 
-// breakSession closes the transport under the session, which is what the
+// breakSession closes the transport under every session, which is what the
 // CLI sees when the session-manager-plugin dies or the task goes away.
 func (b *breakableTransport) breakSession() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, c := range b.conns {
+	for _, cs := range b.conns {
+		for _, c := range cs {
+			c.Close()
+		}
+	}
+}
+
+// breakTask closes the transport under one task's session only: what a
+// deploy does to one task while the rest of the service keeps serving.
+func (b *breakableTransport) breakTask(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, c := range b.conns[id] {
 		c.Close()
 	}
 }
@@ -1570,6 +1658,67 @@ func TestRunNoNetworkSkipsTheResolverEvenWithRemoteDomains(t *testing.T) {
 	}
 }
 
+// TestRunNoNetworkWarnsThatItIsIgnoringRemoteDomains is the other half of
+// the test above. Skipping the resolver is right; doing it silently is not.
+// A developer who put network.remote_domains in .tetherd.yml and runs with
+// --no-network gets those names resolved by their laptop - NXDOMAIN for a
+// private hosted zone or a Cloud Map name - with nothing in the output
+// saying so, and the ✓ network line that would have named the resolver is
+// not printed either.
+func TestRunNoNetworkWarnsThatItIsIgnoringRemoteDomains(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"}, agentAddr: ag.addr}
+	opts := ssmOpts("true")
+	opts.RemoteDomains = []string{"myapp.internal", "db.myapp.internal"}
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p)); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	// The whole line, not a substring of it: the mark says whether this is
+	// a warning or a green status, and the domains have to be the ones
+	// that were ignored. A "contains remote_domains" assertion would pass
+	// for a ✓ naming the wrong names.
+	want := "tetherd  ⚠ network  --no-network ignores remote_domains (myapp.internal, db.myapp.internal); those names resolve on this laptop"
+	if got := findLogLine(out.String(), "remote_domains"); got != want {
+		t.Errorf("the warning line is\n  %q\nwant\n  %q", got, want)
+	}
+}
+
+// TestRunNoNetworkSaysNothingWhenThereAreNoRemoteDomains pins the other
+// direction: a config with no remote_domains has nothing being ignored, and
+// a warning printed on every --no-network run is one developers learn to
+// skip past.
+func TestRunNoNetworkSaysNothingWhenThereAreNoRemoteDomains(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"}, agentAddr: ag.addr}
+	opts := ssmOpts("true")
+	if len(opts.RemoteDomains) != 0 {
+		t.Fatal("this test is about a config with no remote_domains")
+	}
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p)); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if got := findLogLine(out.String(), "remote_domains"); got != "" {
+		t.Errorf("nothing may be said about remote_domains when there are none: %q", got)
+	}
+}
+
+// findLogLine returns the one line of a run's output containing want, or ""
+// if no line does. It fails the comparison rather than hiding it when more
+// than one line matches, by returning them joined - a test asserting on one
+// line must not silently pass because it happened to pick the right one of
+// two.
+func findLogLine(log, want string) string {
+	var found []string
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, want) {
+			found = append(found, line)
+		}
+	}
+	return strings.Join(found, " | ")
+}
+
 // --- fakes for the helper and the capturer ---
 
 type fakeHelperClient struct {
@@ -2378,4 +2527,1020 @@ func TestRunRow24FallsBackToTheAppOnlyWhenNothingIsListening(t *testing.T) {
 			t.Errorf("the application handled the request %d times, want 0: replaying a POST that already ran is worse than relaying the 502", n)
 		}
 	})
+}
+
+// --- one session per task (v0.3b) ------------------------------------------
+//
+// Until v0.3b `tetherd run` attached to one task while the ALB decided which
+// task a request landed on, so on a service with two tasks roughly half the
+// traffic a developer had asked to steal reached the deployed application
+// instead - silently, with every status line still green. These tests are
+// about that hole and about the two ways a rolling deploy used to close the
+// run: a secondary session ending, and a task appearing that nobody attached
+// to.
+
+// refusingTransport fails every dial, standing in for a task whose SSM port
+// forward cannot be opened at all (no connected exec agent, no
+// session-manager-plugin).
+type refusingTransport struct{}
+
+func (refusingTransport) Dial(context.Context, transport.Task) (net.Conn, error) {
+	return nil, errors.New("simulated forward failure")
+}
+
+// runWithCancel starts Run on its own goroutine under a context the test
+// cancels on its way out, and returns the channel carrying its result plus
+// that cancel.
+//
+// The cleanup waits for the goroutine, not for the result to be read: a test
+// that already took the result must not deadlock in its own cleanup. Waiting
+// at all is what makes it safe for these tests to read Run's log and to hand
+// it a child script - a run still live when the test function returns would
+// otherwise keep polling, keep logging into a buffer the test has finished
+// with, and leave its child looping for the rest of the binary.
+func runWithCancel(t *testing.T, opts RunOptions, out io.Writer, d Deps) (<-chan runResult, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan runResult, 1)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		code, err := RunWithDeps(ctx, opts, out, d)
+		done <- runResult{code: code, err: err}
+	}()
+	t.Cleanup(func() { cancel(); <-stopped })
+	return done, cancel
+}
+
+// reachedWithin is waitFor without the t.Fatal: it reports whether cond
+// came true, for a test that has stronger assertions to make afterwards and
+// must not stop at this one.
+func reachedWithin(d time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return cond()
+}
+
+// pinFollowInterval fixes how often the run re-reads the task list, and
+// restores it when the test ends. Every test here that runs the follower
+// names a value, in one direction or the other, because the production
+// interval is wrong for both kinds of test: too long to wait for when the
+// follower is the thing under test, and short enough to *hide* a missing
+// startup attach when it is not.
+//
+// Measured, and the reason this is not a shortcut: with the production
+// interval (10s, spec §6.2) and a `tasks[:1]` mutation,
+// TestRunAttachesToEveryTaskSoStealCannotMissOne came out 5 FAIL / 3 ok
+// over 8 runs - the follower's first poll and the test's own 10s waits sit
+// on the same boundary, so the test was deciding a coin flip rather than
+// whether the startup attach covered every task.
+func pinFollowInterval(t *testing.T, d time.Duration) {
+	t.Helper()
+	restore := followPollInterval
+	followPollInterval = d
+	t.Cleanup(func() { followPollInterval = restore })
+}
+
+// followNever is an interval no test can reach: a run under it attaches at
+// startup and never polls again, so an assertion that a task is attached
+// can only be satisfied by the attach the test is about.
+const followNever = time.Hour
+
+// followFast is for the tests that are about the poll itself.
+const followFast = 20 * time.Millisecond
+
+// stealingOpts is ssmOpts with steal on. Every test below that asks an
+// agent "is this developer attached to you?" uses it, for two reasons: a
+// session that takes requests is what these tests are actually about (the
+// ALB chooses which task a request lands on), and the agent's registry is
+// the steal routing table, so a session that declares no Incoming is not
+// something a test may assume appears in Sessions().
+//
+// Nothing has to listen on the local port: no request is sent, and
+// stealSettings only checks that the port is a port. The token is what makes
+// a session that takes requests legal at all.
+func stealingOpts(cmd ...string) RunOptions {
+	o := ssmOpts(cmd...)
+	o.NoIncoming = false
+	o.Token = "tok-tester"
+	return o
+}
+
+// --- the duplicate_user retry (v0.3b) --------------------------------------
+//
+// The agent unregisters a session on the goroutine that notices the
+// disconnect, so for a moment after `tetherd run` exits the old session is
+// still registered - measured: still held in 60 of 60 runs at the instant
+// the client returned (see waitDetached). A developer who stops a run and
+// immediately starts another one is refused for a conflict that is already
+// over, and both runs are steal sessions, which is the one case the agent's
+// narrowed one-session-per-user rule still refuses.
+
+// countingTransport is agentTransport that counts its dials. Each attach
+// attempt opens its own connection, so the count is how many helloes were
+// sent - which is what distinguishes "the attach retried" from "the attach
+// got in on its first try". Nothing else a test can observe says that: the
+// real agent does not report the helloes it refused.
+type countingTransport struct {
+	addr string
+	n    atomic.Int64
+}
+
+func (c *countingTransport) Dial(ctx context.Context, t transport.Task) (net.Conn, error) {
+	c.n.Add(1)
+	return agentTransport{addr: c.addr}.Dial(ctx, t)
+}
+
+func (c *countingTransport) dials() int { return int(c.n.Load()) }
+
+// attachOutcome carries dialAgent's two results off the goroutine that ran
+// it. The goroutine touches nothing else of the test's - no t, no logger -
+// because it outlives a failing test by design: t.Fatal from there would
+// call Goexit on that goroutine instead of failing the test, and a late
+// call into a finished t panics the binary.
+type attachOutcome struct {
+	sess *session.Client
+	err  error
+}
+
+// wantDuplicateUser fails unless err carries the agent's duplicate_user
+// refusal. It reads the wire contract itself rather than calling
+// isDuplicateUser: asserting through the production predicate would make
+// the assertion mutate with the thing it is meant to pin - measured, a
+// mutation of that predicate turned this check into a failure about the
+// wrong thing.
+func wantDuplicateUser(t *testing.T, err error) {
+	t.Helper()
+	var rej *session.RejectedError
+	if !errors.As(err, &rej) {
+		t.Fatalf("err = %v, want the agent's refusal (a *session.RejectedError) in the chain", err)
+	}
+	if rej.Err.Code != proto.CodeDuplicateUser {
+		t.Fatalf("refusal code = %q, want %q", rej.Err.Code, proto.CodeDuplicateUser)
+	}
+}
+
+// backgroundAttach runs one dialAgent as a steal session and reports what it
+// returned. ctx is the test's, so a test that gives up does not leave the
+// retry loop running for the rest of the binary.
+func backgroundAttach(ctx context.Context, opts RunOptions, d Deps, p *fakeProvider, task transport.Task) <-chan attachOutcome {
+	done := make(chan attachOutcome, 1)
+	st, err := stealSettings(opts)
+	if err != nil {
+		done <- attachOutcome{err: err}
+		return done
+	}
+	go func() {
+		s, err := dialAgent(ctx, opts, d, p, task, noLog, st.Incoming, func(net.Conn) {})
+		done <- attachOutcome{sess: s, err: err}
+	}()
+	return done
+}
+
+// TestAttachRetriesADuplicateUserRefusalUntilThePreviousSessionCloses is the
+// case the retry exists for: the previous run is still registered, the new
+// one is refused, and the moment the old session goes the new one gets in.
+// Without the retry a developer sees a refusal they can do nothing about
+// except run the same command again.
+func TestAttachRetriesADuplicateUserRefusalUntilThePreviousSessionCloses(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	// The previous run: same user, taking requests, so it is in the
+	// registry and the next steal hello for this name is refused.
+	held := attachAs(t, ag.addr, "tester")
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 1 }, "the previous session to register")
+
+	tr := &countingTransport{addr: ag.addr}
+	task := transport.Task{ID: "t1", SubnetID: "subnet-a"}
+	p := &fakeProvider{region: "r", task: task, tr: tr}
+	// A budget the test never means to exhaust: what ends the refusal here
+	// is the old session closing, not the clock. A short budget would make
+	// this test pass for the wrong reason on a loaded machine.
+	d := Deps{AttachRetryBudget: 30 * time.Second}.withDefaults()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := backgroundAttach(ctx, stealingOpts("true"), d, p, task)
+
+	// A second dial means the first hello was refused and the attach came
+	// back for another go. Asserted before the old session is closed, so
+	// the success below cannot be a first attempt that simply won a race.
+	waitFor(t, func() bool { return tr.dials() >= 2 }, "the refused attach to try again")
+	if got := len(ag.a.Sessions()); got != 1 {
+		t.Fatalf("the agent holds %d sessions while the attach is being refused, want only the previous run's", got)
+	}
+	select {
+	case o := <-done:
+		t.Fatalf("the attach must not finish while the previous session is held: sess=%v err=%v", o.sess != nil, o.err)
+	default:
+	}
+
+	held.Close()
+	select {
+	case o := <-done:
+		if o.err != nil {
+			t.Fatalf("the attach must succeed once the previous session closes, got %v (dials=%d)", o.err, tr.dials())
+		}
+		o.sess.Close()
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the attach never completed after the previous session closed (dials=%d)", tr.dials())
+	}
+}
+
+// TestAttachGivesUpOnADuplicateUserRefusalWithAnActionableError is the other
+// half: the retry must not weaken the rule. A second steal session for one
+// user is still refused - just later - and what a developer reads has to
+// say that the wait happened and what to do next, because "retry in a
+// moment" (the agent's own wording) is advice this CLI has already taken.
+func TestAttachGivesUpOnADuplicateUserRefusalWithAnActionableError(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	attachAs(t, ag.addr, "tester") // held for the whole test: a genuine conflict
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 1 }, "the conflicting session to register")
+
+	tr := &countingTransport{addr: ag.addr}
+	task := transport.Task{ID: "t1", SubnetID: "subnet-a"}
+	p := &fakeProvider{region: "r", task: task, tr: tr}
+	const budget = 200 * time.Millisecond
+	d := Deps{AttachRetryBudget: budget}.withDefaults()
+
+	start := time.Now()
+	o := <-backgroundAttach(context.Background(), stealingOpts("true"), d, p, task)
+	elapsed := time.Since(start)
+	if o.err == nil {
+		o.sess.Close()
+		t.Fatal("a second steal session for the same user must still be refused")
+	}
+	// The refusal itself survives the wrapping: the code is what the other
+	// commands match on (statusReason reads it through errors.As), and a
+	// retry that turned it into some other error would break them.
+	wantDuplicateUser(t, o.err)
+	if n := tr.dials(); n < 2 {
+		t.Fatalf("dials = %d, want the attach to have tried again before giving up", n)
+	}
+	// Each assertion names one thing a developer needs: that the wait
+	// happened and for how long, and the two ways out. Checked
+	// individually rather than as one line, so a reworded message fails on
+	// the part that went missing.
+	for _, want := range []string{`attach as "tester"`, "for " + budget.String(), "--user"} {
+		if !strings.Contains(o.err.Error(), want) {
+			t.Errorf("the give-up error must carry %q, got: %v", want, o.err)
+		}
+	}
+	// The injected budget is what bounds the wait. Without this, a retry
+	// that ignored Deps and used DefaultAttachRetryBudget would pass every
+	// assertion above while taking ten times as long here and two seconds
+	// in front of every refused developer.
+	if elapsed > time.Second {
+		t.Errorf("gave up after %s, want about the injected %s: the budget must be what bounds the retry", elapsed, budget)
+	}
+}
+
+// TestAttachUsesTheDefaultBudgetWhenNothingInjectsOne pins the wiring,
+// which is a different claim from "the retry works". Production does the
+// opposite of what the two tests above do: run.go, env.go, status.go and
+// doctor.go each build a Deps that names no budget, so what those four get
+// is DefaultAttachRetryBudget - and nothing was reading it. Measured on
+// this branch: `const DefaultAttachRetryBudget = 0 * time.Second` compiled,
+// was gofmt-clean, and left `go test -race ./internal/cli/` green while
+// disabling the retry for every real command.
+func TestAttachUsesTheDefaultBudgetWhenNothingInjectsOne(t *testing.T) {
+	// The brief's two seconds, asserted in one place: long enough to cover
+	// the window the agent's unregister leaves open, short enough that a
+	// genuine conflict is still reported promptly.
+	if DefaultAttachRetryBudget != 2*time.Second {
+		t.Errorf("DefaultAttachRetryBudget = %s, want 2s", DefaultAttachRetryBudget)
+	}
+
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	attachAs(t, ag.addr, "tester") // held for the whole test: a genuine conflict
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 1 }, "the conflicting session to register")
+
+	tr := &countingTransport{addr: ag.addr}
+	task := transport.Task{ID: "t1", SubnetID: "subnet-a"}
+	p := &fakeProvider{region: "r", task: task, tr: tr}
+	// Deps{}.withDefaults() and nothing else - the Deps every command hands
+	// dialAgent. Naming a budget here is the one thing that would make this
+	// test unable to fail.
+	d := Deps{}.withDefaults()
+
+	start := time.Now()
+	o := <-backgroundAttach(context.Background(), stealingOpts("true"), d, p, task)
+	elapsed := time.Since(start)
+	if o.err == nil {
+		o.sess.Close()
+		t.Fatal("a second steal session for the same user must still be refused")
+	}
+	wantDuplicateUser(t, o.err)
+	if n := tr.dials(); n < 2 {
+		t.Errorf("dials = %d, want an attach that injected no budget to retry anyway", n)
+	}
+	// Against literals, not against the constant: `elapsed >=
+	// DefaultAttachRetryBudget` is satisfied by a constant of zero, which
+	// is the mutation this test exists to catch.
+	if elapsed < 1500*time.Millisecond {
+		t.Errorf("gave up after %s; with nothing injected the wait is the default two seconds", elapsed)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("waited %s, far longer than a refused developer should", elapsed)
+	}
+}
+
+// TestReadOnlyAttachIsNotRetried pins the scope of the retry. `tetherd
+// status` and `tetherd doctor` attach read-only, which the agent does not
+// register and so never refuses for being a second session; a refusal they
+// do see comes from an agent older than that rule, which is holding a live
+// run. Retrying there would spend a doctor check's whole bound, and delay
+// the row `status` prints, to cover a case a wait almost never fixes.
+func TestReadOnlyAttachIsNotRetried(t *testing.T) {
+	refusing := &refusingAgentHandler{err: proto.Error{
+		Code:    proto.CodeDuplicateUser,
+		Message: `another session for user "tester" is already attached`,
+	}}
+	tr := &countingTransport{addr: startFakeAgent(t, refusing)}
+	task := transport.Task{ID: "t1", SubnetID: "subnet-a"}
+	p := &fakeProvider{region: "r", task: task, tr: tr}
+	// Long enough that a retry here would be unmistakable, short enough
+	// that this test failing does not cost half a minute.
+	d := Deps{AttachRetryBudget: 5 * time.Second}.withDefaults()
+
+	start := time.Now()
+	sess, err := dialAgent(context.Background(), ssmOpts("true"), d, p, task, noLog, proto.Incoming{}, nil)
+	if err == nil {
+		sess.Close()
+		t.Fatal("this agent refuses every hello")
+	}
+	wantDuplicateUser(t, err)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("a read-only attach waited %s on a refusal, want it reported at once", elapsed)
+	}
+	if n := tr.dials(); n != 1 {
+		t.Errorf("dials = %d, want exactly one: a read-only attach must not retry", n)
+	}
+}
+
+// --- sessionLoss, the "every session is gone" decision ---------------------
+//
+// The interleaving these two tests cannot reach is the one inside watch: a
+// report published between the decrement releasing the lock and the send.
+// That is why the send happens under the lock rather than after it, and it
+// needs a synchronisation hook in production code to exercise, which is not
+// worth having. What these do pin is the same invariant from the outside -
+// a report exists only while every watched session is dead - in the two
+// orderings a deploy actually produces.
+
+func TestSessionLossSaysNothingUntilTheLastSessionEnds(t *testing.T) {
+	// One of two sessions dying is a rolling deploy doing its job; the run
+	// must hear nothing about it.
+	ag1 := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	ag2 := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	l := newSessionLoss()
+	s1, s2 := dialInto(t, ag1, "one"), dialInto(t, ag2, "two")
+	l.watch(s1)
+	l.watch(s2)
+
+	s1.Close()
+	<-s1.Done()
+	if reachedWithin(300*time.Millisecond, func() bool { return len(l.ch) > 0 }) {
+		t.Fatal("one session of two ended and the run was told everything was gone")
+	}
+
+	s2.Close()
+	<-s2.Done()
+	if !reachedWithin(10*time.Second, func() bool { return len(l.ch) > 0 }) {
+		t.Fatal("every session ended and the run was never told")
+	}
+}
+
+func TestSessionLossForgetsItsReportWhenASessionComesBack(t *testing.T) {
+	// The last session died and the follower re-attached: the run reads
+	// that channel exactly once and ends on whatever it finds, so a report
+	// left over from before the re-attach would end a run that has a
+	// working session.
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	l := newSessionLoss()
+	s1 := dialInto(t, ag, "one")
+	l.watch(s1)
+	s1.Close()
+	// len, not a receive: the report has to still be there for the next
+	// step to mean anything.
+	waitFor(t, func() bool { return len(l.ch) > 0 }, "the report that every session has ended")
+
+	l.watch(dialInto(t, ag, "two"))
+	if len(l.ch) != 0 {
+		t.Fatal("the report survived a re-attach; the run would end while a live session is attached")
+	}
+}
+
+// deployingTransport dials each task's own agent, and on the dial after the
+// first one it hands control to the test: the test kills the session that
+// dial already produced, then lets this one fail. That is a rolling deploy
+// stopping the task a run has just attached to while the next forward is
+// still being set up - an SSM StartSession, a plugin launch and a handshake,
+// seconds on a real task.
+type deployingTransport struct {
+	mu      sync.Mutex
+	conns   []net.Conn
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (d *deployingTransport) Dial(ctx context.Context, t transport.Task) (net.Conn, error) {
+	d.mu.Lock()
+	first := len(d.conns) == 0
+	d.mu.Unlock()
+	if !first {
+		d.once.Do(func() { close(d.reached) })
+		<-d.release
+		return nil, errors.New("the task was stopped while its forward was being set up")
+	}
+	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", t.Addr)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	d.conns = append(d.conns, c)
+	d.mu.Unlock()
+	return c, nil
+}
+
+// breakFirst cuts the session the first dial produced.
+func (d *deployingTransport) breakFirst() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, c := range d.conns {
+		c.Close()
+	}
+}
+
+func TestRunFailsWhenEverySessionDiesDuringTheAttach(t *testing.T) {
+	// The set is not empty and yet has no live session: SessionSet.Primary
+	// skips a session whose Done has fired, so it answers nil while Len is
+	// still 1. A run that read its primary unchecked would panic on the nil
+	// exactly where the developer has to be told that their deploy outran
+	// the attach - and it needs no follower to get there, only the seconds
+	// two forwards take.
+	pinFollowInterval(t, followNever)
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	tr := &deployingTransport{reached: make(chan struct{}), release: make(chan struct{})}
+	p := &fakeProvider{region: "r", tasks: []transport.Task{
+		{ID: "older", StartedAt: time.Unix(1000, 0), Addr: ag.addr},
+		{ID: "newer", StartedAt: time.Unix(2000, 0), Addr: ag.addr},
+	}, tr: tr}
+
+	var out safeLog
+	done, _ := runWithCancel(t, stealingOpts("sleep", "30"), &out, depsFor(p))
+	select {
+	case <-tr.reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the second task was never dialed; this test proves nothing")
+	}
+	tr.breakFirst()
+	// The agent unregistering is the sequencing point: the session the run
+	// is holding is provably gone before the second dial is allowed to
+	// fail, so the set the run then reads holds one dead entry and nothing
+	// else.
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 0 }, "the first task's session to end")
+	close(tr.release)
+
+	select {
+	case r := <-done:
+		if r.code != 1 || r.err == nil {
+			t.Fatalf("a run with no live session must fail: code=%d err=%v\n%s", r.code, r.err, out.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never returned")
+	}
+	if strings.Contains(out.String(), "▶ ") {
+		t.Errorf("the child must not run with no live session:\n%s", out.String())
+	}
+}
+
+func TestTargetLine(t *testing.T) {
+	// Every byte of this line is read by someone: the one-task form is what
+	// `tetherd env` and `tetherd doctor` print, and the plural form is
+	// spec §6.3 / docs/design.md §5. The cases below pin the two forms, the
+	// two-space separators, the age clause and - the one a reader will not
+	// think of - that there is no age clause at all when the task has no
+	// StartedAt, which is every task that reached this line without a
+	// DescribeTasks behind it. Without that case, dropping the guard prints
+	// "(started 497006h23m0s ago)" and no test notices.
+	//
+	// The age clause is startedAgo's, the same renderer status.go's task
+	// rows use: one `tetherd status` prints both about the same task, and
+	// two spellings of one age on one screen read as two different ages.
+	opts := RunOptions{Cluster: "tetherd-dev", Service: "api"}
+	started := time.Now().Add(-14 * time.Minute)
+	long, other, third := "fbc1abc4-1111", "a17e1234-2222", "c0ffee00-3333"
+	for _, tc := range []struct {
+		name  string
+		tasks []transport.Task
+		want  string
+	}{
+		{
+			name:  "one task, no start time",
+			tasks: []transport.Task{{ID: long}},
+			want:  "tetherd-dev/api  task fbc1abc4…",
+		},
+		{
+			name:  "one task",
+			tasks: []transport.Task{{ID: long, StartedAt: started}},
+			want:  "tetherd-dev/api  task fbc1abc4…  (started 14m ago)",
+		},
+		{
+			name: "two tasks",
+			tasks: []transport.Task{
+				{ID: long, StartedAt: started},
+				{ID: other, StartedAt: time.Now().Add(-time.Minute)},
+			},
+			want: "tetherd-dev/api  2 tasks (fbc1abc4… primary, a17e1234…)  (started 14m ago)",
+		},
+		{
+			name:  "two tasks, no start time",
+			tasks: []transport.Task{{ID: long}, {ID: other}},
+			want:  "tetherd-dev/api  2 tasks (fbc1abc4… primary, a17e1234…)",
+		},
+		{
+			name: "three tasks",
+			tasks: []transport.Task{
+				{ID: long, StartedAt: started},
+				{ID: other, StartedAt: time.Now().Add(-2 * time.Minute)},
+				{ID: third, StartedAt: time.Now().Add(-time.Minute)},
+			},
+			want: "tetherd-dev/api  3 tasks (fbc1abc4… primary, a17e1234…, c0ffee00…)  (started 14m ago)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := targetLine(opts, tc.tasks); got != tc.want {
+				t.Errorf("targetLine =\n  %q\nwant\n  %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// gatedProvider is a fakeProvider whose task-list reads after the first one
+// signal and then block until the test releases them, so a test can hold one
+// of the follower's polls open and ask what the run does about it.
+//
+// The first read is the run's own discovery (discoverTasks), which must not
+// be held or nothing would start.
+type gatedProvider struct {
+	*fakeProvider
+	calls   atomic.Int32
+	held    chan struct{} // closed when a poll is first being held
+	release chan struct{} // closed by the test
+	once    sync.Once
+}
+
+func newGatedProvider(p *fakeProvider) *gatedProvider {
+	return &gatedProvider{fakeProvider: p, held: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *gatedProvider) DiscoverAll(ctx context.Context, t ecsprov.Target) ([]transport.Task, error) {
+	if g.calls.Add(1) > 1 {
+		g.once.Do(func() { close(g.held) })
+		<-g.release
+	}
+	return g.fakeProvider.DiscoverAll(ctx, t)
+}
+
+func TestRunWaitsForTheTaskListPollItStarted(t *testing.T) {
+	// The follower's attach runs inside its poll, so a poll in flight when
+	// the run ends can open a session after the set has been closed: that
+	// session is never closed, the agent keeps this developer registered on
+	// a task nobody is using, and the next `tetherd run` is refused with
+	// duplicate_user. Run therefore waits for the poll it started.
+	//
+	// The gate holds a poll open and the assertion is that RunWithDeps has
+	// not returned while it is held.
+	pinFollowInterval(t, followFast)
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	g := newGatedProvider(&fakeProvider{region: "r", tasks: []transport.Task{
+		{ID: "older", StartedAt: time.Unix(1000, 0), Addr: ag.addr},
+	}})
+	d := Deps{NewAWSProvider: func(context.Context, RunOptions) (awsProvider, error) { return g, nil }}
+
+	var out safeLog
+	done, cancel := runWithCancel(t, ssmOpts("sleep", "30"), &out, d)
+	waitFor(t, func() bool { return strings.Contains(out.String(), "▶ ") }, "the child to start")
+	select {
+	case <-g.held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no poll was ever held; the follower is not reading the task list")
+	}
+
+	cancel()
+	select {
+	case r := <-done:
+		t.Fatalf("the run returned (code=%d err=%v) while a task-list poll was still in flight; the session that poll may be opening would be stranded at the agent\n%s", r.code, r.err, out.String())
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	close(g.release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never returned after the poll was released")
+	}
+}
+
+func TestRunAttachesToEveryTaskSoStealCannotMissOne(t *testing.T) {
+	// desired_count = 2: the ALB picks which task a request lands on, so a
+	// run attached to one of them silently misses half the traffic. This is
+	// the defect v0.3b exists to fix, so the assertion is the developer's
+	// own: a request arriving at *either* task reaches their process.
+	//
+	// The poll is pinned out of reach (see pinFollowInterval): what has to
+	// work here is the attach at startup, and with a reachable interval the
+	// follower catching up one poll later would satisfy every assertion
+	// below just as well.
+	pinFollowInterval(t, followNever)
+	port := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "LOCAL %s", r.URL.Path)
+	}))
+	older := startStealAgent(t)
+	newer := startStealAgent(t)
+	p := &fakeProvider{
+		region: "ap-northeast-1",
+		tasks: []transport.Task{
+			{ID: "older", SubnetID: "subnet-a", StartedAt: time.Unix(1000, 0), Addr: older.addr},
+			{ID: "newer", SubnetID: "subnet-a", StartedAt: time.Unix(2000, 0), Addr: newer.addr},
+		},
+	}
+	opts := ssmOpts("sleep", "30")
+	opts.NoIncoming = false
+	opts.LocalPort = port
+	opts.User = "shota"
+	opts.Token = "tok-shota"
+	var out safeLog
+	done, cancel := runWithCancel(t, opts, &out, depsFor(p))
+
+	for _, tk := range []struct {
+		id string
+		ag *stealAgent
+	}{{"older", older}, {"newer", newer}} {
+		// waitAttached fails the test if this task never got a session,
+		// which is exactly what attaching to tasks[0] alone would do.
+		hello := tk.ag.waitAttached(t)
+		if hello.User != "shota" || !hello.Incoming.Enabled || hello.Token != "tok-shota" {
+			t.Errorf("task %s was told user=%q incoming=%+v (token carried: %v); every task has to be told what to steal, because the ALB chooses which one gets the request",
+				tk.id, hello.User, hello.Incoming, hello.Token == "tok-shota")
+		}
+		resp, perr := tk.ag.steal(t, devRequest("GET", "/api/orders", "shota", "tok-shota"))
+		if perr != nil {
+			t.Fatalf("the CLI refused the stream from task %s: %+v", tk.id, perr)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 || !strings.Contains(string(b), "LOCAL /api/orders") {
+			t.Fatalf("a request that arrived at task %s did not reach the developer's process: status=%d body=%s", tk.id, resp.StatusCode, b)
+		}
+	}
+
+	waitFor(t, func() bool { return strings.Contains(out.String(), "▶ ") }, "the child to start")
+	if l := out.String(); !strings.Contains(l, "c/api  2 tasks (older primary, newer)") {
+		t.Errorf("the status line must say how many tasks are attached and which one is the primary:\n%s", l)
+	}
+	cancel()
+	r := <-done
+	if r.err != nil {
+		t.Errorf("the run was ended by its context, so it must report no failure: code=%d err=%v\n%s", r.code, r.err, out.String())
+	}
+	if strings.Contains(out.String(), "agent session lost") {
+		t.Errorf("no session died, so nothing may report one lost:\n%s", out.String())
+	}
+}
+
+func TestRunSurvivesASecondaryTaskGoingAway(t *testing.T) {
+	// A rolling deploy replaces tasks one at a time. Losing a secondary
+	// must not end the run - before v0.3b any session loss did, so a deploy
+	// killed the developer's session (and their child process with it)
+	// halfway through.
+	//
+	// The child ignores SIGINT and blocks until this test releases it, so
+	// whether the run ended is decided by files and by its result, not by a
+	// sleep race. The poll is pinned out of reach for two reasons: the
+	// secondary must be attached by the startup attach for its loss to mean
+	// anything, and a follower that re-attached it would leave the run
+	// surviving for a reason this test is not about.
+	pinFollowInterval(t, followNever)
+	primary := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	secondary := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	tr := &breakableTransport{} // no addr: each task's own Addr is dialed
+	p := &fakeProvider{
+		region: "r",
+		tasks: []transport.Task{
+			{ID: "older", StartedAt: time.Unix(1000, 0), Addr: primary.addr},
+			{ID: "newer", StartedAt: time.Unix(2000, 0), Addr: secondary.addr},
+		},
+		tr: tr,
+	}
+
+	dir := t.TempDir()
+	started, release, finished := filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "finished")
+	script := writeChildScript(t, "echo up > "+started+"\n"+
+		"while [ ! -f "+release+" ]; do sleep 0.05; done\n"+
+		"echo done > "+finished+"\n")
+
+	var out safeLog
+	done, _ := runWithCancel(t, stealingOpts("/bin/sh", script), &out, depsFor(p))
+
+	waitFor(t, func() bool { return len(secondary.a.Sessions()) == 1 }, "the secondary task to be attached")
+	waitForFile(t, started)
+
+	tr.breakTask("newer")
+	// Wait for the loss to have actually happened before asserting anything
+	// about it: the agent unregisters when it notices its connection is
+	// gone, so this is the point where the secondary is provably dead
+	// rather than probably.
+	waitFor(t, func() bool { return len(secondary.a.Sessions()) == 0 }, "the secondary's session to end")
+
+	select {
+	case r := <-done:
+		t.Fatalf("the run ended when a secondary task went away (code=%d err=%v); a rolling deploy does this to every task in turn\n%s", r.code, r.err, out.String())
+	case <-time.After(300 * time.Millisecond):
+	}
+	if _, err := os.Stat(finished); err == nil {
+		t.Fatal("the child finished on its own; this test proves nothing")
+	}
+	if err := os.WriteFile(release, []byte("go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.code != 0 || r.err != nil {
+			t.Errorf("the run must end with its child and nothing else: code=%d err=%v\n%s", r.code, r.err, out.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never returned after the child finished")
+	}
+	if strings.Contains(out.String(), "agent session lost") {
+		t.Errorf("losing one task of two is not losing the session:\n%s", out.String())
+	}
+}
+
+func TestRunFailsWhenNoTaskCanBeAttached(t *testing.T) {
+	// Unchanged behaviour: zero sessions is still fatal. Attaching to every
+	// task must not turn "nothing answered" into a run that carries on with
+	// no session at all.
+	t.Run("discovery finds none", func(t *testing.T) {
+		p := &fakeProvider{region: "r", discErr: &ecsprov.NotReadyError{
+			Reasons: []string{"task t1: ECS Exec is disabled"},
+		}}
+		code, err := RunWithDeps(context.Background(), ssmOpts("true"), io.Discard, depsFor(p))
+		if code != 1 || err == nil || !strings.Contains(err.Error(), "ECS Exec is disabled") {
+			t.Fatalf("code=%d err=%v, want the discovery failure and exit 1", code, err)
+		}
+	})
+	t.Run("every task refuses the session", func(t *testing.T) {
+		p := &fakeProvider{
+			region: "r",
+			tasks: []transport.Task{
+				{ID: "older", StartedAt: time.Unix(1000, 0)},
+				{ID: "newer", StartedAt: time.Unix(2000, 0)},
+			},
+			tr: refusingTransport{},
+		}
+		var out strings.Builder
+		code, err := RunWithDeps(context.Background(), ssmOpts("true"), &out, depsFor(p))
+		if code != 1 || err == nil || !strings.Contains(err.Error(), "connect to agent") {
+			t.Fatalf("code=%d err=%v, want the dial failure and exit 1\n%s", code, err, out.String())
+		}
+		// Both failures are named: a developer whose run died has to see
+		// that it was not one task's problem.
+		for _, id := range []string{"older", "newer"} {
+			if !strings.Contains(out.String(), "task "+id+" could not be attached") {
+				t.Errorf("task %s's failure is not in the log:\n%s", id, out.String())
+			}
+		}
+		if strings.Contains(out.String(), "▶ ") {
+			t.Errorf("the child must not run with no session:\n%s", out.String())
+		}
+	})
+}
+
+func TestRunFollowsADeployByAttachingToANewTask(t *testing.T) {
+	// A deploy adds a task after the run started. The ALB will send it
+	// requests whether or not tetherd noticed, so the run has to attach to
+	// it while it is live - which is the follower, running inside Run.
+	pinFollowInterval(t, followFast)
+	first := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	second := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	older := transport.Task{ID: "older", StartedAt: time.Unix(1000, 0), Addr: first.addr}
+	newer := transport.Task{ID: "newer", StartedAt: time.Unix(2000, 0), Addr: second.addr}
+	p := &fakeProvider{region: "r", tasks: []transport.Task{older}}
+
+	var out safeLog
+	done, cancel := runWithCancel(t, stealingOpts("sleep", "30"), &out, depsFor(p))
+	waitFor(t, func() bool { return len(first.a.Sessions()) == 1 }, "the service's only task to be attached")
+
+	// The one-task status line is what `tetherd env`, `tetherd doctor` and
+	// the AWS e2e script read, and one task must not print the plural form.
+	if l := out.String(); !strings.Contains(l, "c/api  task older  (started ") {
+		t.Errorf("the one-task status line changed shape:\n%s", l)
+	}
+	if l := out.String(); strings.Contains(l, "tasks (") {
+		t.Errorf("one task must not be reported as several:\n%s", l)
+	}
+
+	p.setTasks(older, newer)
+	waitFor(t, func() bool { return len(second.a.Sessions()) == 1 }, "the task that appeared to be attached")
+	waitFor(t, func() bool { return strings.Contains(out.String(), "task newer attached") }, "the line naming the task that appeared")
+
+	cancel()
+	r := <-done
+	if r.err != nil {
+		t.Errorf("the run was ended by its context, so it must report no failure: code=%d err=%v\n%s", r.code, r.err, out.String())
+	}
+}
+
+// TestRunSurvivesADeployThatReplacesEveryTaskItAttachedTo is v0.3b's
+// headline property end to end: a rolling deploy stops every task the run
+// attached to at startup, and the run carries on through the sessions the
+// follower opened to the replacements.
+//
+// It exists because that property hangs on one line of run.go - loss.watch
+// in the Follower's Attach closure - and nothing travelled it. Measured:
+// deleting that line left `go test -race ./internal/cli/` green, while in
+// production the sessions the follower opens go uncounted, so the moment the
+// last startup session dies - which a rolling deploy guarantees, because it
+// replaces every task in turn - the run ends with "agent session lost" while
+// live sessions to the replacement tasks are attached. That is the v0.3a
+// failure this change exists to remove (plan completion condition 3).
+//
+// The three tests that look like they cover it each stop one step short, and
+// deliberately: TestRunSurvivesASecondaryTaskGoingAway pins the poll out of
+// reach so the session lost is one the *startup* attach opened,
+// TestRunFollowsADeployByAttachingToANewTask never kills the old task, and
+// TestSessionLossForgetsItsReportWhenASessionComesBack calls l.watch itself
+// and so cannot see whether run.go wires it. So here the follower has to do
+// the attach - through RunWithDeps, not through a Follower this test builds -
+// and every session the startup attach opened has to be gone afterwards.
+func TestRunSurvivesADeployThatReplacesEveryTaskItAttachedTo(t *testing.T) {
+	pinFollowInterval(t, followFast)
+	first := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	second := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	third := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	older := transport.Task{ID: "older", StartedAt: time.Unix(1000, 0), Addr: first.addr}
+	newer := transport.Task{ID: "newer", StartedAt: time.Unix(2000, 0), Addr: second.addr}
+	newest := transport.Task{ID: "newest", StartedAt: time.Unix(3000, 0), Addr: third.addr}
+	tr := &breakableTransport{} // no addr: each task's own Addr is dialed
+	p := &fakeProvider{region: "r", tasks: []transport.Task{older, newer}, tr: tr}
+
+	// The child ignores SIGINT and blocks until this test releases it, so
+	// whether the run is still alive is decided by files and by its result
+	// rather than by a sleep race: a run that ended cancelled its context
+	// on the way out and the child died with it.
+	dir := t.TempDir()
+	started, release, finished := filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "finished")
+	script := writeChildScript(t, "echo up > "+started+"\n"+
+		"while [ ! -f "+release+" ]; do sleep 0.05; done\n"+
+		"echo done > "+finished+"\n")
+
+	var out safeLog
+	done, _ := runWithCancel(t, stealingOpts("/bin/sh", script), &out, depsFor(p))
+	waitFor(t, func() bool { return len(first.a.Sessions()) == 1 && len(second.a.Sessions()) == 1 }, "both of the service's tasks to be attached at startup")
+	waitForFile(t, started)
+
+	// The deploy, in the order ECS does it: the replacement is RUNNING and
+	// listed before the tasks it replaces go away. The follower's own log
+	// line is waited for as well as the session, because the startup attach
+	// cannot have produced that line - past this point the replacement's
+	// session provably came from the Attach closure under test.
+	p.setTasks(older, newer, newest)
+	waitFor(t, func() bool { return len(third.a.Sessions()) == 1 }, "the follower to attach to the task the deploy added")
+	waitFor(t, func() bool { return strings.Contains(out.String(), "task newest attached") }, "the follower's line naming the task it attached")
+
+	// Now every task the run started with goes away: dropped from the
+	// service and its forward cut, which are the two halves of what a
+	// stopped task does to a session. Both, so that neither the Retain nor
+	// the Reap path is what this depends on.
+	p.setTasks(newest)
+	tr.breakTask("older")
+	tr.breakTask("newer")
+	waitFor(t, func() bool { return len(first.a.Sessions()) == 0 && len(second.a.Sessions()) == 0 }, "both startup sessions to end")
+
+	// The assertion that names the bug, and the fast one: sessionLoss
+	// publishes the instant the last session it counted dies, so a
+	// replacement that was never counted shows up here in milliseconds.
+	if reachedWithin(500*time.Millisecond, func() bool { return strings.Contains(out.String(), "agent session lost") }) {
+		t.Fatalf("the run reported every session lost while it was attached to task newest; a rolling deploy does this to every task in turn, so this ends every run that outlives a deploy\n%s", out.String())
+	}
+	select {
+	case r := <-done:
+		t.Fatalf("the run ended when the deploy replaced the tasks it started with (code=%d err=%v)\n%s", r.code, r.err, out.String())
+	default:
+	}
+	if _, err := os.Stat(finished); err == nil {
+		t.Fatal("the child finished on its own; this test proves nothing")
+	}
+	if n := len(third.a.Sessions()); n != 1 {
+		t.Fatalf("the replacement task holds %d sessions, want the one the run is carrying on through\n%s", n, out.String())
+	}
+
+	if err := os.WriteFile(release, []byte("go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.code != 0 || r.err != nil {
+			t.Errorf("the run must end with its child and nothing else: code=%d err=%v\n%s", r.code, r.err, out.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never returned after the child finished")
+	}
+	if strings.Contains(out.String(), "agent session lost") {
+		t.Errorf("every task the run attached to at startup went away, but it was attached to their replacement throughout:\n%s", out.String())
+	}
+}
+
+func TestRunPinnedToOneTaskAttachesToThatTaskOnly(t *testing.T) {
+	// --task ID is how a developer debugs one task of several - the point
+	// of it is that the other tasks are left alone, so neither the attach
+	// at startup nor the follower may reach them.
+	pinFollowInterval(t, followFast)
+	pinned := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	other := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{region: "r", tasks: []transport.Task{
+		{ID: "older", StartedAt: time.Unix(1000, 0), Addr: other.addr},
+		{ID: "newer", StartedAt: time.Unix(2000, 0), Addr: pinned.addr},
+	}}
+	opts := stealingOpts("sleep", "30")
+	opts.TaskID = "newer"
+	var out safeLog
+	done, cancel := runWithCancel(t, opts, &out, depsFor(p))
+
+	waitFor(t, func() bool { return len(pinned.a.Sessions()) == 1 }, "the pinned task to be attached")
+	// Several poll intervals of the follower not attaching the other task.
+	if reachedWithin(300*time.Millisecond, func() bool { return len(other.a.Sessions()) > 0 }) {
+		t.Errorf("--task newer attached to task older as well:\n%s", out.String())
+	}
+	if l := out.String(); !strings.Contains(l, "c/api  task newer  (started ") {
+		t.Errorf("a pinned run is a one-task run and says so:\n%s", l)
+	}
+	cancel()
+	if r := <-done; r.err != nil {
+		t.Errorf("the run was ended by its context, so it must report no failure: code=%d err=%v\n%s", r.code, r.err, out.String())
+	}
+}
+
+func TestRunKeepsItsSessionsWhenTheTaskListCannotBeRead(t *testing.T) {
+	// A throttled ListTasks, an expired credential, a brief API outage: the
+	// poll fails and the sessions already attached are untouched by it. The
+	// failure mode this guards against is a poll that reports "no tasks"
+	// instead of an error, which would detach from every task and end the
+	// run - so the warning line is asserted too, because its absence is
+	// what that mistake looks like from here.
+	pinFollowInterval(t, followFast)
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{region: "r", tasks: []transport.Task{
+		{ID: "older", StartedAt: time.Unix(1000, 0), Addr: ag.addr},
+	}}
+
+	dir := t.TempDir()
+	started, release, finished := filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "finished")
+	script := writeChildScript(t, "echo up > "+started+"\n"+
+		"while [ ! -f "+release+" ]; do sleep 0.05; done\n"+
+		"echo done > "+finished+"\n")
+
+	var out safeLog
+	done, _ := runWithCancel(t, stealingOpts("/bin/sh", script), &out, depsFor(p))
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 1 }, "the task to be attached")
+	waitForFile(t, started)
+
+	p.setDiscoverErr(errors.New("simulated throttling"))
+	// Not waitFor: a poll that swallows its failure - the mistake this
+	// test exists for - would stop here on a missing log line and never
+	// reach the assertions below, which are the ones about the developer's
+	// session surviving.
+	if !reachedWithin(5*time.Second, func() bool {
+		return strings.Contains(out.String(), "could not re-read the task list")
+	}) {
+		t.Errorf("a poll that failed must say so, so a developer whose steal goes stale learns why:\n%s", out.String())
+	}
+
+	select {
+	case r := <-done:
+		t.Fatalf("the run ended because the task list could not be read (code=%d err=%v); the sessions it holds are unaffected by that\n%s", r.code, r.err, out.String())
+	case <-time.After(300 * time.Millisecond):
+	}
+	if _, err := os.Stat(finished); err == nil {
+		t.Fatal("the child finished on its own; this test proves nothing")
+	}
+	if err := os.WriteFile(release, []byte("go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.code != 0 || r.err != nil {
+			t.Errorf("the run must end with its child and nothing else: code=%d err=%v\n%s", r.code, r.err, out.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never returned after the child finished")
+	}
+	if strings.Contains(out.String(), "agent session lost") {
+		t.Errorf("a poll that failed is not a session that was lost:\n%s", out.String())
+	}
 }

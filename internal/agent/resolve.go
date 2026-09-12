@@ -24,7 +24,7 @@ const maxResolveAddrs = 16
 // leaves it unset and the agent uses the task's own resolver, which is the
 // VPC resolver; tests substitute a stub.
 //
-// Call this before Serve/ListenAndServe starts accepting sessions: a.lookup
+// Call this before Run/Serve starts accepting sessions: a.lookup
 // is read from per-connection handler goroutines without a lock (the same
 // as SetDialer), so it is only safe to set once, up front, and never while
 // sessions may already be in flight.

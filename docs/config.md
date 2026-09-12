@@ -22,7 +22,7 @@ aws:
 target:
   cluster: myapp-dev
   service: api
-  container: app                # 今は読まれるだけで使われない（実際に効くのは agent 側の TETHERD_APP_CONTAINER）
+  container: app                # 意図して読まれない（効くのは agent 側の TETHERD_APP_CONTAINER）
   env: dev                      # agent の TETHERD_ENV と照合し、違えば接続を拒否する
 env:
   override:                     # タスクの env の上にかぶせる
@@ -46,7 +46,7 @@ incoming:                       # v0.3a で有効。steal（下記）の受け�
 - `version` — 今は `1` のみ。将来フォーマットを変えたときに、古い tetherd が「upgrade してください」と言えるようにするためのもの。未知のキーもエラーにするので、綴り間違いは黙って無視されない
 - `aws.profile` / `aws.region` — SDK の既定チェーンの代わりに使うプロファイルとリージョン。個人設定の同じキーが勝つ
 - `target.cluster` / `target.service` — 接続先の ECS サービス。この 2 つが書いてあれば `tetherd run -- <cmd>` だけで動く
-- `target.container` — **今は読まれるだけで使われない**（`incoming` と同じ）。env を読むコンテナを決めているのは**タスク定義の agent サイドカーに渡す `TETHERD_APP_CONTAINER`**（既定 `app`）で、CLI 側のこのキーではない。agent は `pidMode: task` で共有した pid 名前空間から、そのコンテナの最古のプロセスの `/proc/<pid>/environ` を読む。つまりアプリのコンテナ名が `web` なら、ここに `web` と書いても何も起きず、agent の環境変数に `TETHERD_APP_CONTAINER=web` を設定する必要がある（設定しないと `task env` が「container "app" is not in the task」で失敗する）。このキーを実際に配線するかどうかは v0.3 の判断
+- `target.container` — **意図して読まれない**（`incoming` は v0.3a/v0.3b で読まれるようになったが、このキーは違う）。env を読むコンテナを決めているのは**タスク定義の agent サイドカーに渡す `TETHERD_APP_CONTAINER`**（既定 `app`）で、CLI 側のこのキーではない。agent は `pidMode: task` で共有した pid 名前空間から、そのコンテナの最古のプロセスの `/proc/<pid>/environ` を読む。つまりアプリのコンテナ名が `web` なら、ここに `web` と書いても何も起きず、agent の環境変数に `TETHERD_APP_CONTAINER=web` を設定する必要がある（設定しないと `task env` が「container "app" is not in the task」で失敗する）。**配線しないことを v0.3b で決めた**: どのコンテナの env を読むかは agent の仕事で、agent には既に `TETHERD_APP_CONTAINER` がある。CLI 側からもう 1 つ名前を渡せば同じ事実が 2 箇所に散り、食い違ったときに黙って間違った env を注入する。キー自体は残す（`.tetherd.yml` は未知のキーをエラーにするので、消すと既にコミットされている設定ファイルが全部パースエラーになる）
 - `target.env` — 環境ガード。agent が名乗る `TETHERD_ENV` と一致しなければ接続を拒否する。prod のタスクに誤って繋ぐのを防ぐための最後の砦
 - `env.override` — タスクの env より強い。ローカルのポートだけ変えたいときなど
 - `env.exclude` — タスクの env から落とす名前。tetherd が常に落とすもの（下記）に追加される
@@ -55,7 +55,7 @@ incoming:                       # v0.3a で有効。steal（下記）の受け�
 - `network.remote_domains` — このドメインの名前解決を agent に任せる。Cloud Map やプライベートホストゾーンの名前がここに入る
 - `network.remote_services` — `s3` と `dynamodb` のみ。その managed prefix list の範囲をリモート集合に足す
 - `network.pin_credential_route` — 既定 `false`。`169.254.170.2` を lo0 に固定して、env を読まずにこのアドレスを直書きしているツールにもタスクロールを届ける。**マシン全体に効く**ので、必要なときだけ（下記）
-- `incoming` — v0.3a で有効。ALB に届いたリクエストのうち、`incoming.match.header`（既定 `X-Dev-User`）と `incoming.match.token_header`（既定 `X-Dev-Token`）の両方が一致するものだけを `run` 中のラップトップの `incoming.local_port`（既定 `8080`）に転送する（agent 側の steal。spec §5.2）。一致しないリクエストと、ヘッダーの無いヘルスチェック / WebSocket upgrade は常にタスクの app へ素通しする。既定値はこの CLI が適用するもので、`internal/config` 自体は何も既定を持たない（キーを省略すればそのフィールドはゼロ値のまま CLI に渡る）。フラグとの対応は `--no-incoming`（steal を止めて常時素通しにする）、`--local-port <port>`（`incoming.local_port` の上書き）、`--as <user>`（`~/.tetherd/config.yml` の `user` の上書き。一致条件の片方になる）。この配線により agent は誰も繋いでいなくても常に ALB のデータパス上に居続ける（素通しになるだけで、経路から外れるわけではない）ので、ALB のヘルスチェックは常に agent 経由で app に届く必要があり、agent が死ねばヘルスチェックも失敗する — agent の健全性がそのままサービスの健全性になる
+- `incoming` — v0.3a で有効。ALB に届いたリクエストのうち、`incoming.match.header`（既定 `X-Dev-User`）と `incoming.match.token_header`（既定 `X-Dev-Token`）の両方が一致するものだけを `run` 中のラップトップの `incoming.local_port`（既定 `8080`）に転送する（agent 側の steal。spec §5.2）。一致しないリクエストと、ヘッダーの無いヘルスチェック / WebSocket upgrade は常にタスクの app へ素通しする。既定値はこの CLI が適用するもので、`internal/config` 自体は何も既定を持たない（キーを省略すればそのフィールドはゼロ値のまま CLI に渡る）。フラグとの対応は `--no-incoming`（steal を止めて常時素通しにする）、`--local-port <port>`（`incoming.local_port` の上書き）、`--as <user>`（`~/.tetherd/config.yml` の `user` の上書き。一致条件の片方になる）。この配線により agent は誰も繋いでいなくても常に ALB のデータパス上に居続ける（素通しになるだけで、経路から外れるわけではない）ので、ALB のヘルスチェックは常に agent 経由で app に届く必要があり、agent が死ねばヘルスチェックも失敗する — agent の健全性がそのままサービスの健全性になる。**v0.3b から `tetherd run` はサービスの全タスクに接続する**（下記）
 
 ## `~/.tetherd/config.yml`
 
@@ -71,6 +71,36 @@ aws:
 - `user` — agent に名乗る名前（`hello.user` ＝ `X-Dev-User` に載る値）。`--as` で上書きできる。ALB から自分宛のリクエストを識別する steal の一致条件の片方（v0.3a）
 - `token` — steal の一致条件の片方になる秘密。`run` の開始時に `hello` で agent に渡り、`X-Dev-Token` ヘッダーと比較される。**ファイルは 0600 で、一度作られたトークンは再生成されない**。手で作ったファイルにトークンが無ければ、他のキーを保ったまま書き足す。ALB は public なので `X-Dev-User` と `X-Dev-Token` の両方が一致しない限りラップトップには届かない — `user` は秘密ではなく誰でも知り得る名前なので、片方だけでは steal は起きない。**トークンは任意ではなく必須の照合条件**であり、無くても動く利便のための仕組みではない
 - `aws.profile` / `aws.region` — 共有設定の `aws` ブロックを個人的に上書きする。チームで 1 つのアカウントを共有していない場合に使う
+
+トークンが漏れた（かもしれない）ときは `tetherd token rotate` で差し替える。**他のキー（`user`、`aws`）はそのまま残り**、ファイルは 0600 に直され（手で 0644 で作ったファイルも締め直す）、新しいトークンが標準出力に出る（ModHeader 側の `X-Dev-Token` を貼り替えるため）。**既に走っている `tetherd run` は古いトークンを持ち続ける** — agent は attach 時の `hello` で受け取った値と比較するため、ファイルを書き換えても走行中のセッションには効かない。漏れを閉じるには全てのセッションを再起動する。ファイルが無いマシンでは作成される（初回 `run` と同じ 0600 / 同じ生成器）。なお**書き戻しはこの構造体の再シリアライズなので、ファイルは整形され直す**（コメントは消え、キーの順序は `user` → `token` → `aws` になり、インデントは 4 スペースになり、`aws` に `profile` だけ書いていた場合は `region: ""` が明示的に付く）。いずれも動作には影響しない（空の値は読み側で無視される）が、手で編集してコメントを入れているなら消えることを承知しておくこと。`tetherd run` がトークンを書き足すとき（`token` の無いファイル）も同じ整形が起きる。
+
+### 全タスクに接続する（v0.3b）
+
+`tetherd run` はサービスの**対象タスク全部**に接続する（spec §6.2 / §6.3）。どのタスクにリクエストを落とすかを決めるのは ALB なので、1 タスクだけに繋いでいると `desired_count` が 2 以上のサービスでは steal が当たるか外れるかが運になる — これが v0.3b の本体。
+
+- 起動時の `target` 行が `tetherd-dev/api  2 tasks (a1b2c3d4… primary, e5f6a7b8…)  (started 12m ago)` の形になる（1 タスクのときは従来の `task <id>` のまま）
+- **primary** は起動が最も古いタスク。`dial`（pf で捕捉した TCP）・DNS の `resolve`・注入する env はここを通る。steal はどのタスクからでも受ける
+- 10 秒おきにタスク一覧を読み直し、新しいタスクには接続し、消えたタスクは片付ける（`↻ session` 行）。rolling deploy の最中でも `run` は生き続け、新しいタスクに繋ぎ直る
+- secondary が 1 本落ちても `run` は終わらない（そのタスク宛の steal だけが止まる）。**全**セッションが失われたときだけ `✗ agent session lost` で終了する
+- primary のタスクが落ちたら、生き残りのうち最も古いものが primary に昇格する（`↻ session   task … went away; dial and DNS now go through task …`）
+- `--task ID` を渡した場合はそのタスク 1 本だけ。追従もしない
+
+### 誰がどのタスクに繋いでいるかを見る（`tetherd status`）
+
+steal は共有の仕組みで、同じ dev サービスに複数人が繋ぐ。「自分のリクエストが来ない」の原因は多くの場合ヘッダーではなく人で、`tetherd status` がタスクごとに**誰が・どこから・いつから**繋いでいるかを出す。
+
+```
+  task a1b2c3d4…  (started 12m ago)
+    abe    from 124.35.91.195  attached 3m ago
+    shota  from 203.0.113.9    attached 11m ago
+  task e5f6a7b8…  (started 2m ago)
+    (nobody attached)
+```
+
+- `status` は**読むためだけに attach する**。開くセッションは `incoming` を無効にし、トークンを送らないので、他人のリクエストが `status` の側に流れ込むことはない（`status` 自身が steal の対象にならない）
+- 読めなかったタスクも行として出て理由が付く（`(not read: …)`）。1 タスクが不通のサービスは「半分のリクエストだけ steal できる」状態で、それを見せるのがこのコマンドの仕事なので、最初の失敗で止まらない
+- タスクの agent が古い（v0.3a）場合は名前だけが出て、どこから・いつからは出ない。その旨の 1 行が付く
+- 探索は `run` と同じ（`.tetherd.yml` の `target`、`--task ID` も効く）。繋ぐ先が `run` と違えば診断にならないため
 
 ### ブラウザから steal を試す
 
@@ -157,7 +187,7 @@ RDS / ElastiCache / 内部 ALB のエンドポイント名はパブリック DNS
 
 - 固定は**マシン全体**に効く。セッション中は `tetherd` グループ以外のプロセスも `169.254.170.2` で dev タスクの認証情報に到達できる（pf の `rdr` は `group` 句を受け付けないので gid で絞れない）
 - `amazon-ecs-local-container-endpoints` のようにこのアドレスをローカルで使うツールと衝突する。そちらが**タスクの**ロールを掴む形になる
-- 有効なときに `tetherd doctor` が警告する行は v0.3b で追加する。v0.3a の `doctor` はこの設定を見ないので、有効かどうかは `.tetherd.yml` と `run` の出力で確認する
+- **`tetherd doctor` はこの設定をまだ見ない。** v0.3b で追加すると書いてあったが入らなかった（v0.3b の `doctor` に入ったのは `?` ステータス・`steal` の行・`task role` の行）。有効かどうかは `.tetherd.yml` と `run` の `✓ network` 行（有効なときだけ `remote:` に `169.254.170.0/24` が入る）で確認する
 - `local_cidrs` に何を書いても `169.254.170.0/24` は捕捉から外れない（外すと誰も応答しないアドレスになる）
 
 なお既定のループバック口も無認証で、**同じマシンのどのプロセスからでも**叩けばタスクロールの認証情報を得られる（ポートは毎回変わるが、秘密ではない）。信頼境界は SSM のローカルフォワードと同じ「同一マシンに閉じるが、それ自体が境界」。固定方式より狭いのは「アドレスが予測できない」点だけ。

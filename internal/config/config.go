@@ -30,15 +30,22 @@ type AWS struct {
 type Target struct {
 	Cluster string `yaml:"cluster"`
 	Service string `yaml:"service"`
-	// Container is parsed but nothing reads it (like Incoming). Which
-	// container's environment is read is decided by the agent's
-	// TETHERD_APP_CONTAINER in the task definition, not from here - so a
-	// developer whose app container is named "web" gets no error from
-	// setting this and then debugs a `task env` failure whose advice points
-	// at a different mechanism. KnownFields(true) is why it stays: removing
-	// the field would turn every committed .tetherd.yml that carries the
-	// key into a hard parse error. Wiring it up is a v0.3 decision
-	// (docs/config.md says so too).
+	// Container is parsed and deliberately not read. Which container's
+	// environment is read is the agent's decision, and the agent already
+	// has TETHERD_APP_CONTAINER in the task definition for it; honouring a
+	// second name from here would put one fact in two places, and the
+	// failure when they disagreed would be silent - the CLI asking for
+	// "web" while the agent reads "app" and reports success.
+	//
+	// The cost of leaving it unread is that a developer whose app container
+	// is named "web" gets no error from setting this, and then debugs a
+	// `task env` failure whose advice points at a different mechanism. That
+	// is what docs/config.md's entry for the key is for: it says the name
+	// has to go in the task definition's TETHERD_APP_CONTAINER.
+	//
+	// KnownFields(true) is why the field stays rather than being deleted:
+	// removing it would turn every committed .tetherd.yml that carries the
+	// key into a hard parse error.
 	Container string `yaml:"container"`
 	Env       string `yaml:"env"`
 }

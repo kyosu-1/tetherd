@@ -148,3 +148,92 @@ func TestDiscoverNoTasks(t *testing.T) {
 		t.Fatal("want error when no tasks are running")
 	}
 }
+
+// runningTask builds a fully eligible RUNNING task with the agent
+// container's ExecuteCommandAgent running, matching the shape task() above
+// builds for the existing tests.
+func runningTask(id string, started time.Time) types.Task {
+	return task(id, started, true, "RUNNING", true)
+}
+
+// noExecTask is a RUNNING task with ECS Exec disabled - the one field
+// DiscoverAll rejects it on.
+func noExecTask(id string, started time.Time) types.Task {
+	return task(id, started, false, "RUNNING", true)
+}
+
+func TestDiscoverAllReturnsEveryEligibleTaskOldestFirst(t *testing.T) {
+	// Two eligible tasks: the steal path needs both, because the ALB
+	// picks which one a request lands on and a session attached to only
+	// one of them silently misses half the traffic.
+	api := &fakeECS{
+		arns: []string{"arn:aws:ecs:r:1:task/c/newer", "arn:aws:ecs:r:1:task/c/older"},
+		tasks: []types.Task{
+			runningTask("newer", time.Unix(2000, 0)),
+			runningTask("older", time.Unix(1000, 0)),
+		},
+	}
+	all, err := DiscoverAll(context.Background(), api, Target{Cluster: "c", Service: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("got %d tasks, want 2", len(all))
+	}
+	if all[0].ID != "older" || all[1].ID != "newer" {
+		t.Fatalf("order = %s, %s; want older first (primary is the oldest task)", all[0].ID, all[1].ID)
+	}
+}
+
+func TestDiscoverStillReturnsTheOldestOnly(t *testing.T) {
+	api := &fakeECS{
+		arns: []string{"arn:aws:ecs:r:1:task/c/newer", "arn:aws:ecs:r:1:task/c/older"},
+		tasks: []types.Task{
+			runningTask("newer", time.Unix(2000, 0)),
+			runningTask("older", time.Unix(1000, 0)),
+		},
+	}
+	task, err := Discover(context.Background(), api, Target{Cluster: "c", Service: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.ID != "older" {
+		t.Fatalf("Discover returned %s, want the oldest", task.ID)
+	}
+}
+
+func TestDiscoverAllSkipsTheIneligibleAndSaysWhy(t *testing.T) {
+	// One task RUNNING with the agent, one without ECS Exec. The eligible
+	// one must come back and the reason for the other must not be lost -
+	// a developer whose deploy is half-rolled needs to know which task is
+	// not attachable and why.
+	api := &fakeECS{
+		arns: []string{"arn:aws:ecs:r:1:task/c/good", "arn:aws:ecs:r:1:task/c/noexec"},
+		tasks: []types.Task{
+			runningTask("good", time.Unix(1000, 0)),
+			noExecTask("noexec", time.Unix(1100, 0)),
+		},
+	}
+	all, err := DiscoverAll(context.Background(), api, Target{Cluster: "c", Service: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].ID != "good" {
+		t.Fatalf("got %v, want only the eligible task", all)
+	}
+}
+
+func TestDiscoverAllWithNoEligibleTaskReportsEveryReason(t *testing.T) {
+	api := &fakeECS{
+		arns:  []string{"arn:aws:ecs:r:1:task/c/noexec"},
+		tasks: []types.Task{noExecTask("noexec", time.Unix(1100, 0))},
+	}
+	_, err := DiscoverAll(context.Background(), api, Target{Cluster: "c", Service: "s"})
+	var nr *NotReadyError
+	if !errors.As(err, &nr) {
+		t.Fatalf("err = %v, want a *NotReadyError", err)
+	}
+	if len(nr.Reasons) != 1 || !strings.Contains(nr.Reasons[0], "ECS Exec is disabled") {
+		t.Fatalf("reasons = %v, want the ECS Exec explanation", nr.Reasons)
+	}
+}

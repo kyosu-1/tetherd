@@ -9,8 +9,10 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/kyosu-1/tetherd/internal/awsid"
 	"github.com/kyosu-1/tetherd/internal/doctor"
 	"github.com/kyosu-1/tetherd/internal/helper"
 	"github.com/kyosu-1/tetherd/internal/proto"
@@ -42,7 +44,7 @@ const DefaultDoctorTimeout = 10 * time.Second
 // one cannot leave this behind.
 const DefaultAgentCheckTimeout = ssmtr.StartupWait + session.HandshakeWait
 
-// DefaultDoctorBudget bounds the whole report, not just each row. Eleven
+// DefaultDoctorBudget bounds the whole report, not just each row. Thirteen
 // checks plus one resolve per configured domain, each allowed
 // DefaultDoctorTimeout, adds up to minutes in the worst case; nobody waits
 // that long for a diagnostic. What the budget cuts short is reported as
@@ -79,8 +81,10 @@ type DoctorOptions struct {
 	// Budget is how long the whole report may take. Zero means
 	// DefaultDoctorBudget.
 	Budget time.Duration
-	// SkipAgent leaves the agent alone: no session is opened, and the three
-	// rows that need one are reported as not checked rather than dropped.
+	// SkipAgent leaves the agent alone: no session is opened, and the four
+	// rows that need one - the agent session, the task's environment, the
+	// task role and the remote domains - are reported as not checked rather
+	// than dropped.
 	// One doctor run is otherwise one SSM session, which shows up in
 	// CloudTrail and in the task's session history - noise a scripted or
 	// looped invocation may not want.
@@ -243,7 +247,7 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 	}
 	icancel()
 	if isContextError(idErr) {
-		results = append(results, timedOut("AWS identity", checkTimedOut(ctx, "AWS GetCallerIdentity", timeout)))
+		results = append(results, timedOut("your AWS identity", checkTimedOut(ctx, "AWS GetCallerIdentity", timeout)))
 	} else {
 		results = append(results, doctor.CheckIdentity(arn, idErr))
 	}
@@ -331,6 +335,29 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 		results = append(results, doctor.CheckTaskEnv(len(welcome.AppEnv), welcome.EnvError))
 	}
 
+	// 5c. The task role, fetched the way the child would fetch it. `tetherd
+	// run` prints a ✓ iam line with the ARN the *task* role resolves to,
+	// obtained through the loopback credential endpoint it serves over this
+	// same session; the identity row above is the developer's own ARN from
+	// the developer's own credentials. Two different facts were being
+	// reported under one word, so both are reported, each under its own
+	// name.
+	switch {
+	case opts.SkipAgent:
+		results = append(results, skipped("task role", "--skip-agent"))
+	case sess == nil:
+		results = append(results, notChecked("task role", "the agent did not answer"))
+	case welcome.EnvError != "":
+		// The task env row above has already failed with the agent's own
+		// reason, and without the task's environment there is no endpoint
+		// to relay: ContainerCredentialsPath would answer "" and this row
+		// would report that the task advertises no role, which is a
+		// different statement and an untrue one.
+		results = append(results, notChecked("task role", "the task's environment could not be read"))
+	default:
+		results = append(results, taskRoleRow(ctx, timeout, d, sess, welcome.AppEnv, prov.Region()))
+	}
+
 	// 6. The captured set - what goes to the task, and what it collides
 	// with on this machine. remoteSet is the function `tetherd run` builds
 	// its set with, so the two can never disagree.
@@ -379,7 +406,12 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 		}
 	}
 
-	// 7. The remote domains, asked of the agent over the session row 5
+	// 7. Steal: where a stolen request would go, and whether anything is
+	// there to take it. Nothing outside this machine is asked, so this row
+	// is printed whatever the rows above did.
+	results = append(results, stealRow(ctx, timeout, opts.RunOptions))
+
+	// 8. The remote domains, asked of the agent over the session row 5
 	// already opened: whether a name resolves in the VPC is the agent's
 	// answer, not something that can be inferred from the configuration.
 	// resolved holds an entry only for a name doctor actually put to the
@@ -513,6 +545,153 @@ func taskRow(task transport.Task, taskErr, idErr error) doctor.Result {
 	}
 }
 
+// taskRoleRow gathers what the task role row judges: the credentials the
+// child's own path would fetch, and the ARN sts:GetCallerIdentity says they
+// belong to.
+//
+// It is the only check that serves something rather than only asking - a
+// loopback credential endpoint, the one `tetherd run` points the child at -
+// because that is the path being checked. Fetching the credentials straight
+// over the session instead would pass on a machine where the child could not
+// reach them at all, which is the class of false green this row was added to
+// end.
+//
+// The two legs are bounded and reported apart, the way run reports them: the
+// fetch is the child's own path and its failure means the child would have
+// no AWS identity, while sts:GetCallerIdentity leaves the laptop for
+// sts.<region>.amazonaws.com and can fail on a plane with nothing wrong with
+// the setup at all. Each clock is named rather than left as "context
+// deadline exceeded", so the row says which leg ran out of time.
+func taskRoleRow(ctx context.Context, timeout time.Duration, d Deps, sess *session.Client, taskEnv map[string]string, region string) doctor.Result {
+	credPath := ContainerCredentialsPath(taskEnv)
+	if credPath == "" {
+		// There is no role to relay, so nothing is served and nothing is
+		// fetched: the judgement needs only that fact.
+		return doctor.CheckCredentialEndpoint("", "", "", nil, nil)
+	}
+	cctx, ccancel := context.WithCancel(ctx)
+	defer ccancel()
+	// No Logf: doctor prints a table, and the proxy's own ⚠ lines would
+	// interleave with the rows. Its errors reach this row as the failure of
+	// the fetch below, which is where they belong.
+	cp := &CredProxy{Dial: sess.DialTCP}
+	addr, err := cp.Start(cctx)
+	if err != nil {
+		// Binding a loopback port is this process's own doing, so a failure
+		// here says nothing about the setup being checked.
+		return doctor.Result{
+			Name:   "task role",
+			Status: doctor.Unknown,
+			Detail: "not checked: cannot serve the task's credential endpoint on loopback: " + err.Error(),
+			Next:   "run tetherd doctor again; tetherd run serves the same endpoint and would fail the same way",
+		}
+	}
+	defer cp.Close()
+	fctx, fcancel := context.WithTimeout(ctx, timeout)
+	creds, credsErr := awsid.FetchContainerCredentials(fctx, dialAddrPort(addr), credPath)
+	fcancel()
+	if isContextError(credsErr) {
+		credsErr = checkTimedOut(ctx, "the task's credential endpoint", timeout)
+	}
+	var (
+		arn   string
+		idErr error
+	)
+	if credsErr == nil {
+		ictx, icancel := context.WithTimeout(ctx, timeout)
+		arn, idErr = d.CallerIdentity(ictx, creds, region)
+		icancel()
+		if isContextError(idErr) {
+			idErr = checkTimedOut(ctx, "sts:GetCallerIdentity with the task's credentials", timeout)
+		}
+	}
+	return doctor.CheckCredentialEndpoint(addr.String(), credPath, arn, credsErr, idErr)
+}
+
+// stealRow gathers what the steal row judges: the settings this run would
+// take requests under, and whether anything is listening where a taken
+// request would go.
+//
+// The settings come from stealSettings, which is where the three defaults
+// live and the only place they are applied - a second copy here would be a
+// second answer to "which port would a stolen request go to", and this row
+// exists precisely to answer that one.
+//
+// A refusal from stealSettings is reported as not checked rather than as a
+// failure: what is wrong is the settings a run would be given, and doctor
+// cannot tell where a stolen request would go without them. The settings
+// themselves arrive from the config files (newDoctorCommand calls
+// applySharedIncoming and applyIncomingPort), so this arm is reachable only
+// for a value that really is wrong - an incoming.local_port that is not a
+// port number - and `tetherd run` refuses on it the same way. A missing
+// token is not reachable through the CLI at all, because applyConfig's
+// EnsurePersonal mints one into any personal file that lacks it; it is
+// still handled, for an in-process caller and for a file that somehow
+// carries an empty token.
+//
+// The listener is probed by connecting, not by trying to bind: binding is
+// the wrong question (a port can be in use by something that is not
+// listening for this) and would take the port away from the server the
+// developer is about to start. Connecting is what a stolen request does,
+// and nothing is written on the connection - a probe that spoke HTTP would
+// land in the developer's own access log as a request they did not make.
+func stealRow(ctx context.Context, timeout time.Duration, opts RunOptions) doctor.Result {
+	st, err := stealSettings(opts)
+	if err != nil {
+		return doctor.Result{
+			Name:   "steal",
+			Status: doctor.Unknown,
+			// Only the first line: errNoStealToken carries run's own
+			// multi-line advice, which belongs on a terminal rather than in
+			// a column of a table.
+			Detail: "not checked: " + firstLine(err.Error()),
+			Next:   "tetherd run resolves these settings from .tetherd.yml and ~/.tetherd/config.yml and would refuse for the same reason; check incoming.local_port there, and that the personal file holds a token",
+		}
+	}
+	listening := false
+	if st.Incoming.Enabled {
+		// The same address CheckSteal names and StealServer dials, and it
+		// goes to bounded as the thing that did not answer, so a clock's
+		// message names the port rather than "the local port".
+		dst := fmt.Sprintf("127.0.0.1:%d", st.LocalPort)
+		c, derr := bounded(ctx, timeout, "a connect to "+dst,
+			func(c context.Context) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(c, "tcp", dst)
+			},
+			func(c net.Conn) { c.Close() })
+		switch {
+		case derr == nil:
+			// Nothing is sent: that something accepted is the whole fact.
+			c.Close()
+			listening = true
+		case isCheckTimeout(derr) || isContextError(derr):
+			// A clock, not a measurement. A connect to this machine either
+			// answers or is refused in microseconds, so the only ways here
+			// are the per-check bound, the report's budget having already
+			// run out, or something local dropping the packets - and in
+			// none of them did doctor learn whether anything is listening.
+			// Reporting that as "nothing is listening" is a verdict about a
+			// port that may well have a server on it: the same false green
+			// as the rows that route their clocks, in the other direction.
+			return doctor.Result{
+				Name:   "steal",
+				Status: doctor.Unknown,
+				Detail: "not checked: " + derr.Error(),
+				Next:   "run tetherd doctor again (or with a longer --timeout); a connect to your own machine that neither answers nor is refused means something local is dropping it, not that the port is empty",
+			}
+		}
+	}
+	return doctor.CheckSteal(st.Incoming, st.LocalPort, listening)
+}
+
+// firstLine is s up to its first newline.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
 // timedOut is the row for a check that never answered. It is used where the
 // judgement would otherwise answer a timeout with advice for a different
 // problem, and it is a failure, not a warning: something that should have
@@ -540,9 +719,17 @@ func isCheckTimeout(err error) bool {
 
 // checkTimedOut names what did not answer and why the wait ended. The raw
 // error at hand is only ever "context deadline exceeded", which says neither.
+//
+// Neither message says "not checked", and that is a rule rather than a
+// choice of words: a row whose detail starts with "not checked:" is a `?`
+// row that does not fail the command (doctor.Unknown), and most of what this
+// error ends up in is a `✗` row from timedOut, deliberately - an incomplete
+// report that exited 0 would tell a script the machine is fine. The one
+// place it does reach a `?` row (stealRow's clock arm) adds the prefix
+// itself.
 func checkTimedOut(ctx context.Context, what string, timeout time.Duration) *checkTimeout {
 	if ctx.Err() != nil {
-		return &checkTimeout{msg: what + " was not checked: tetherd doctor ran out of time"}
+		return &checkTimeout{msg: what + " did not answer before tetherd doctor ran out of time"}
 	}
 	return &checkTimeout{msg: fmt.Sprintf("%s did not answer within %s", what, timeout)}
 }
@@ -560,21 +747,23 @@ func isContextError(err error) bool {
 func skipped(name, flag string) doctor.Result {
 	return doctor.Result{
 		Name:   name,
-		Status: doctor.Warn,
+		Status: doctor.Unknown,
 		Detail: "not checked: " + flag,
 		Next:   "run tetherd doctor without " + flag + " to check this",
 	}
 }
 
 // notChecked is the row for a check that could not run because something it
-// depends on failed. It is a warning, not a pass and not a failure: the
-// failure is already reported by the row it depends on, and counting it
-// again would inflate the exit status - but reporting it as OK would tell
-// the developer something that was never tested is fine.
+// depends on failed. It is neither a pass nor a failure nor a warning about
+// the setup: the failure is already reported by the row it depends on, and
+// counting it again would inflate the exit status - but reporting it as OK
+// would tell the developer something that was never tested is fine, and
+// reporting it as a warning (which it was until doctor.Unknown existed) put
+// it under the same mark as a real finding about a working setup.
 func notChecked(name, why string) doctor.Result {
 	return doctor.Result{
 		Name:   name,
-		Status: doctor.Warn,
+		Status: doctor.Unknown,
 		Detail: "not checked: " + why,
 		Next:   "fix the failing rows, then run tetherd doctor again",
 	}

@@ -97,7 +97,7 @@ mirror（共有 DB への二重書き込みの扱いを決めてから）、UDP 
 - セッションが切れたら即座に素通しに戻す（リクエスト途中のものは完了まで待つ）
 - AWS API は呼ばない。Linux capability は env 読み取りのための `SYS_PTRACE` のみ。root で動かす（capability を effective にするため）
 - 常時データパスにいるので `essential: true` と `restartPolicy` を推奨
-- listen ポート（8080 / 9900）は env で変更可
+- ALB を受けるポートは env で変更可（`TETHERD_PROXY`、既定 `0.0.0.0:8080`）。制御ポートの `TETHERD_CONTROL` も env にあるが**実質固定** — CLI の SSM トランスポートが 9900 を固定で転送するので、変えると誰も繋げなくなる（v0.4 でトランスポート側に教える）
 
 ### 3.2 環境変数と secrets の取得 — 実行中のプロセスから読む
 
@@ -606,11 +606,14 @@ tetherd は「Kubernetes を使わないサーバーレスコンテナのため�
 
 ## 16. ロードマップ
 
+✓ は実機（`deploy/dev-env` + `docs/e2e-aws.md`）で確認済み。結果は spec §12 に記録している。
+
 | | 内容 |
 |---|---|
-| v0.1 | ローカル e2e。helper + `tetherd-exec` + pf rdr + natlook + yamux + agent の `dial` を Docker ネットワーク相手に通す（§15 の 1〜3）。`psql -h 192.0.2.10` がコード変更なしで通る |
-| v0.2 | `deploy/dev-env`（Terraform）と agent の environ 読み取り、SSM トランスポート、env 注入、DNS、タスクロール確認（§15 の 4〜6）。`tetherd run -- psql -h <rds>` が通る |
-| v0.3 | steal（agent の L7 プロキシ、トークン、フォールバック）、全タスク接続と deploy 追従、`status` / `doctor` |
+| v0.1 ✓ | ローカル e2e。helper + `tetherd-exec` + pf rdr + natlook + yamux + agent の `dial` を Docker ネットワーク相手に通す（§15 の 1〜3）。`psql -h 192.0.2.10` がコード変更なしで通る |
+| v0.2 ✓ | `deploy/dev-env`（Terraform）と agent の environ 読み取り、SSM トランスポート、env 注入、DNS、タスクロール確認（§15 の 4〜6）。`tetherd run -- psql -h <rds>` が通る。v0.2b で設定ファイル・`env`・`doctor` |
+| v0.3a ✓ | steal（agent の L7 プロキシ、トークン、フォールバック）。タスクロールはループバック口から配る方式に変更（§6 の「タスクロールの届け方」） |
+| v0.3b ✓ | 全タスク接続と rolling deploy 追従、`status`、`token rotate`、`doctor` の拡充（検査できなかったことを `?` で言う・`steal` と `task role` の行） |
 | v0.4 | Homebrew tap、LaunchDaemon、GoReleaser、README。チームに配れる |
 | v1.0 | 上記の安定化 |
 | 以降 | Linux（netns + netstack）、mirror、UDP、`remote_localhost`、plugin 埋め込み、Tailscale トランスポート、Cloud Run |

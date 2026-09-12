@@ -1529,6 +1529,86 @@ func TestRunRefusesToStartWithoutBothPorts(t *testing.T) {
 	}
 }
 
+// TestNewDefaultsEveryAddressForAConfigBuiltByHand pins what New makes of a
+// Config that did not come from the environment - every test in this
+// package, and an embedded agent later.
+//
+// An empty address is not the startup error it looks like. Measured on this
+// branch, before withDefaults covered the listen addresses:
+// New(Config{Env: "dev"}).Run(ctx) returned nil and logged "control
+// listening on [::]:58165, proxy listening on [::]:58166", because
+// net.Listen("tcp", "") succeeds and binds every interface on a
+// kernel-chosen port. That is the control port - documented loopback-only,
+// which is what keeps it off the task's ENI without a security-group change
+// - published to the VPC, and the ALB port on a port no target group knows,
+// with nothing said at startup. An empty AppAddr is the quieter cousin: a
+// dial target that fails at the first request, layers from the empty field.
+func TestNewDefaultsEveryAddressForAConfigBuiltByHand(t *testing.T) {
+	byHand := New(Config{Env: "dev"}, nil)
+	fromEnv, err := ConfigFromEnv(func(k string) string {
+		if k == "TETHERD_ENV" {
+			return "dev"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The whole Config, compared as one value rather than field by field:
+	// there is one set of defaults and both paths read it, so a field a
+	// future withDefaults forgets fails here without anyone having to
+	// remember to add an assertion for it. What each value *is* stays
+	// pinned against the literals in TestConfigDefaultsForTheProxyAndTheApp
+	// below and in TestConfigFromEnv - one place per address.
+	if byHand.cfg != fromEnv {
+		t.Errorf("New(Config{Env: \"dev\"}) produced\n  %+v\nand ConfigFromEnv with the same environment\n  %+v\nthere is one set of defaults", byHand.cfg, fromEnv)
+	}
+	// Presence, field by field and named: the equality above only says the
+	// two paths agree, so a default *both* of them lost would satisfy it
+	// while leaving an address empty - and an empty listen address is not
+	// an error, it is every interface (see this test's comment).
+	for _, f := range []struct{ name, got string }{
+		{"Control", byHand.cfg.Control},
+		{"Proxy", byHand.cfg.Proxy},
+		{"AppAddr", byHand.cfg.AppAddr},
+		{"AppContainer", byHand.cfg.AppContainer},
+	} {
+		if f.got == "" {
+			t.Errorf("New left %s empty: an empty listen address binds every interface, and an empty dial target fails at the first request", f.name)
+		}
+	}
+	// Said separately from the equality above, because this is the reason
+	// and not a value: both paths drifting to 0.0.0.0 together would
+	// satisfy the comparison and put the control port on the ENI.
+	host, _, err := net.SplitHostPort(byHand.cfg.Control)
+	if err != nil {
+		t.Fatalf("New's control address %q is not a host:port at all (an empty one binds every interface): %v", byHand.cfg.Control, err)
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		t.Errorf("New's control address is %q; the control port is loopback-only, which is what keeps it unreachable from the task's ENI", byHand.cfg.Control)
+	}
+	// The env reader is built from the normalised Config as well. Nothing
+	// separates the two today - AppContainer is "app" either way - so this
+	// is here to keep it that way: reading the raw Config there is how the
+	// next default added to withDefaults would apply to the agent and not
+	// to the container it reads the environment out of. No network: New
+	// only records the URL.
+	withMeta := New(Config{Env: "dev", MetadataURL: "http://169.254.170.2/v4/task"}, nil)
+	pr, ok := withMeta.env.(*ProcEnvReader)
+	if !ok {
+		t.Fatalf("New with a metadata URL gave env reader %T, want *ProcEnvReader", withMeta.env)
+	}
+	if pr.AppContainer != withMeta.cfg.AppContainer {
+		t.Errorf("the env reader reads container %q while the agent's Config says %q: it was built from the un-normalised Config", pr.AppContainer, withMeta.cfg.AppContainer)
+	}
+	// And what the caller did give is still theirs - the tests in this file
+	// that point the proxy at their own listener depend on it.
+	kept := New(Config{Env: "dev", Control: "127.0.0.1:0", Proxy: "127.0.0.1:0", AppAddr: "127.0.0.1:3000", AppContainer: "web"}, nil)
+	if kept.cfg.Control != "127.0.0.1:0" || kept.cfg.Proxy != "127.0.0.1:0" || kept.cfg.AppAddr != "127.0.0.1:3000" || kept.cfg.AppContainer != "web" {
+		t.Errorf("New overwrote what it was given: %+v", kept.cfg)
+	}
+}
+
 // TestConfigDefaultsForTheProxyAndTheApp pins the two addresses the ECS
 // task definition and the ALB target group depend on. Getting either wrong
 // is a task that comes up and serves nothing.

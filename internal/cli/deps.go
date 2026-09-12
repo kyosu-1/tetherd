@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -33,6 +34,17 @@ import (
 type awsProvider interface {
 	Region() string
 	Discover(ctx context.Context, t ecsprov.Target) (transport.Task, error)
+	// DiscoverAll returns every attachable task, oldest first. `tetherd
+	// run` attaches to all of them, because the ALB chooses which task a
+	// request lands on: a run attached to one of two silently misses half
+	// the traffic it was asked to steal. Discover's single task is still
+	// what `tetherd env` and `tetherd doctor` read.
+	//
+	// It never answers an empty slice with a nil error - zero eligible
+	// tasks is an error carrying the per-task reasons - which is what
+	// makes it safe to use as Follower.List, whose removal loop drops
+	// every attached task the list does not contain.
+	DiscoverAll(ctx context.Context, t ecsprov.Target) ([]transport.Task, error)
 	VPCCIDRs(ctx context.Context, subnetID string) ([]netip.Prefix, error)
 	ServiceCIDRs(ctx context.Context, services []string) ([]netip.Prefix, error)
 	Transport(logf func(string, ...any)) transport.Transport
@@ -105,6 +117,13 @@ type Deps struct {
 	LookPath func(file string) (string, error)
 	// InterfaceAddrs lists this machine's own addresses (net.InterfaceAddrs).
 	InterfaceAddrs func() ([]net.Addr, error)
+
+	// AttachRetryBudget is how long an attach the agent refused with
+	// duplicate_user keeps trying before it gives up (see dialAgent).
+	// Zero means DefaultAttachRetryBudget. It is injected rather than
+	// fixed so that the test of the give-up path costs milliseconds
+	// instead of the whole budget.
+	AttachRetryBudget time.Duration
 }
 
 func (d Deps) withDefaults() Deps {
@@ -141,6 +160,9 @@ func (d Deps) withDefaults() Deps {
 	}
 	if d.InterfaceAddrs == nil {
 		d.InterfaceAddrs = net.InterfaceAddrs
+	}
+	if d.AttachRetryBudget <= 0 {
+		d.AttachRetryBudget = DefaultAttachRetryBudget
 	}
 	return d
 }
@@ -196,6 +218,10 @@ func (p *sdkProvider) Region() string { return p.cfg.Region }
 
 func (p *sdkProvider) Discover(ctx context.Context, t ecsprov.Target) (transport.Task, error) {
 	return ecsprov.Discover(ctx, awsecs.NewFromConfig(p.cfg), t)
+}
+
+func (p *sdkProvider) DiscoverAll(ctx context.Context, t ecsprov.Target) ([]transport.Task, error) {
+	return ecsprov.DiscoverAll(ctx, awsecs.NewFromConfig(p.cfg), t)
 }
 
 func (p *sdkProvider) VPCCIDRs(ctx context.Context, subnetID string) ([]netip.Prefix, error) {

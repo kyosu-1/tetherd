@@ -3,8 +3,10 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -14,7 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+
 	"github.com/kyosu-1/tetherd/internal/agent"
+	"github.com/kyosu-1/tetherd/internal/doctor"
 	"github.com/kyosu-1/tetherd/internal/session"
 	"github.com/kyosu-1/tetherd/internal/transport"
 	ssmtr "github.com/kyosu-1/tetherd/internal/transport/ssm"
@@ -44,7 +49,11 @@ func parseDoctorRows(out string) []doctorRow {
 		if !ok {
 			continue
 		}
-		if mark != "✓" && mark != "!" && mark != "✗" {
+		// The four marks Render can print. "!" is deliberately absent: it
+		// used to mean both "look at this" and "could not be checked", and
+		// leaving it here would let a row that went back to it be parsed
+		// as a row rather than failing.
+		if mark != "✓" && mark != "⚠" && mark != "✗" && mark != "?" {
 			if _, next, isNext := strings.Cut(line, "→ "); isNext && len(rows) > 0 {
 				rows[len(rows)-1].next = strings.TrimSpace(next)
 			}
@@ -81,13 +90,19 @@ var everyDoctorRow = []string{
 	"helper",
 	"setgid tetherd-exec",
 	"session-manager-plugin",
-	"AWS identity",
+	// "your AWS identity", not "AWS identity": the task role row below
+	// reports the other AWS identity in play - the one the child gets -
+	// and the two were both called "AWS identity" while reporting
+	// different ARNs.
+	"your AWS identity",
 	"attachable task",
 	"pidMode",
 	"agent session",
 	"task env",
+	"task role",
 	"remote CIDRs",
 	"local addresses",
+	"steal",
 	"remote domains",
 }
 
@@ -108,7 +123,57 @@ func wantRowSet(t *testing.T, out string) []doctorRow {
 	if got[len(got)-1] != "remote domains" {
 		t.Fatalf("the remote domains row must be printed last: %v", got)
 	}
+	wantUncheckedRowsSaySo(t, rows, out)
+	wantNoStrayLines(t, out)
 	return rows
+}
+
+// wantUncheckedRowsSaySo pins what the ? mark promises: a row that could not
+// be checked says "not checked:" first, and no other row claims to be
+// unchecked. It is asserted on every report the tests render rather than in
+// one place, because the invariant is what makes the new status
+// self-describing - a reader who has seen one ? row knows what the next one
+// means - and because a row that drifted onto the wrong status is exactly the
+// bug doctor.Unknown exists to prevent.
+//
+// The prefix, not Contains: CheckDomains' *failure* arm appends
+// "; not checked: <domains>" to name the names it never got to, which is a
+// ✗ row honestly reporting a gap inside itself, not a row claiming it was
+// not checked.
+func wantUncheckedRowsSaySo(t *testing.T, rows []doctorRow, out string) {
+	t.Helper()
+	for _, r := range rows {
+		said := strings.HasPrefix(r.detail, "not checked:")
+		switch {
+		case r.mark == "?" && !said:
+			t.Errorf("the %q row is ? but does not say what was not checked: %q\n%s", r.name, r.detail, out)
+		case r.mark != "?" && said:
+			t.Errorf("the %q row says it was not checked but is marked %q, not ?: %q\n%s", r.name, r.mark, r.detail, out)
+		}
+	}
+}
+
+// wantNoStrayLines pins that every line of the report is a row or that row's
+// next step. Nothing else may appear, because a detail (or a next step) with
+// a newline in it prints as extra lines in the middle of the table - and
+// parseDoctorRows splits on "\n" before anything can be asserted about it, so
+// those lines vanish from every parsed-row assertion. That is not
+// hypothetical: the one assertion written for it read the parsed row's detail
+// and could never have been true, and dropping the firstLine call it was
+// guarding survived the whole suite.
+func wantNoStrayLines(t *testing.T, out string) {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if mark, _, _ := strings.Cut(line, " "); mark == "✓" || mark == "⚠" || mark == "✗" || mark == "?" {
+			continue
+		}
+		// A next step: two leading spaces, the name column's width of
+		// blanks, then the arrow.
+		if strings.HasPrefix(line, "  ") && strings.Contains(line, "→ ") {
+			continue
+		}
+		t.Errorf("stray line in the report - a detail or next step with a newline in it? %q\n%s", line, out)
+	}
 }
 
 func wantMarks(t *testing.T, rows []doctorRow, want map[string]string) {
@@ -200,7 +265,7 @@ func TestDoctorPrintsEveryRowAndExitsOnAFailure(t *testing.T) {
 		"helper":                 "✗",
 		"setgid tetherd-exec":    "✓",
 		"session-manager-plugin": "✓",
-		"AWS identity":           "✓",
+		"your AWS identity":      "✓",
 		"attachable task":        "✓",
 		"pidMode":                "✓",
 		"agent session":          "✓",
@@ -220,7 +285,7 @@ func TestDoctorPrintsEveryRowAndExitsOnAFailure(t *testing.T) {
 	if sessions != 1 {
 		t.Errorf("doctor opened %d AWS sessions, want exactly 1", sessions)
 	}
-	if d := findRow(t, rows, "AWS identity").detail; d != "arn:aws:sts::1:assumed-role/dev/me" {
+	if d := findRow(t, rows, "your AWS identity").detail; d != "arn:aws:sts::1:assumed-role/dev/me" {
 		t.Errorf("the identity row must print who the caller is, got %q", d)
 	}
 	if d := findRow(t, rows, "attachable task").detail; !strings.Contains(d, "t1") {
@@ -273,8 +338,8 @@ func TestDoctorFailsTheCapturedSetRowWhenItCannotBeBuilt(t *testing.T) {
 	}
 	// And the overlap row must not claim a clean machine off a set that
 	// was never computed.
-	if m := findRow(t, rows, "local addresses").mark; m != "!" {
-		t.Errorf("local addresses = %q, want it reported as not checked", m)
+	if m := findRow(t, rows, "local addresses").mark; m != "?" {
+		t.Errorf("local addresses = %q, want it reported as not checked (?), not as a warning about the machine", m)
 	}
 }
 
@@ -305,16 +370,23 @@ func TestDoctorKeepsCheckingWhenAWSIsUnreachable(t *testing.T) {
 		"setgid tetherd-exec":    "✓",
 		"session-manager-plugin": "✓",
 		// Failed, with the reason.
-		"AWS identity": "✗",
-		// Not checkable, and never reported as healthy.
-		"attachable task": "!",
-		"pidMode":         "!",
-		"agent session":   "!",
-		"remote CIDRs":    "!",
-		"local addresses": "!",
-		"remote domains":  "!",
+		"your AWS identity": "✗",
+		// Not checkable, and never reported as healthy - "?" rather than
+		// the "!" these rows used to share with a real finding about a
+		// working setup.
+		"attachable task": "?",
+		"pidMode":         "?",
+		"agent session":   "?",
+		"task env":        "?",
+		"task role":       "?",
+		"remote CIDRs":    "?",
+		"local addresses": "?",
+		"remote domains":  "?",
+		// Checked, and fine, with no AWS whatsoever: this row asks nothing
+		// of anything outside the laptop.
+		"steal": "✓",
 	})
-	if d := findRow(t, rows, "AWS identity").detail; !strings.Contains(d, "no valid credential sources") {
+	if d := findRow(t, rows, "your AWS identity").detail; !strings.Contains(d, "no valid credential sources") {
 		t.Errorf("the reason must survive to the identity row, got %q", d)
 	}
 	// The credentials are the problem and the identity row above says so
@@ -351,8 +423,8 @@ func TestDoctorBlamesTheRightRowWhenDiscoveryFails(t *testing.T) {
 		t.Fatalf("code = %d, want 1\n%s", code, out.String())
 	}
 	rows := wantRowSet(t, out.String())
-	wantMarks(t, rows, map[string]string{"AWS identity": "✓", "attachable task": "✗"})
-	if d := findRow(t, rows, "AWS identity").detail; d != "arn:aws:sts::1:assumed-role/dev/me" {
+	wantMarks(t, rows, map[string]string{"your AWS identity": "✓", "attachable task": "✗"})
+	if d := findRow(t, rows, "your AWS identity").detail; d != "arn:aws:sts::1:assumed-role/dev/me" {
 		t.Errorf("working credentials must be reported as working, got %q", d)
 	}
 	if d := findRow(t, rows, "attachable task").detail; !strings.Contains(d, "no RUNNING tasks") {
@@ -416,7 +488,7 @@ func TestDoctorBlamesTheRightRowWhenCredentialsExpire(t *testing.T) {
 				t.Fatalf("code = %d, want 1\n%s", code, out.String())
 			}
 			rows := wantRowSet(t, out.String())
-			r := findRow(t, rows, "AWS identity")
+			r := findRow(t, rows, "your AWS identity")
 			if r.mark != "✗" || !strings.Contains(r.detail, c.idErr.Error()) {
 				t.Fatalf("broken credentials must fail the identity row with the reason: %q %q", r.mark, r.detail)
 			}
@@ -426,12 +498,11 @@ func TestDoctorBlamesTheRightRowWhenCredentialsExpire(t *testing.T) {
 
 			// The row below it is the one the bug misdiagnosed. The
 			// credentials never worked, so nothing was learned about the
-			// task: that is "not checked" (a warning - the identity row
-			// already carries the failure), never a failure of the ECS
-			// service.
+			// task: that is "not checked" (the identity row already carries
+			// the failure), never a failure of the ECS service.
 			task := findRow(t, rows, "attachable task")
-			if task.mark != "!" {
-				t.Fatalf("attachable task = %q %q, want ! (not checked): the identity row above is what failed", task.mark, task.detail)
+			if task.mark != "?" {
+				t.Fatalf("attachable task = %q %q, want ? (not checked): the identity row above is what failed", task.mark, task.detail)
 			}
 			if !strings.Contains(task.detail, "not checked") || !strings.Contains(task.detail, "AWS identity") {
 				t.Errorf("attachable task detail = %q, want it to say it was not checked and why", task.detail)
@@ -516,8 +587,8 @@ func TestDoctorWarnsWhenItCannotListLocalAddresses(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := findRow(t, wantRowSet(t, out.String()), "local addresses")
-	if r.mark != "!" || !strings.Contains(r.detail, "operation not permitted") {
-		t.Fatalf("local addresses = %q %q, want a warning carrying the reason", r.mark, r.detail)
+	if r.mark != "⚠" || !strings.Contains(r.detail, "operation not permitted") {
+		t.Fatalf("local addresses = %q %q, want a warning (⚠) carrying the reason", r.mark, r.detail)
 	}
 	if code != 0 {
 		t.Fatalf("code = %d, want 0: not knowing is a warning, not a failure\n%s", code, out.String())
@@ -552,7 +623,7 @@ func TestDoctorNamesTheMissingTargetFlags(t *testing.T) {
 	if !strings.Contains(r.next, "--cluster") && !strings.Contains(r.next, "target.cluster") {
 		t.Errorf("the next step must say how to name the service: %q", r.next)
 	}
-	wantMarks(t, rows, map[string]string{"helper": "✓", "setgid tetherd-exec": "✓", "session-manager-plugin": "✓", "AWS identity": "✓"})
+	wantMarks(t, rows, map[string]string{"helper": "✓", "setgid tetherd-exec": "✓", "session-manager-plugin": "✓", "your AWS identity": "✓"})
 }
 
 // TestStatGIDKeepsTheSetgidBit pins the one fact the setgid row turns on.
@@ -621,7 +692,7 @@ func TestDoctorExitsZeroOnWarningsOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := wantRowSet(t, out.String())
-	wantMarks(t, rows, map[string]string{"remote CIDRs": "!", "local addresses": "!"})
+	wantMarks(t, rows, map[string]string{"remote CIDRs": "⚠", "local addresses": "⚠"})
 	for _, r := range rows {
 		if r.mark == "✗" {
 			t.Fatalf("no row should have failed: %v", r)
@@ -1049,7 +1120,7 @@ func TestDoctorBoundsASilentAgent(t *testing.T) {
 	rows := wantRowSet(t, out.String())
 	// The handshake is what failed, and the domains were never asked - so
 	// they must not be reported as broken DNS records.
-	wantMarks(t, rows, map[string]string{"agent session": "✗", "attachable task": "✓", "task env": "!", "remote domains": "!"})
+	wantMarks(t, rows, map[string]string{"agent session": "✗", "attachable task": "✓", "task env": "?", "task role": "?", "remote domains": "?"})
 	if d := findRow(t, rows, "remote domains").detail; !strings.Contains(d, "not checked") {
 		t.Errorf("remote domains = %q, want it named as not checked", d)
 	}
@@ -1099,7 +1170,7 @@ func TestDoctorFailsWhenTheAgentIsUnreachable(t *testing.T) {
 	}
 	// Everything ECS could see is still fine, which is exactly why this row
 	// is needed.
-	wantMarks(t, rows, map[string]string{"attachable task": "✓", "pidMode": "✓", "remote CIDRs": "✓", "task env": "!"})
+	wantMarks(t, rows, map[string]string{"attachable task": "✓", "pidMode": "✓", "remote CIDRs": "✓", "task env": "?", "task role": "?"})
 	// A refused connection is what CheckAgentSession's advice is written
 	// for, so it must keep it rather than being routed to the timeout row.
 	if !strings.Contains(r.next, "tetherd-agent") {
@@ -1180,10 +1251,652 @@ func TestDoctorFailsWhenTheAgentCannotReadTheTaskEnv(t *testing.T) {
 	// The point of the row: everything that could see this before it stays
 	// green, so nothing else would have caught it.
 	wantMarks(t, rows, map[string]string{"pidMode": "✓", "agent session": "✓", "attachable task": "✓"})
+	// Without the task's environment there is no endpoint to relay, and the
+	// row must say it was not checked rather than report that the task
+	// advertises no role - which is a different statement, and untrue.
+	if role := findRow(t, rows, "task role"); role.mark != "?" || !strings.Contains(role.detail, "not checked") {
+		t.Errorf("task role = %q %q, want it reported as not checked", role.mark, role.detail)
+	}
+}
+
+// credEndpointDialer serves h on loopback and returns a dialer that reaches
+// it whatever address it is asked for, which is how the in-process agent
+// stands in for a task whose credential endpoint is at 169.254.170.2.
+func credEndpointDialer(t *testing.T, h http.HandlerFunc) func(context.Context, string) (net.Conn, error) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
+	t.Cleanup(func() { srv.Close() })
+	go srv.Serve(ln)
+	return func(ctx context.Context, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", ln.Addr().String())
+	}
+}
+
+// taskCredentials is what the endpoint answers with.
+const taskCredentials = `{"AccessKeyId":"AKIATASKROLE","SecretAccessKey":"s","Token":"t","Expiration":"2126-09-13T00:00:00Z"}`
+
+// TestDoctorReportsTheTaskRoleRatherThanTheDevelopersOwnIdentity: the two
+// are different facts and the report used to carry only the second under a
+// name that did not say so. `tetherd run` prints ✓ iam with the *task
+// role's* ARN, fetched through the loopback endpoint it serves over the
+// session; doctor showing the developer's own ARN under "AWS identity" was
+// green on a machine where the child would have had no AWS identity at all.
+func TestDoctorReportsTheTaskRoleRatherThanTheDevelopersOwnIdentity(t *testing.T) {
+	const taskRole = "arn:aws:sts::1:assumed-role/tetherd-dev-task/abc"
+	dial := credEndpointDialer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/credentials/x" {
+			http.Error(w, "wrong path", http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(taskCredentials))
+	})
+	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil, dial)
+	d := healthyDoctorDeps(healthyProvider(ag.addr))
+	var gotKey, gotRegion string
+	d.CallerIdentity = func(_ context.Context, c aws.Credentials, region string) (string, error) {
+		gotKey, gotRegion = c.AccessKeyID, region
+		return taskRole, nil
+	}
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	}
+	rows := wantRowSet(t, out.String())
+	role := findRow(t, rows, "task role")
+	if role.mark != "✓" || !strings.Contains(role.detail, taskRole) {
+		t.Fatalf("task role = %q %q, want the task role's own ARN", role.mark, role.detail)
+	}
+	// The identity row above still reports the developer, and the task role
+	// row must not be a second copy of it.
+	if strings.Contains(role.detail, "assumed-role/dev/me") {
+		t.Errorf("the task role row is reporting the developer's identity: %q", role.detail)
+	}
+	if id := findRow(t, rows, "your AWS identity").detail; id != "arn:aws:sts::1:assumed-role/dev/me" {
+		t.Errorf("your AWS identity = %q, want the developer's own ARN", id)
+	}
+	// The ARN came from credentials the *task's* endpoint served, through
+	// the session: a row that called STS with the laptop's own credentials
+	// would print an ARN too, and it would be the wrong one.
+	if gotKey != "AKIATASKROLE" {
+		t.Errorf("sts was called with access key %q, want the one the task's endpoint served", gotKey)
+	}
+	if gotRegion != "ap-northeast-1" {
+		t.Errorf("sts was called for region %q, want the task's", gotRegion)
+	}
+	// And it took the child's own path: a loopback port, then the session.
+	if !strings.Contains(role.detail, "127.0.0.1:") {
+		t.Errorf("the row must name the loopback endpoint the child would be pointed at, got %q", role.detail)
+	}
+}
+
+// A task that advertises no role is not a problem: `tetherd run` prints no
+// iam line for it and leaves the developer's own credentials in the child's
+// environment. The row still has to say which of the two worlds this is.
+func TestDoctorSaysWhenTheTaskAdvertisesNoRole(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	d := healthyDoctorDeps(healthyProvider(ag.addr))
+	d.CallerIdentity = func(context.Context, aws.Credentials, string) (string, error) {
+		t.Error("nothing should be asked of STS for a task with no role to relay")
+		return "", nil
+	}
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	}
+	r := findRow(t, wantRowSet(t, out.String()), "task role")
+	if r.mark != "✓" || !strings.Contains(r.detail, "no role") {
+		t.Fatalf("task role = %q %q, want it to say the task advertises no role", r.mark, r.detail)
+	}
+}
+
+// The credentials not arriving is the child having no AWS identity, so it
+// fails. This is the machine `tetherd run` warns on while every other doctor
+// row is green.
+func TestDoctorFailsWhenTheTaskRoleCannotBeFetched(t *testing.T) {
+	dial := credEndpointDialer(t, func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no credentials for you", http.StatusServiceUnavailable)
+	})
+	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil, dial)
+	d := healthyDoctorDeps(healthyProvider(ag.addr))
+	d.CallerIdentity = func(context.Context, aws.Credentials, string) (string, error) {
+		t.Error("STS must not be asked about credentials that never arrived")
+		return "", nil
+	}
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1: a child with no AWS identity is a failure\n%s", code, out.String())
+	}
+	rows := wantRowSet(t, out.String())
+	r := findRow(t, rows, "task role")
+	if r.mark != "✗" || !strings.Contains(r.detail, "503") {
+		t.Fatalf("task role = %q %q, want a failure carrying what the endpoint said", r.mark, r.detail)
+	}
+	if !strings.Contains(r.next, "task role") {
+		t.Errorf("the next step must point at the role and the sidecar, got %q", r.next)
+	}
+	// Everything that could see this before stays green, which is why the
+	// row is needed at all.
+	wantMarks(t, rows, map[string]string{"agent session": "✓", "task env": "✓", "your AWS identity": "✓"})
+}
+
+// STS being unreachable is not the setup's problem: the credentials arrived,
+// the child can sign with them, and a developer on a plane must still get a
+// report that exits 0. The row says what it could not establish.
+func TestDoctorDoesNotFailTheTaskRoleWhenSTSCannotBeAsked(t *testing.T) {
+	dial := credEndpointDialer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(taskCredentials))
+	})
+	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil, dial)
+	d := healthyDoctorDeps(healthyProvider(ag.addr))
+	d.CallerIdentity = func(context.Context, aws.Credentials, string) (string, error) {
+		return "", errors.New("dial tcp: i/o timeout")
+	}
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0: an unreachable STS is not a broken setup\n%s", code, out.String())
+	}
+	r := findRow(t, wantRowSet(t, out.String()), "task role")
+	if r.mark != "?" {
+		t.Fatalf("task role = %q %q, want ? (could not be checked)", r.mark, r.detail)
+	}
+	if !strings.Contains(r.detail, "reached tetherd") || !strings.Contains(r.detail, "i/o timeout") {
+		t.Errorf("the row must say the credentials arrived and why their owner is unknown, got %q", r.detail)
+	}
+}
+
+// TestDoctorRoutesTheTaskRoleClocksToTheirOwnLeg: the row has two legs with
+// two different meanings, and a bound that expires on either arrives as
+// nothing but "context deadline exceeded" - which names neither the leg nor
+// the clock. The sibling rows each have a test for this
+// (TestDoctorRoutesAWSTimeoutsToTheirOwnRow,
+// TestDoctorRoutesAnAgentTimeoutToItsOwnRow); without one here, deleting
+// both names left the whole suite green.
+//
+// The legs are deliberately graded apart. The fetch is the child's own path,
+// so its clock is a failure: nothing came back over the path the child would
+// use. sts:GetCallerIdentity leaves the laptop for sts.<region>.amazonaws.com,
+// so its clock is a ? - the credentials did arrive, and the child can sign
+// with them whatever STS says.
+func TestDoctorRoutesTheTaskRoleClocksToTheirOwnLeg(t *testing.T) {
+	const bound = 500 * time.Millisecond
+
+	t.Run("the credential endpoint", func(t *testing.T) {
+		hang := make(chan struct{})
+		t.Cleanup(func() { close(hang) })
+		dial := credEndpointDialer(t, func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-hang:
+			case <-r.Context().Done():
+			}
+		})
+		ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil, dial)
+		d := healthyDoctorDeps(healthyProvider(ag.addr))
+		d.CallerIdentity = func(context.Context, aws.Credentials, string) (string, error) {
+			t.Error("STS must not be asked about credentials that never arrived")
+			return "", nil
+		}
+		opts := doctorOpts()
+		opts.Timeout = bound
+
+		var out strings.Builder
+		code, err := DoctorRunWithDeps(context.Background(), opts, &out, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := findRow(t, wantRowSet(t, out.String()), "task role")
+		if r.mark != "✗" {
+			t.Fatalf("task role = %q %q, want ✗: nothing came back over the path the child would use", r.mark, r.detail)
+		}
+		// The clock is named, and named as this leg's: "context deadline
+		// exceeded" would leave a developer unable to tell which of the two
+		// calls the row is talking about.
+		if !strings.Contains(r.detail, "the task's credential endpoint") || !strings.Contains(r.detail, "did not answer") {
+			t.Errorf("the detail must name the leg that ran out of time and its bound, got %q", r.detail)
+		}
+		if strings.Contains(r.detail, "context deadline exceeded") {
+			t.Errorf("the raw clock error must not reach the report: %q", r.detail)
+		}
+		if code != 1 {
+			t.Fatalf("code = %d, want 1\n%s", code, out.String())
+		}
+	})
+
+	t.Run("sts", func(t *testing.T) {
+		dial := credEndpointDialer(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Write([]byte(taskCredentials))
+		})
+		ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil, dial)
+		d := healthyDoctorDeps(healthyProvider(ag.addr))
+		d.CallerIdentity = func(ctx context.Context, _ aws.Credentials, _ string) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		opts := doctorOpts()
+		opts.Timeout = bound
+
+		var out strings.Builder
+		code, err := DoctorRunWithDeps(context.Background(), opts, &out, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := findRow(t, wantRowSet(t, out.String()), "task role")
+		if r.mark != "?" {
+			t.Fatalf("task role = %q %q, want ?: the credentials arrived, only their owner is unknown", r.mark, r.detail)
+		}
+		if !strings.Contains(r.detail, "with the task's credentials") || !strings.Contains(r.detail, "did not answer") {
+			t.Errorf("the detail must name the STS call that ran out of time and its bound, got %q", r.detail)
+		}
+		if strings.Contains(r.detail, "context deadline exceeded") {
+			t.Errorf("the raw clock error must not reach the report: %q", r.detail)
+		}
+		// The fact that was established must survive the clock: the child
+		// would hold the task role either way.
+		if !strings.Contains(r.detail, "reached tetherd") {
+			t.Errorf("the row must still say the credentials arrived: %q", r.detail)
+		}
+		if code != 0 {
+			t.Fatalf("code = %d, want 0: an STS that did not answer is not a broken setup\n%s", code, out.String())
+		}
+	})
+}
+
+// TestDoctorChecksWhereAStolenRequestWouldGo: steal is on by default and the
+// agent is on the ALB's data path whether or not anyone is listening here,
+// so a laptop with no server on the local port answers its own stolen
+// requests with 502 while every other row in the report is green. That is
+// the report this row exists to stop.
+func TestDoctorChecksWhereAStolenRequestWouldGo(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	opts := doctorOpts()
+	opts.NoIncoming = false
+	opts.Token = "a-token"
+	opts.LocalPort = port
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(ag.addr)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	}
+	r := findRow(t, wantRowSet(t, out.String()), "steal")
+	if r.mark != "✓" {
+		t.Fatalf("steal = %q %q, want ✓: something is listening", r.mark, r.detail)
+	}
+	// The port is the one that was resolved, and the header names are the
+	// ones stealSettings applies - the row has to describe the run that
+	// would happen, not a second set of defaults spelled out here.
+	for _, want := range []string{fmt.Sprint(port), DefaultMatchHeader, DefaultMatchTokenHeader} {
+		if !strings.Contains(r.detail, want) {
+			t.Errorf("steal detail %q does not mention %q", r.detail, want)
+		}
+	}
+}
+
+func TestDoctorWarnsWhenNothingWouldTakeAStolenRequest(t *testing.T) {
+	// A port with nothing on it: bound to learn a free one, then released.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	opts := doctorOpts()
+	opts.NoIncoming = false
+	opts.Token = "a-token"
+	opts.LocalPort = port
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(ag.addr)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	r := findRow(t, rows, "steal")
+	if r.mark != "⚠" {
+		t.Fatalf("steal = %q %q, want ⚠: nothing is listening on the local port", r.mark, r.detail)
+	}
+	// "would come back 502", not "502": the detail names the port, and a
+	// bare "502" is a substring of about one ephemeral port in a hundred
+	// and twenty - so this assertion could be satisfied by the port number
+	// alone, passing for a detail that never said what the caller gets.
+	if !strings.Contains(r.detail, fmt.Sprint(port)) || !strings.Contains(r.detail, "would come back 502") {
+		t.Errorf("the warning must name the port and what the caller would get, got %q", r.detail)
+	}
+	if !strings.Contains(r.next, "--no-incoming") {
+		t.Errorf("the next step must name the way out, got %q", r.next)
+	}
+	// A warning, not a failure: a developer who starts their server after
+	// running doctor has nothing wrong with their setup.
+	if code != 0 {
+		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	}
+	// And this is the row nothing else would have caught.
+	for _, other := range rows {
+		if other.name != "steal" && other.mark != "✓" {
+			t.Errorf("only the steal row should have anything to say: %v", other)
+		}
+	}
+}
+
+// The command now fills the token and the port from the config files
+// (applySharedIncoming, exercised by
+// TestDoctorCommandJudgesStealFromTheConfigFiles), so this is the arm that
+// is left: a machine whose personal file holds no token at all, which is
+// also the machine `tetherd run` refuses to start on. The row must say it
+// could not be checked rather than fail - a report is about the setup, and
+// what is missing here is a settings file, which the next step names.
+func TestDoctorSaysItCouldNotCheckStealWithoutTheSettings(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	opts := doctorOpts()
+	opts.NoIncoming = false // as `tetherd doctor` itself arrives: no flag turns it off
+	opts.Token = ""
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(ag.addr)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0: a row that could not be checked must not fail the command\n%s", code, out.String())
+	}
+	r := findRow(t, wantRowSet(t, out.String()), "steal")
+	if r.mark != "?" || !strings.Contains(r.detail, "not checked") {
+		t.Fatalf("steal = %q %q, want ? (could not be checked)", r.mark, r.detail)
+	}
+	if !strings.Contains(r.next, "incoming.local_port") {
+		t.Errorf("the next step must say where the settings come from, got %q", r.next)
+	}
+	// One line, asserted on the raw report and by position.
+	// errNoStealToken carries run's own multi-line advice - three lines, the
+	// last two indented for a terminal - and a table cannot hold it. The
+	// obvious assertion ("the detail has no newline in it") cannot fail,
+	// because parseDoctorRows splits the report on "\n" first and hands back
+	// a detail that was already cut at the first one: it was written, it ran,
+	// and dropping the firstLine call it was guarding changed nothing. What
+	// does catch it is the line that follows the row: it must be this row's
+	// next step, not the rest of the detail.
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	at := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, "? steal") {
+			at = i
+		}
+	}
+	if at < 0 {
+		t.Fatalf("no steal row in the raw report:\n%s", out.String())
+	}
+	if !strings.Contains(lines[at], "no steal token") {
+		t.Errorf("the refusal must be on the row's own line, got %q", lines[at])
+	}
+	if at+1 >= len(lines) || !strings.Contains(lines[at+1], "→ ") {
+		t.Errorf("the line after the steal row must be its next step, not the rest of a multi-line detail: %q\n%s", lines[at+1], out.String())
+	}
+}
+
+// TestDoctorDoesNotCallAClockAnEmptyPort: a connect that never came back is
+// not a port with nothing on it. Every other row in doctor.go routes its
+// clock (isContextError / isCheckTimeout) so that a bound does not arrive
+// dressed as a finding; this row dialed and read any error as "nothing is
+// listening", which is a verdict about a port that may well have a server on
+// it - and this test has one, so the ⚠ would be a lie about a measurement
+// doctor never took.
+//
+// The report is out of time before the row is reached, which is the
+// reachable shape (the overall budget expiring, or the developer's own
+// interrupt): the connect's own context is already dead, so nothing is
+// dialed at all.
+//
+// Two things about the first version of this test were wrong, and they are
+// separate. What actually made it flaky is the "502" assertion below, not a
+// clock - see the comment there; the report it failed on was correct, which
+// is why every failure quoted a detail that reads exactly right.
+//
+// What was fragile without ever having been the failure is how the ordering
+// was established: Budget=300ms plus a blocking LookPath, trusting the
+// 300ms to be gone by the time the row ran. Nothing here trusts a wall
+// clock now. The per-check bound is taken out of the report through the
+// boundedAfter seam, and the report's own time is ended by hand from inside
+// the plugin check - the row immediately before this one - so bounded's only
+// reachable exit for that check is ctx.Done(), and the report's context is
+// dead before stealRow is entered on any machine, under any load. The test
+// also costs no wall time at all now, which is what made 50,000 runs cheap
+// enough to find the collision below in the first place.
+func TestDoctorDoesNotCallAClockAnEmptyPort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	d := healthyDoctorDeps(healthyProvider(ag.addr))
+
+	// The bound's clock, removed: a nil channel is never ready, so no
+	// bounded call in this report can be ended by its per-check timeout.
+	// Every check here either answers or is ended by the report's own
+	// context, and no row's outcome can turn on how long this machine took.
+	restoreBoundedAfter(t, func(time.Duration, <-chan struct{}) <-chan time.Time { return nil })
+
+	// The report's clock, spent on demand. LookPath ends the report's time
+	// and only then blocks, and it never returns, so the plugin check can
+	// leave bounded through ctx.Done() and nothing else - which makes
+	// "the report has run out of time" a fact established before the check
+	// that precedes the steal row has even returned.
+	ctx, spend := context.WithCancel(context.Background())
+	defer spend()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	d.LookPath = func(string) (string, error) {
+		spend()
+		// bounded abandons this call rather than joining it; the test
+		// releases it on the way out so the goroutine does not outlive it.
+		<-release
+		return "/opt/homebrew/bin/session-manager-plugin", nil
+	}
+
+	opts := doctorOpts()
+	opts.NoIncoming = false
+	opts.Token = "a-token"
+	opts.LocalPort = port
+	// Both bounds out of reach on purpose. Neither is what ends this
+	// report - spend() is - and a test about a clock misreported as a
+	// finding should not itself depend on one.
+	opts.Timeout = time.Hour
+	opts.Budget = time.Hour
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(ctx, opts, &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := findRow(t, wantRowSet(t, out.String()), "steal")
+	if r.mark == "⚠" {
+		t.Fatalf("a port with a listener on it was reported as empty: %q %q", r.mark, r.detail)
+	}
+	if r.mark != "?" {
+		t.Fatalf("steal = %q %q, want ? (the clock, not a verdict)", r.mark, r.detail)
+	}
+	// The phrases CheckSteal's ⚠ detail is made of, not a fragment of one.
+	// A bare "502" was this test's flake: the detail names the port, and
+	// 137 of the 16384 ephemeral ports contain those three digits (52502,
+	// 50231, 65029), so about one run in a hundred and twenty failed here
+	// on a ? row that had just satisfied every assertion above. Anchoring
+	// on the wording fixes that and tightens the check while it is at it:
+	// "would come back 502" can only come from the ⚠ arm, where "502" on
+	// its own could come from anywhere in the row.
+	for _, never := range []string{"nothing is listening", "would come back 502"} {
+		if strings.Contains(r.detail, never) {
+			t.Errorf("a clock must not be reported as a finding about the port: %q", r.detail)
+		}
+	}
+	// It still names the port, so the developer knows which one was not
+	// reached, and the next step is about the clock rather than about
+	// starting a server.
+	if !strings.Contains(r.detail, fmt.Sprint(port)) {
+		t.Errorf("the row must name the port it could not reach: %q", r.detail)
+	}
+	if strings.Contains(r.next, "--no-incoming") {
+		t.Errorf("nothing here says steal is misconfigured: %q", r.next)
+	}
+	// The budget still fails the report - through the row it actually cut
+	// short, not through this one.
+	if code != 1 {
+		t.Fatalf("code = %d, want 1 (the plugin row the budget cut short)\n%s", code, out.String())
+	}
+	plugin := findRow(t, wantRowSet(t, out.String()), "session-manager-plugin")
+	if plugin.mark != "✗" {
+		t.Errorf("session-manager-plugin = %q, want ✗: that is the row the budget cut short", plugin.mark)
+	}
+	// And it must not borrow the ? rows' wording while doing it: a row the
+	// budget cut short fails on purpose, so a detail that reads "not
+	// checked" would say the opposite of the mark beside it.
+	if strings.Contains(plugin.detail, "not checked") {
+		t.Errorf("a ✗ row must not say it was not checked: %q", plugin.detail)
+	}
+}
+
+// TestCheckTimedOutKeepsTheUncheckedWordingForUncheckedRows: "not checked" is
+// what a ? row says, and only a ? row - that is the rule
+// wantUncheckedRowsSaySo asserts across the report. This error's two messages
+// are the wording most at risk of breaking it, because most of what carries
+// them is timedOut, which is a ✗ deliberately (an incomplete report that
+// exited 0 would tell a script the machine is fine), and because one of them
+// used to read "<what> was not checked: tetherd doctor ran out of time".
+func TestCheckTimedOutKeepsTheUncheckedWordingForUncheckedRows(t *testing.T) {
+	spent, cancel := context.WithCancel(context.Background())
+	cancel()
+	budgetGone := checkTimedOut(spent, "the plugin lookup", time.Second)
+	live := checkTimedOut(context.Background(), "the plugin lookup", time.Second)
+
+	for _, e := range []*checkTimeout{budgetGone, live} {
+		if strings.Contains(e.Error(), "not checked") {
+			t.Errorf("a clock that ends in a ✗ row must not say it was not checked: %q", e.Error())
+		}
+		if !strings.Contains(e.Error(), "the plugin lookup") {
+			t.Errorf("the message must name what did not answer: %q", e.Error())
+		}
+	}
+	// Each still says why the wait ended, which is the whole reason this
+	// error exists rather than "context deadline exceeded".
+	if !strings.Contains(budgetGone.Error(), "ran out of time") {
+		t.Errorf("the budget's message must say the report ran out of time: %q", budgetGone.Error())
+	}
+	if !strings.Contains(live.Error(), "within 1s") {
+		t.Errorf("the per-check message must name the bound it exceeded: %q", live.Error())
+	}
+	if budgetGone.Error() == live.Error() {
+		t.Error("the two clocks must read differently: one is this check, the other the whole report")
+	}
+	// The row it becomes: a failure, and one that says what to do.
+	r := timedOut("session-manager-plugin", budgetGone)
+	if r.Status != doctor.Fail {
+		t.Errorf("a check that never answered is a failure, got %v", r.Status)
+	}
+	if strings.HasPrefix(r.Detail, "not checked:") {
+		t.Errorf("wantUncheckedRowsSaySo would reject this row: %q", r.Detail)
+	}
+}
+
+// TestDoctorProbesTheStealPortByConnectingAndSendingNothing pins the two
+// rules the probe is written to: it connects (rather than trying to bind the
+// port, which is a different question and would take the port away from the
+// server the developer is about to start), and it writes nothing (a probe
+// that spoke HTTP would land in the developer's own access log as a request
+// they did not make).
+//
+// Both are invisible in the row: a bind probe would print the same ✓ here,
+// and so would one that sent a GET. The developer's own listener is the only
+// place the difference shows, so this test is that listener.
+func TestDoctorProbesTheStealPortByConnectingAndSendingNothing(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	read := make(chan int, 4)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Whatever the probe sent, if anything. A closed connection
+			// reads 0 bytes and EOF; a probe that wrote a request line
+			// reads more.
+			c.SetReadDeadline(time.Now().Add(2 * time.Second))
+			var buf [1]byte
+			n, _ := c.Read(buf[:])
+			read <- n
+			c.Close()
+		}
+	}()
+
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	opts := doctorOpts()
+	opts.NoIncoming = false
+	opts.Token = "a-token"
+	opts.LocalPort = port
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(ag.addr)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	}
+	if m := findRow(t, wantRowSet(t, out.String()), "steal").mark; m != "✓" {
+		t.Fatalf("steal = %q, want ✓", m)
+	}
+	select {
+	case n := <-read:
+		if n != 0 {
+			t.Errorf("the probe wrote %d byte(s) to the developer's process; it must send nothing", n)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("nothing ever connected to the local port: the row must be judged by connecting to it, not by trying to bind it")
+	}
 }
 
 // TestDoctorSkipAgentReportsTheRowsItGivesUp: --skip-agent is for scripted or
-// looped use, where one SSM session per invocation is noise. The three rows
+// looped use, where one SSM session per invocation is noise. The four rows
 // that need a session must then say they were not checked - a report that
 // silently loses the only rows proving `tetherd run` can attach would be
 // worse than a slower one. The provider points at a dead address, so a dial
@@ -1206,8 +1919,8 @@ func TestDoctorSkipAgentReportsTheRowsItGivesUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := wantRowSet(t, out.String())
-	wantMarks(t, rows, map[string]string{"agent session": "!", "task env": "!", "remote domains": "!"})
-	for _, name := range []string{"agent session", "task env"} {
+	wantMarks(t, rows, map[string]string{"agent session": "?", "task env": "?", "task role": "?", "remote domains": "?"})
+	for _, name := range []string{"agent session", "task env", "task role"} {
 		r := findRow(t, rows, name)
 		if !strings.Contains(r.detail, "--skip-agent") {
 			t.Errorf("%s must say why it was skipped, got %q", name, r.detail)
@@ -1261,9 +1974,9 @@ func TestDoctorRoutesAWSTimeoutsToTheirOwnRow(t *testing.T) {
 		t.Fatalf("code = %d, want 1\n%s", code, out.String())
 	}
 	check(t, out.String(), map[string]string{
-		"AWS identity": "aws sso login",
-		"pidMode":      "ecs:DescribeTaskDefinition",
-		"remote CIDRs": ".tetherd.yml",
+		"your AWS identity": "aws sso login",
+		"pidMode":           "ecs:DescribeTaskDefinition",
+		"remote CIDRs":      ".tetherd.yml",
 	})
 
 	// Discovery timing out is its own run: it makes every row below it
@@ -1299,7 +2012,7 @@ func TestDoctorDoesNotBlameTheDomainsWhenTheBudgetRunsOut(t *testing.T) {
 	}
 	rows := wantRowSet(t, out.String())
 	r := findRow(t, rows, "remote domains")
-	if r.mark != "!" || !strings.Contains(r.detail, "not checked") {
+	if r.mark != "?" || !strings.Contains(r.detail, "not checked") {
 		t.Fatalf("remote domains = %q %q, want them reported as not checked", r.mark, r.detail)
 	}
 	if strings.Contains(r.detail, "context deadline") {
@@ -1809,4 +2522,93 @@ func TestDoctorGivesTheAgentRowABoundThatCoversItsWork(t *testing.T) {
 			t.Errorf("the agent dial had %s left, want no more than the --timeout the operator typed", tr.left)
 		}
 	})
+}
+
+// TestDoctorCommandJudgesStealFromTheConfigFiles closes the gap the steal
+// row shipped with: every other test of that row hands DoctorRun its
+// settings in-process, which proves the judgement but not that the command
+// ever makes it - and it did not. `tetherd doctor` called applyConfig and
+// nothing that fills the token, the port or the header names, so the row
+// read "?" on every machine, including ones with a good token in
+// ~/.tetherd/config.yml and an incoming block in .tetherd.yml.
+//
+// This drives the real command (root -> applyConfig -> applySharedIncoming)
+// and lets it run the real report, so the wiring and the row are exercised
+// together rather than one standing in for the other. Only AWS and the
+// machine probes are stood in for; the agent is the in-process one and the
+// listener is real, on loopback.
+func TestDoctorCommandJudgesStealFromTheConfigFiles(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, ".tetherd.yml")
+	body := fmt.Sprintf("version: 1\ntarget:\n  cluster: c\n  service: api\n  env: dev\nincoming:\n  local_port: %d\n  match:\n    header: X-Team-User\n    token_header: X-Team-Token\n", port)
+	if err := os.WriteFile(cfgPath, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+	writePersonal(t, dir, "user: shota\ntoken: tok-from-personal\n")
+
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	var out strings.Builder
+	doctorFn = func(opts DoctorOptions) (int, error) {
+		return DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(ag.addr)))
+	}
+	t.Cleanup(func() { doctorFn = defaultDoctor })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"doctor", "--config", cfgPath})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("a healthy machine must exit 0: %v\n%s", err, out.String())
+	}
+
+	r := findRow(t, wantRowSet(t, out.String()), "steal")
+	if r.mark != "✓" {
+		t.Fatalf("steal = %q %q, want ✓: a machine with a token and a listener", r.mark, r.detail)
+	}
+	if strings.Contains(r.detail, "not checked") {
+		t.Errorf("the row must be a judgement, not a \"could not be checked\": %q", r.detail)
+	}
+	// The port the repository configured, as the address a stolen request
+	// would actually be dialed at - not a default guessed here, which is
+	// the other way this row can lie.
+	if want := fmt.Sprintf("127.0.0.1:%d", port); !strings.Contains(r.detail, want) {
+		t.Errorf("steal detail %q does not name %s", r.detail, want)
+	}
+	// The header names come from the same file, and both of them matter: a
+	// request needs the user header and the token header to be taken.
+	for _, want := range []string{"X-Team-User", "X-Team-Token"} {
+		if !strings.Contains(r.detail, want) {
+			t.Errorf("steal detail %q does not name the configured %s", r.detail, want)
+		}
+	}
+	// The token reached the report but must never be printed by it.
+	if strings.Contains(out.String(), "tok-from-personal") {
+		t.Errorf("the report must not print the steal token:\n%s", out.String())
+	}
+}
+
+// TestSkipAgentHelpNamesEveryRowItGivesUp: --skip-agent's help is the only
+// place a developer learns what they stop checking, and it went stale the
+// moment a fourth row started needing the session - it named three while
+// the code reported four as not checked. A list in prose that no test reads
+// is a list that drifts, so this reads it.
+func TestSkipAgentHelpNamesEveryRowItGivesUp(t *testing.T) {
+	f := newDoctorCommand().Flags().Lookup("skip-agent")
+	if f == nil {
+		t.Fatal("--skip-agent must exist")
+	}
+	// The rows DoctorRun reports as Unknown when no session is opened; see
+	// TestDoctorSkipAgentReportsTheRowsItGivesUp, which pins the behaviour
+	// this text describes.
+	for _, row := range []string{"agent session", "task env", "task role", "remote domain"} {
+		if !strings.Contains(f.Usage, row) {
+			t.Errorf("--skip-agent help does not name the %q row it gives up: %q", row, f.Usage)
+		}
+	}
 }

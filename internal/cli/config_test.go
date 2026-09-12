@@ -2,10 +2,13 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kyosu-1/tetherd/internal/config"
 )
 
 func TestApplyConfigFillsUnsetFlagsOnly(t *testing.T) {
@@ -245,15 +248,19 @@ func TestApplyConfigSeedsThePersonalFileWithTheResolvedUser(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	body, err := os.ReadFile(filepath.Join(home, ".tetherd", "config.yml"))
+	// The parsed `user:` field, not a substring of the file body: the file
+	// also carries the randomly generated steal token, and a base64url
+	// token that happens to spell "bob" (roughly 1 run in 6,400 for a
+	// three-character name - it has already happened once on this branch)
+	// would fail the negative check for a reason that has nothing to do
+	// with which user was seeded. Parsing also catches the two fields
+	// being written under each other's keys, which no substring check can.
+	cfg, err := config.Load("", filepath.Join(home, ".tetherd", "config.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(body), "user: alice") {
-		t.Fatalf("a first run with --user alice must seed the personal file with alice, not $USER=bob: %s", body)
-	}
-	if strings.Contains(string(body), "bob") {
-		t.Fatalf("the personal file must not mention $USER=bob at all: %s", body)
+	if cfg.Personal.User != "alice" {
+		t.Fatalf("a first run with --user alice must seed the personal file with alice, not $USER=bob: user = %q", cfg.Personal.User)
 	}
 }
 
@@ -531,4 +538,135 @@ func TestApplyIncomingPicksUpTheGeneratedToken(t *testing.T) {
 	if !strings.Contains(string(onDisk), string(captured.Token)) {
 		t.Errorf("the token in RunOptions is not the one on disk")
 	}
+}
+
+// TestApplySharedIncomingReachesDoctor pins the wiring that makes doctor's
+// steal row a judgement rather than a "could not be checked" on every
+// machine: `tetherd doctor` registers none of run's incoming flags, so it
+// calls applySharedIncoming (the header names and the token, which no flag
+// binds) and applyIncomingPort (incoming.local_port, which has a flag on
+// `run` but none here) instead of applyIncoming, whose changed() guards
+// panic on a command without those flags. A regression here either panics
+// or silently hands doctor zero settings, and the row can only say nothing.
+func TestApplySharedIncomingReachesDoctor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".tetherd.yml")
+	body := "version: 1\nincoming:\n  local_port: 4321\n  match:\n    header: X-Team-User\n    token_header: X-Team-Token\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+	writePersonal(t, dir, "user: shota\ntoken: tok-from-personal\n")
+
+	var captured DoctorOptions
+	doctorFn = func(opts DoctorOptions) (int, error) { captured = opts; return 0, nil }
+	t.Cleanup(func() { doctorFn = defaultDoctor })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"doctor", "--config", path})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if captured.LocalPort != 4321 {
+		t.Errorf("LocalPort = %d, want incoming.local_port: a guessed default would report the wrong port to every repository that sets one", captured.LocalPort)
+	}
+	if captured.MatchHeader != "X-Team-User" || captured.MatchTokenHeader != "X-Team-Token" {
+		t.Errorf("match headers = %q / %q, want the file's", captured.MatchHeader, captured.MatchTokenHeader)
+	}
+	if string(captured.Token) != "tok-from-personal" {
+		t.Errorf("Token = %q, want the personal file's: without it the row says a machine with a good token has none", string(captured.Token))
+	}
+	// The settings doctor judges are the ones run would resolve, which is
+	// the whole claim the row makes.
+	st, err := stealSettings(captured.RunOptions)
+	if err != nil {
+		t.Fatalf("stealSettings: %v", err)
+	}
+	if st.LocalPort != 4321 || st.Incoming.Header != "X-Team-User" || st.Incoming.TokenHeader != "X-Team-Token" {
+		t.Errorf("resolved = %+v", st)
+	}
+}
+
+// TestLocalPortFlagBeatsTheIncomingBlock is the hazard applySharedIncoming
+// introduced by existing: the steal settings are now applied from two
+// places, and if incoming.local_port were applied in the flag-free half -
+// as the first sketch of that split had it - a typed --local-port would be
+// silently replaced by whatever the repository committed.
+//
+// Precedence in this project is decided on whether the flag was *passed*,
+// not on whether its value is non-zero (flags > personal > shared >
+// defaults), so the two cases a value-based guard (`if opts.LocalPort == 0
+// || opts.LocalPort == DefaultLocalPort`) would get wrong are pinned here
+// as well: the flag typed with the default port's own value, and the flag
+// typed with zero.
+//
+// The file's port must therefore differ from every typed value, including
+// from DefaultLocalPort. An earlier version of this test committed 8080 to
+// the file and typed 8080 for the default-port case - typed value, config
+// value and expectation one number, so that case could only ever pass, and
+// it did pass under both mutations it exists to catch. What it has to
+// distinguish is "a typed value that happens to equal the default still
+// beats a different config value", which needs the two to be different
+// numbers.
+func TestLocalPortFlagBeatsTheIncomingBlock(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		args []string
+		// want is RunOptions.LocalPort, wantResolved what stealSettings
+		// makes of it - zero is the one value those two differ on.
+		want, wantResolved int
+	}{
+		{"a port the developer typed", []string{"--local-port", "3000"}, 3000, 3000},
+		{"the default port, typed", []string{"--local-port", fmt.Sprint(DefaultLocalPort)}, DefaultLocalPort, DefaultLocalPort},
+		{"zero, typed", []string{"--local-port", "0"}, 0, DefaultLocalPort},
+		{"no flag at all", nil, 9999, 9999},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, ".tetherd.yml")
+			// 9999 in the file: not zero, and not DefaultLocalPort, so
+			// every typed case above has a different number to beat and
+			// "no flag at all" can only get 9999 by reading the file.
+			if err := os.WriteFile(path, []byte("version: 1\nincoming:\n  local_port: 9999\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("HOME", dir)
+			writePersonal(t, dir, "user: shota\ntoken: tok\n")
+
+			var captured RunOptions
+			runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+			t.Cleanup(func() { runFn = defaultRun })
+
+			root := NewRootCommand()
+			root.SetArgs(append(append([]string{"run", "--config", path}, c.args...), "--", "true"))
+			if err := root.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if captured.LocalPort != c.want {
+				t.Fatalf("LocalPort = %d, want %d", captured.LocalPort, c.want)
+			}
+			st, err := stealSettings(captured)
+			if err != nil {
+				t.Fatalf("stealSettings: %v", err)
+			}
+			if st.LocalPort != c.wantResolved {
+				t.Errorf("resolved port = %d, want %d", st.LocalPort, c.wantResolved)
+			}
+		})
+	}
+}
+
+// TestApplyIncomingPortRefusesACommandWithTheFlag: applyIncomingPort exists
+// only for a command that has no --local-port, and it assigns without a
+// guard. If that flag were ever added to such a command, the assignment
+// would quietly beat the value the developer typed - so it panics instead,
+// the same way changed() panics on a flag that is not registered.
+func TestApplyIncomingPortRefusesACommandWithTheFlag(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("applyIncomingPort must panic under a command that registers --local-port")
+		}
+	}()
+	var opts RunOptions
+	applyIncomingPort(newRunCommand(), config.Config{}, &opts)
 }

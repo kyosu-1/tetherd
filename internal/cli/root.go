@@ -44,6 +44,18 @@ func defaultDoctor(opts DoctorOptions) (int, error) {
 	return DoctorRun(ctx, opts, os.Stdout)
 }
 
+// statusFn is swapped in tests, the same way runFn is.
+var statusFn = defaultStatus
+
+// defaultStatus writes the report to stdout: who is attached is what the
+// developer is asking for, not a progress log about finding out. The target
+// line and any transport chatter stay on stderr.
+func defaultStatus(opts StatusOptions) (int, error) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return StatusRun(ctx, opts, os.Stdout, os.Stderr)
+}
+
 // NewRootCommand builds `tetherd`.
 func NewRootCommand() *cobra.Command {
 	root := &cobra.Command{
@@ -53,16 +65,16 @@ func NewRootCommand() *cobra.Command {
 		SilenceErrors: true,
 		Version:       version.Version,
 	}
-	root.AddCommand(newRunCommand(), newEnvCommand(), newDoctorCommand())
+	root.AddCommand(newRunCommand(), newEnvCommand(), newDoctorCommand(), newStatusCommand(), newTokenCommand())
 	return root
 }
 
-// addTargetFlags registers the flags `run` and `env` share: everything
-// needed to discover the task and reach its agent. Both commands' RunE call
-// applyConfig, whose changed() guards look up "user", "profile", "region",
-// "cluster", "service" and "env" by name - registering all of them here on
-// both commands is what keeps applyConfig callable (and its guards
-// non-panicking) under either one.
+// addTargetFlags registers the flags `run`, `env`, `doctor` and `status`
+// share: everything needed to discover the task and reach its agent. Every
+// one of those commands' RunE calls applyConfig, whose changed() guards
+// look up "user", "profile", "region", "cluster", "service" and "env" by
+// name - registering all of them here on all four commands is what keeps
+// applyConfig callable (and its guards non-panicking) under any of them.
 func addTargetFlags(cmd *cobra.Command, opts *RunOptions) {
 	f := cmd.Flags()
 	f.StringVar(&opts.Transport, "transport", "ssm", "how to reach the agent: ssm | direct")
@@ -183,9 +195,20 @@ func newDoctorCommand() *cobra.Command {
 		Short: "Check that this machine and the dev service are set up for tetherd",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if _, err := applyConfig(cmd, &opts.RunOptions); err != nil {
+			cfg, err := applyConfig(cmd, &opts.RunOptions)
+			if err != nil {
 				return err
 			}
+			// The steal settings, so the steal row is a judgement about
+			// this machine rather than "could not be checked" on all of
+			// them. Not applyIncoming: doctor registers none of run's
+			// incoming flags, and applyIncoming's changed() guards panic on
+			// a command without them. The port comes through
+			// applyIncomingPort, which is where "this command has no
+			// --local-port whose precedence could be lost" is asserted
+			// rather than assumed.
+			applySharedIncoming(cfg, &opts.RunOptions)
+			applyIncomingPort(cmd, cfg, &opts.RunOptions)
 			// A bound the operator did not type must reach DoctorRun as
 			// zero, not as the flag's default. Zero is what means "use the
 			// defaults", and the defaults are not one number: the
@@ -228,7 +251,7 @@ func newDoctorCommand() *cobra.Command {
 	f.StringVar(&opts.ExecPath, "exec-path", helper.ExecInstallDir+"/"+helper.ExecName, "path of the setgid tetherd-exec")
 	// No backticks in this help text: cobra reads a backquoted word as the
 	// flag's argument name, which for a bool flag prints as nonsense.
-	f.BoolVar(&opts.SkipAgent, "skip-agent", false, "do not open a session to the agent; the agent session, task env and remote domain rows are then reported as not checked, and they are the only ones that prove tetherd run can attach at all")
+	f.BoolVar(&opts.SkipAgent, "skip-agent", false, "do not open a session to the agent; the agent session, task env, task role and remote domain rows are then reported as not checked, and they are the only ones that prove tetherd run can attach at all")
 	// The two bounds the report runs under. They were honoured by
 	// DoctorRun from the start but reachable only in-process, so an
 	// operator whose network makes a row time out had nothing to turn. The
@@ -237,7 +260,54 @@ func newDoctorCommand() *cobra.Command {
 	// row, whose default is longer, and RunE above for why not typing
 	// these is not the same as typing their defaults.
 	f.DurationVar(&opts.Timeout, "timeout", DefaultDoctorTimeout, "how long any one check may take before it is reported as not having answered")
-	f.DurationVar(&opts.Budget, "budget", DefaultDoctorBudget, "how long the whole report may take; what it cuts short is reported as not checked")
+	// Not "reported as not checked": that wording belongs to the ? rows,
+	// which never fail the command. A row the budget cuts short is a ✗ on
+	// purpose - an incomplete report that exited 0 would tell a script the
+	// machine is fine.
+	f.DurationVar(&opts.Budget, "budget", DefaultDoctorBudget, "how long the whole report may take; a row it cuts short is reported as a failure")
+	return cmd
+}
+
+func newStatusCommand() *cobra.Command {
+	var opts StatusOptions
+	cmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show who is attached to each task of the dev service",
+		Long: "Show who is attached to each task of the dev service: who, from where and\n" +
+			"since when. Steal is shared - several developers attach to the same dev\n" +
+			"service and the ALB decides which task a request lands on - so this is what\n" +
+			"answers \"why are my requests not arriving?\".\n\n" +
+			"It attaches to read and closes: it takes no incoming request and sends no\n" +
+			"token, so it never becomes the target another developer's requests are\n" +
+			"routed to.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if _, err := applyConfig(cmd, &opts.RunOptions); err != nil {
+				return err
+			}
+			// applyIncoming is deliberately not called: `status` has none
+			// of the steal flags its changed() guards look up, and nothing
+			// here wants the personal file's token.
+			code, err := statusFn(opts)
+			if err != nil {
+				if code == 0 {
+					code = 1
+				}
+				return &exitError{code: code, err: err}
+			}
+			if code != 0 {
+				// Every task that could not be read has already printed
+				// its own reason; child marks the error as one main must
+				// not print a line of its own for.
+				return &exitError{code: code, child: true}
+			}
+			return nil
+		},
+	}
+	// The shared target flags, which is also what applyConfig's changed()
+	// guards look up by name - registering them here is what keeps
+	// `tetherd status` from panicking inside that guard.
+	addTargetFlags(cmd, &opts.RunOptions)
 	return cmd
 }
 

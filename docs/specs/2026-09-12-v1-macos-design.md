@@ -226,7 +226,7 @@ design.md §9 のものに EC2 の読み取り 4 つを追加。
 - ALB はターゲットへの接続を keep-alive で使い回すので、振り分けは**リクエスト単位**。agent はセッションの有無にかかわらず常に HTTP/1.1 リバースプロキシ（`net/http` + `httputil.ReverseProxy`）。「素通し」= 全リクエストが app へ
 - ヘルスチェックはヘッダーが無いので常に app へ
 - WebSocket は upgrade を app にそのまま通す。steal はしない
-- ターゲットグループが gRPC / HTTP2 のものは対象外（`doctor` が検出）
+- ターゲットグループが gRPC / HTTP2 のものは対象外（agent は HTTP/1.1 サーバなので steal も素通しも成立しない。**検出する `doctor` の行はまだ無い** — §6.5）
 - `X-Forwarded-*`、`traceparent`、`X-Amzn-Trace-Id` は素通し
 
 ### 5.2 steal
@@ -248,13 +248,16 @@ agent は root で動く（`SYS_PTRACE` を effective にするため。distrole
 
 ### 5.4 セッション管理
 
-- ユーザー名 → セッションのマップ。同名の二重接続は `error{code: "duplicate_user", from, since}` で拒否
+- ユーザー名 → セッションのマップ。**`incoming.enabled` を宣言したセッションのみ**を登録し、同名の二重接続は `error{code: "duplicate_user", from, since}` で拒否
+- `incoming.enabled` が無いセッション（`tetherd env` / `doctor` / `status`、および `tetherd run --no-incoming`）は**登録しない**ため、この拒否の対象にもならない。リクエストを受け取らないセッションは、この規則が防いでいるルーティングの曖昧さを作れない（steal の照合は `incoming.enabled` が無いセッションを最初から飛ばす）。登録しないことで `welcome.others` / `welcome.sessions` は「リクエストを受け取れるのは誰か」を意味する — `tetherd status` が答える問いそのもの。登録していないセッションもアタッチ/デタッチはログに出す（ログだけ、レジストリには入れない）
+- 1 台のマシンで `tetherd run` が二重に走らないことは CLI 側の pid ロックが保証する（agent のレジストリではない）
 - 制御ストリームで 5 秒おきに ping。3 回連続で pong が無ければセッションを破棄し、そのユーザーのルールを消す
 - `TETHERD_ENV` が無ければ起動しない。値は `welcome.env` で CLI に返す
 
 ### 5.5 設定と配布
 
-- env のみ: `TETHERD_ENV`（必須）、`TETHERD_LISTEN`（`:8080`）、`TETHERD_UPSTREAM`（`127.0.0.1:8081`）、`TETHERD_CONTROL`（`127.0.0.1:9900`）、`TETHERD_APP_CONTAINER`（`app`）
+- env のみ: `TETHERD_ENV`（必須）、`TETHERD_PROXY`（`0.0.0.0:8080`。ALB を受ける口）、`TETHERD_APP_ADDR`（`127.0.0.1:8081`。app への転送先）、`TETHERD_CONTROL`（`127.0.0.1:9900`）、`TETHERD_APP_CONTAINER`（`app`）、`TETHERD_TASK_ARN`（任意。メタデータが取れればそちらが優先）
+- `TETHERD_CONTROL` は**実装上は固定**。CLI の `ssm` トランスポートが転送先ポートに 9900 を固定で入れる（`internal/transport/ssm` の `controlPort`）ので、これを変えた agent は誰も繋げない listen になり、失敗は「agent に届かない」として出る。テストと埋め込み用の口であり、デプロイのつまみではない（トランスポート側に教えるのは v0.4）
 - AWS API は呼ばない
 - イメージ `ghcr.io/kyosu-1/tetherd-agent`、distroless static、linux/arm64 + linux/amd64
 - タスク定義の推奨: `essential: true`、`restartPolicy.enabled: true`、`linuxParameters.capabilities.add: ["SYS_PTRACE"]`、`pidMode: task`
@@ -329,11 +332,13 @@ tetherd token rotate
 ```
 
 - `env`: 既定は secrets をマスク。どれが secret かはタスク定義（`DescribeTaskDefinition`）の `secrets` ブロックの名前で判定
-- `status`: タスクごとに接続中のユーザー、自分のルール、primary かどうか。agent の `status` メッセージで取る
+- `status`: タスクごとに接続中のユーザー、どこから、いつから。v0.3b で実装。専用のメッセージは足さず、attach の `welcome` に載る `sessions` を読む（`hello` 1 往復で済み、追加の状態も持たないため）。読むためだけに attach するので `incoming` を無効にし、トークンも送らない — `status` 自身が steal の宛先にならないことが要件（§11）。タスクごとに 1 行以上出し、読めなかったタスクも理由付きで出す
 - `doctor` の検査項目（各項目に「次に何をするか」を付ける）:
   helper が応答しバージョンが一致 / `tetherd` グループと setgid `tetherd-exec` / session-manager-plugin の有無 / AWS 認証 / サービスの `enableExecuteCommand` / タスクの agent コンテナと ExecuteCommandAgent / タスク定義の `pidMode: task` / ターゲットグループが HTTP1 / ECS・EC2 の読み取り権限 / VPC CIDR とローカル IF の重なり / `remote_domains` が agent 側で解けるか / `remote_cidrs` に `0.0.0.0/0` が無いか
 
-  v0.2b で実装したのは 9 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲の広さ / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査は v0.3** — developer policy に `elasticloadbalancing:DescribeTargetGroups` を足す必要があり、検証環境が動いている間は Terraform を再適用しない方針のため。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
+  v0.2b で実装したのは 9 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲の広さ / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査は v0.3b にも入らず、v0.4 に送った** — `elasticloadbalancing:DescribeTargetGroups` を呼ぶ SDK が無いため。理由と残作業は §12 の v0.3b に書いた。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
+
+  v0.3a / v0.3b で足したのは、`agent session`（tetherd 自身が通した handshake。ECS の見解とは別）・`task env`（agent が読めた変数と `env_error`）・`task role`（子プロセスと同じ経路でループバック口から取った認証情報の ARN）・`steal`（一致条件と、ラップトップ側に listener が居るか）の 4 行と、**`?`（検査できなかった）ステータス**。`?` は「動くが注意」の `⚠` と分けてあり、**どの行でも exit code を動かさない**（失敗した行は既にそれ自身で数えられているため）。`pin_credential_route` の行は入っていない
 
 ### 6.6 出力
 
@@ -642,6 +647,42 @@ design.md §10 に加えて:
 `remote:` に `169.254.170.0/24` が入らないこと（既定ではループバック口から配るため）、そして §12 の既知の穴 3 番（ARP 失敗の拒否ルートで間欠的に壊れる）の原因アドレスに**もう誰も接続しない**ことが実機で確認できた。
 
 **`terraform apply` で 1 回失敗した。** ターゲットグループの `port` 変更は置き換えを強制するが、リスナが転送先にしている間は削除できないため `ResourceInUse` になる。しかも失敗が綺麗ではなく、セキュリティグループの更新だけ先に適用済みで、ALB からのインバウンドが 8080 のみ許可・ターゲットグループはまだ 8081 をヘルスチェック、という状態で止まり、dev 環境が一時的に 5xx になった。`create_before_destroy` と `name_prefix`（ターゲットグループは 6 文字まで）で解決（`f099788`）。次に同種の置き換えを含む変更を当てる者は、plan の `# forces replacement` を見た時点でこれを疑うこと。
+
+### v0.3b（全タスク接続・deploy 追従・`status`・`token rotate`・`doctor`）
+
+**§6.2 / §6.3 は最初から「対象タスク全部に接続」と書いてあり、実装が追いついていなかった。** v0.3a までの `run` は最も古い 1 本にしか繋いでおらず、`desired_count` が 2 以上のサービスでは ALB がどのタスクに落とすかで steal が当たるか外れるかが決まっていた。v0.3b で実装が仕様に一致した（`internal/cli/sessionset.go` の `SessionSet` が primary と secondary を持ち、`internal/cli/follow.go` の `Follower` が 10 秒おきにタスク一覧を読み直す）。**§6.2 / §6.3 の本文は書き換えていない** — 仕様が正しく、コードが後から揃った側なので、記録はこの節に置く。
+
+あわせて入ったもの: `tetherd status`（§6.5。`welcome` の `sessions` を読む。専用メッセージは足していない）、`tetherd token rotate`（§5.2。0600 を保ち、`user` / `aws` を残す）、`doctor` の `?` ステータスと `steal` / `task role` の行（§6.5）。
+
+**Terraform の変更は無い。** `deploy/dev-env` は v0.3a のまま。検証のために `desired_count` を動かすだけで、当てるべき差分は 1 行も無い。
+
+**`doctor` のターゲットグループの検査は v0.4 に送った。** 計画には入っていたが、計画自身の「依存追加なし・`go.mod` は 1 行も変えない」と両立しない: `protocol_version` を報告する API は `elasticloadbalancing:DescribeTargetGroups` だけで、それを呼ぶ SDK（`aws-sdk-go-v2/service/elasticloadbalancingv2`）は `go.mod` に無い。**`ecs:DescribeServices` はターゲットグループの ARN とポートは返すが、`protocol_version` は返さない**（agent 側にも分からない。ALB のプロトコルバージョンは「パースできないリクエストが来る」としてしか現れない）。片方だけ入れても意味が無いので、**判定も、そのための developer policy の権限追加も、v0.3b には入れていない** — 実装の無い権限を配るのは、この計画が 9 タスクかけて消してきた「どこかに書いてあるが実装が無い」そのものだから。
+
+v0.4 でやること 3 つ（どれも独立）: (1) `aws-sdk-go-v2/service/elasticloadbalancingv2` を入れて `DescribeTargetGroups` を呼び、developer policy に権限を足す。(2) agent の既定プロキシポート（`internal/agent` の非公開定数 `defaultProxy` = `0.0.0.0:8080`）を `internal/doctor` から読める場所に出す。(3) タスク定義の agent コンテナの env から `TETHERD_PROXY` を読み、ポートの判定を `⚠` から本当の検査にする。検証手順は `docs/e2e-aws.md` の「v0.4 に持ち越した行」にある（31 行。**ターゲットグループを HTTP2 にすると dev 環境が一時的に壊れる**ので、実施は最後に回してすぐ戻すこと）。
+
+**なぜポートを「検査」できないのか**（上の (3) の背景）: agent のプロキシポートは `TETHERD_PROXY` で動かせるのに、`doctor` にはそれを知る手段が無い。`welcome` は `Version` / `TaskARN` / `Env` / `AppEnv` / `EnvError` / `Others` / `Sessions` だけで、CLI が繋ぐのは**制御**ポートであってプロキシポートではない。だから「既定と違う」は `⚠`（質問）にしかならず、`✗`（判定）にはできない — 既定と違うポートを向けている配置は**正しく設定されている**。安いのはタスク定義から `TETHERD_PROXY` を読むこと（`awsProvider` は `SecretNames` / `PIDMode` で既にタスク定義を読んでいるので同じ呼び出し形）。もう一方は `welcome` にフィールドを 1 つ足すこと（追加のみなので互換は保てる）。
+
+**検証には `desired_count` を 2 にする必要がある**（27・28 行）。ALB がタスクを選ぶ以上、1 タスクでは「どのタスクに落ちても届く」は検証できない。**検証が終わったら 1 に戻す** — Fargate の課金が倍になるため。
+
+検証手順は `docs/e2e-aws.md` の 27〜30 行（31 行は上記のとおり v0.4）。**27〜30 行すべて成功**（2026-09-13、ap-northeast-1、ALB `tetherd-dev-1301575947`、`desired_count = 2`、agent イメージは v0.3b を再デプロイ）。
+
+| 行 | 検証 | 結果 |
+|---|---|---|
+| 前提 | ALB が 2 タスクに振り分けている | ✅ ヘッダー無しで 6 回叩いて `ip-10-0-10-72` と `ip-10-0-11-104` に **3 対 3**。どちらも `from 127.0.0.1:` なので agent 経由 |
+| 27 | `desired_count = 2` で、一致するリクエストが**どのタスクに落ちても**届く | ✅ 起動行が `2 tasks (100f020e… primary, e7cd9413…)`。20 回叩いて**ラップトップ受信 20/20**、CLI のログ行 20 本、**アプリに落ちたリクエスト 0**。v0.3a の CLI ならおよそ半分がアプリに届き、開発者側に痕跡は残らなかった |
+| 28 | deploy 追従 | ✅ `run` 実行中に `force-new-deployment`。新タスク 2 本に接続（`↻ … attached (3 total)` / `(4 total)`）、**起動時の 2 本が両方消えても run は生存**、昇格が 2 回（`dial and DNS now go through …`）。deploy 後に 10 回叩いて **10/10 がラップトップに届いた** — 繋ぎ直しただけでなく、入れ替わったタスクで steal が実際に機能している |
+| 29 | `tetherd status` | ✅ **自分の `run` が動いている最中に読めた**。タスクごとに `abe  from 127.0.0.1:…  attached 58s ago`。narrowing 前は `duplicate_user` で拒否され、まさに必要な瞬間に使えなかった（`env` と `doctor` も同様で、v0.2b から入っていた欠陥） |
+| 30 | `tetherd token rotate` | ✅ トークンが変わり、`user` は残り、権限は `-rw-------`。**実行中のセッションは古いトークンのまま**を実機で確認 — 新しいトークンで叩くとアプリが応答し、ラップトップの受信数は動かない（31 のまま）。計画の当初の期待は逆で、間違っていた |
+| 後片付け | セッション終了後に残留しない | ✅ `/etc/resolver/` は空、ワーキングツリーに残骸なし |
+
+**28 行が全体レビューの F1 を裏付けた。** 起動時の 2 タスクが両方死んで run が生きるという経路は、`run.go` のフォロワー側 `loss.watch(s)` が無ければ `every task tetherd was attached to has gone away` で終わっていた。**コードは正しく、テストがそれを留めていなかった** — 実機がそれを示した。
+
+| 行 | 検証 | 結果 |
+|---|---|---|
+| 27 | `desired_count = 2` で、一致するヘッダーのリクエストがどのタスクに落ちてもラップトップに届く | 未実施 |
+| 28 | rolling deploy 中に `run` が生き続け、新しいタスクに繋ぎ、古いタスクが落ちても終わらない | 未実施 |
+| 29 | `tetherd status` が各タスクの接続者を出し、トークンを送らない | 未実施 |
+| 30 | `token rotate` の直後は走行中のセッションが古いトークンのまま steal し続ける | 未実施 |
 
 ---
 

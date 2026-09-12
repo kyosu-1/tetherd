@@ -28,9 +28,14 @@ func New(cfg Config, logf func(string, ...any)) *Agent {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	a := &Agent{cfg: cfg, logf: logf, sessions: map[string]*Session{}}
-	if cfg.MetadataURL != "" {
-		a.env = &ProcEnvReader{MetadataURL: cfg.MetadataURL, ProcRoot: "/proc", AppContainer: cfg.AppContainer}
+	a := &Agent{cfg: cfg.withDefaults(), logf: logf, sessions: map[string]*Session{}}
+	// a.cfg, not cfg: everything below this line reads the normalised
+	// Config. The two are the same today for MetadataURL, which has no
+	// default, and AppContainer, which gets one - but reading the raw
+	// Config here is how the next default added to withDefaults would
+	// quietly not apply to the env reader.
+	if a.cfg.MetadataURL != "" {
+		a.env = &ProcEnvReader{MetadataURL: a.cfg.MetadataURL, ProcRoot: "/proc", AppContainer: a.cfg.AppContainer}
 	}
 	return a
 }
@@ -95,17 +100,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	return second
 }
 
-// ListenAndServe listens on cfg.Control and serves until ctx is done. It
-// serves the control port only; Run is what production starts.
-func (a *Agent) ListenAndServe(ctx context.Context) error {
-	ln, err := net.Listen("tcp", a.cfg.Control)
-	if err != nil {
-		return err
-	}
-	a.logf("control listening on %s (env=%s)", ln.Addr(), a.cfg.Env)
-	return a.Serve(ctx, ln)
-}
-
 // Serve accepts sessions on ln.
 func (a *Agent) Serve(ctx context.Context, ln net.Listener) error {
 	go func() {
@@ -130,20 +124,62 @@ func (a *Agent) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
-func (a *Agent) others(user string) []string {
-	var out []string
+// sessionInfos is what Welcome.Sessions carries: every registered session
+// except user's, with where it attached from and since when. An empty user
+// excludes nothing, which is what a read-only attach wants - it has no
+// registered session of its own (see register).
+//
+// It reuses Sessions()'s sort, which is a contract rather than tidiness
+// (see registry.go): unsorted, the welcome one developer reads would differ
+// from one attach to the next and so would `tetherd status`'s output.
+//
+// The exclusion is what makes this exactly the set others() returns, one
+// field richer - see Welcome.
+func (a *Agent) sessionInfos(user string) []proto.SessionInfo {
+	var out []proto.SessionInfo
 	for _, s := range a.Sessions() {
 		if s.User != user {
-			out = append(out, s.User)
+			out = append(out, proto.SessionInfo{User: s.User, From: s.From, Since: s.Since})
 		}
+	}
+	return out
+}
+
+// sessionUsers projects the user names out of infos: Welcome.Others, which
+// is what every CLI up to v0.3a reads. Deriving it from the slice
+// Welcome.Sessions carries, rather than from a second snapshot of the
+// registry, is what keeps the two fields of one welcome from ever
+// describing different sets.
+//
+// It returns nil for an empty input, not an empty slice, so that
+// Welcome.Others keeps being omitted from the wire when nobody else is
+// attached.
+func sessionUsers(infos []proto.SessionInfo) []string {
+	var out []string
+	for _, s := range infos {
+		out = append(out, s.User)
 	}
 	return out
 }
 
 // handler implements session.Handler for one connection.
 type handler struct {
-	a    *Agent
+	a *Agent
+	// user names this handler's registered session, and is what Closed
+	// unregisters. It stays empty for a read-only session, which the
+	// registry does not record (see register).
 	user string
+	// readOnlyUser names a read-only session, for the log and nothing
+	// else. It is a second field rather than a flag beside user so that
+	// nothing can reach unregister with it by mistake: that is the bug
+	// this split exists to make unrepresentable.
+	//
+	// It exists because the agent's log is the only place to see that a
+	// CLI reached the task at all. `tetherd run --no-incoming` is
+	// long-lived *and* read-only, so without these lines a developer
+	// whose `tetherd status` shows nothing has no server-side trace to
+	// check - and neither does whoever reads CloudWatch afterwards.
+	readOnlyUser string
 }
 
 // Hello registers the user's session: the user and where they attached
@@ -156,9 +192,43 @@ func (h *handler) Hello(hello proto.Hello, remote string, open session.Opener) (
 	if e := h.a.register(hello, remote, open); e != nil {
 		return proto.Welcome{}, e
 	}
-	h.user = hello.User
-	h.a.logf("user %q attached from %s", hello.User, remote)
-	w := proto.Welcome{Version: proto.Version, TaskARN: h.a.cfg.TaskARN, Env: h.a.cfg.Env, Others: h.a.others(hello.User)}
+	// Only a session the registry recorded may set this: Closed
+	// unregisters whatever it names, so a read-only session that set it
+	// would unregister this developer's own steal session on detaching.
+	// stealSession is the one predicate both sides ask (see registry.go).
+	if stealSession(hello) {
+		h.user = hello.User
+		h.a.logf("user %q attached from %s", hello.User, remote)
+	} else {
+		// Said differently on purpose: the two mean different things to
+		// whoever reads the log. A read-only session takes no request, is
+		// not in the registry, and does not appear in anyone's `tetherd
+		// status` - so a line that read like a steal attach would have
+		// someone hunting for a session the registry never had.
+		h.readOnlyUser = hello.User
+		h.a.logf("user %q attached from %s to read only", hello.User, remote)
+	}
+	// One snapshot of the registry for both views of it: Others is the
+	// names, Sessions the same set with the detail `tetherd status` needs.
+	//
+	// What is left out is the session this welcome is *for*, which for a
+	// read-only attach is none of them: it was not recorded, so there is
+	// nothing of its own to leave out. Filtering by name instead would
+	// have `tetherd status` hide this developer's own `tetherd run` - the
+	// session they are most likely asking about, and the one whose absence
+	// would read as "your run is not attached to this task".
+	self := ""
+	if stealSession(hello) {
+		self = hello.User
+	}
+	sessions := h.a.sessionInfos(self)
+	w := proto.Welcome{
+		Version:  proto.Version,
+		TaskARN:  h.a.cfg.TaskARN,
+		Env:      h.a.cfg.Env,
+		Others:   sessionUsers(sessions),
+		Sessions: sessions,
+	}
 	if h.a.env == nil {
 		w.EnvError = "no ECS metadata endpoint (agent is not running in ECS)"
 	} else {
@@ -191,5 +261,14 @@ func (h *handler) Closed() {
 	if h.user != "" {
 		h.a.unregister(h.user)
 		h.a.logf("user %q detached", h.user)
+		return
+	}
+	if h.readOnlyUser != "" {
+		// Nothing to unregister - this session was never recorded - but
+		// it is still said out loud, so that every attach in the log has
+		// an end and a session that is still open is distinguishable from
+		// one that finished. Suffixed, so it cannot be mistaken for the
+		// line above.
+		h.a.logf("user %q detached (read only)", h.readOnlyUser)
 	}
 }

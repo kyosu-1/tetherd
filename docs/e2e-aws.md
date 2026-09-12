@@ -34,10 +34,10 @@ v0.2b から、cluster / service / profile / region / env は `.tetherd.yml` か
 | 11 | `./bin/tetherd env \| head -20` | `KEY=value` の一覧。`DB_PASSWORD=***` | secrets はタスク定義の `secrets` ブロックから名前を取ってマスクされる。値も長さも漏れない |
 | 12 | `./bin/tetherd env --format json \| jq -r '.DB_PASSWORD, .PORT'` / `./bin/tetherd env --reveal --format json \| jq -r '.DB_PASSWORD'` | 前者は `***` と `8081`、後者は 24 文字の実値 | 既定はマスク、`--reveal` で実値。出力が JSON として妥当 |
 | 13 | `eval "$(./bin/tetherd env --format shell)" && echo "$PORT"` | `8081` | 変数は stdout、ステータス行は stderr。混ざっていれば `eval` が壊れる |
-| 14 | `./bin/tetherd doctor` | helper を起動していれば全 11 行 `✓`（`agent session` は `handshake ok, protocol 1, TETHERD_ENV=dev`、`task env` は読めた変数の数、`remote domains` は `myapp.internal … resolve through the agent`）で exit 0。helper を落としていれば `✗ helper` とその次の一手が出て exit 1、**残りの行は出続ける** | 11 項目の検査と、失敗しても続けること。`agent session` と `task env` は ECS の見解ではなく tetherd 自身のハンドシェイク結果なので、サイドカーが落ちていれば他が全部緑でもここで落ちる |
+| 14 | `./bin/tetherd doctor` | helper を起動していれば 13 行のうち 12 行が `✓`（`agent session` は `handshake ok, protocol 1, TETHERD_ENV=dev`、`task env` は読めた変数の数、`task role` はタスクロールの ARN と `(via 127.0.0.1:<port> → the task)`、`remote domains` は `myapp.internal … resolve through the agent`）、`steal` は自分のサーバーをまだ立てていなければ `⚠`（`nothing is listening on 127.0.0.1:<port>`。20 行目のようにサーバーを立ててから実行すれば `X-Dev-User (+ X-Dev-Token) → 127.0.0.1:<port>, which has a listener` で `✓`。`?` になるのは `incoming.local_port` がポート番号として不正なとき（`incoming.local_port: 70000` → `? steal  not checked: local port 70000 is not a port number`）か、probe が時間内に答えられなかったとき。トークンが無いケースは起きない — `doctor` 自身の `applyConfig` が `~/.tetherd/config.yml` にトークンを生成してから判定する。`?` はどの行でも exit code を動かさない）で exit 0。helper を落としていれば `✗ helper` とその次の一手が出て exit 1、**残りの行は出続ける** | 13 項目の検査と、失敗しても続けること。`agent session`・`task env`・`task role` は ECS の見解でなく tetherd 自身が通した経路の結果なので、サイドカーが落ちていれば他が全部緑でもここで落ちる。`task role` は `run` の `✓ iam` と同じ経路（loopback → セッション → タスクのエンドポイント）を通るので、`your AWS identity`（開発者自身の ARN）とは別の行 |
 | 15 | `.tetherd.yml` の `service` を `nope` にして `./bin/tetherd doctor` | `✗ attachable task` に `no RUNNING tasks in service tetherd-dev/nope` が出て exit 1。他の行は出続ける | 1 つ失敗しても残りの検査が走る（1 問ずつ直して再実行させない） |
 | 16 | `.tetherd.yml` に `remote_services: [s3]` を足して `$RUN -- sh -c 'aws s3 ls && curl -s -o /dev/null -w "%{http_code}\n" https://example.com'` | `aws s3 ls` が成功し `example.com` も 200。`✓ network` 行に S3 の prefix が並ぶ（ap-northeast-1 では 15 件） | prefix list 由来の CIDR が捕捉範囲に入る。件数はリージョンごとに違い、API は 1 ページ 100 件で切るので、ページングしていなければ大きいリージョンで静かに取りこぼす。それ以外の宛先はラップトップから直接出る |
-| 17 | `ipconfig getifaddr en0` の /24 を `local_cidrs` に足して `$RUN -- true` と `./bin/tetherd doctor` | 起動時の重なり警告が消え、doctor の `local addresses` が `!` → `✓` | 分割による引き算（VPC /16 から自宅 /24 だけを抜く）が効いている |
+| 17 | `ipconfig getifaddr en0` の /24 を `local_cidrs` に足して `$RUN -- true` と `./bin/tetherd doctor` | 起動時の重なり警告が消え、doctor の `local addresses` が `⚠` → `✓` | 分割による引き算（VPC /16 から自宅 /24 だけを抜く）が効いている |
 | 18 | `local_cidrs: [10.0.0.0/8]`（VPC を丸ごと消す）で `$RUN -- true` | `network.local_cidrs excludes the entire remote set` で exit 2（設定の誤りなので usage 扱い） | 設定ミスで捕捉範囲が空になったら黙って起動しない。タスクロールのエンドポイントを足し戻して「1 件あるから OK」にしない |
 | 19 | `$RUN -- python3 -c "import socket,time; t=time.time()\ntry: socket.gethostbyname('nope.myapp.internal')\nexcept socket.gaierror as e: print('gaierror in %.1fs' % (time.time()-t))"` | 1 秒未満で `gaierror` | 存在しない名前が NXDOMAIN として返る。SERVFAIL だと macOS がリトライして数秒待たされる |
 
@@ -53,6 +53,27 @@ v0.3a から、agent は常に ALB のデータパス上に居る（§5.1）。�
 | 25 | `$RUN --no-incoming -- sleep 60` 中に一致するヘッダーで `curl` | タスクの応答。CLI に `✓ steal` 行が無い | `--no-incoming` は何も取らない |
 | 26 | ALB のヘルスチェックが 2 分間 healthy のまま | ターゲットが healthy | ヘルスチェックは常に app に届く（agent 経由。§5.1） |
 
+v0.3b から、`tetherd run` は**サービスの対象タスク全部**に接続し、rolling deploy に追従する（§6.2 / §6.3）。以下はそれと `status` / `token rotate` / `doctor` の確認。
+
+**27 と 28 は `desired_count = 2` が必要**（`terraform apply -var desired_count=2`）。ALB がどのタスクにリクエストを落とすかを決めるので、1 タスクでは「どのタスクに落ちても届く」を検証できない。**終わったら 1 に戻す** — Fargate の課金が倍になる。
+
+| # | コマンド | 期待 | 確認すること |
+|---|---|---|---|
+| 27 | `desired_count = 2` にして、まず**ヘッダー無し**で `for i in $(seq 20); do curl -s http://<alb>/; done \| sort \| uniq -c`。次に `$RUN -- <自分のサーバ>` を起動し、一致するヘッダーで同じ 20 回 | ヘッダー無しの 20 回が**2 つのタスク両方**から答える（`sampleapp on ip-10-0-…` が 2 種類出る）。`$RUN` の `target` 行が `2 tasks (<id>… primary, <id>…)`。一致するヘッダーの 20 回は**20 回すべて**ラップトップのプロセスが答え、CLI に `←` が 20 行出る。ラップトップ側の受信数も 20 | **どのタスクに落ちても steal できる（v0.3b の本体）。** ヘッダー無しの 1 周目を先に取るのが要点 — ALB が実際に 2 タスクへ振り分けていることを確かめずに 20/20 を見ても、たまたま片方に寄っただけで通ってしまう。v0.3a のコードは最も古い 1 本にしか繋がないので、この形では繋いでいないタスクに落ちた分が app の応答になる |
+| 28 | `$RUN -- <自分のサーバ>` を動かしたまま別端末で `aws ecs update-service --cluster tetherd-dev --service api --force-new-deployment`。入れ替わりの間、一致するヘッダーで `curl` を続ける | 新しいタスクに `↻ session   task <id>… attached (N total)`（primary でなければ `(N total)`、primary なら `attached and is now the primary`）が出て繋がり、古いタスクが落ちると `↻ session   task <id>… went away (…); N left`。**`run` は生き続け、子プロセスも動き続ける**。primary が入れ替わった場合は `dial and DNS now go through task <id>…` が出る。`curl` はその間もラップトップに届く | deploy 追従。タスク一覧は 10 秒おきなので反映に最大 10 秒の遅れがある。**secondary が 1 本落ちても `run` は終わらない**こと（`✗ agent session lost` が出ないこと）が見どころ — 終わるのは全セッションを失ったときだけ |
+| 29 | `$RUN` を別端末で生かしたまま `./bin/tetherd status`。続けて `$RUN` を止めてもう一度 | 1 回目はタスクごとの節に自分の名前・`from <自分の IP>`・`attached <n>s ago` が出る（`run` は全タスクに繋ぐので**両方のタスクに**出る）。2 回目は両タスクが `(nobody attached)`。exit 0。helper（sudo）は要らない | 共有時の診断。`status` は読むためだけに attach するので、**トークンを送らず steal の対象にならない**（29 の実行中に一致するヘッダーで `curl` してもタスクの応答になり、`status` 側には何も来ない）。タスクが 1 本読めなくても残りが出ること（`(not read: …)`）も、片方を `aws ecs stop-task` して確認できる |
+| 30 | `$RUN` を生かしたまま別の端末で `./bin/tetherd token rotate`、その後 **古い**トークンのヘッダーで `curl` | 新しいトークンが表示され、`~/.tetherd/config.yml` は 0600 のまま `user` と `aws` も残る。**古いトークンの `curl` はまだラップトップに届く**（`$RUN` を再起動すると届かなくなり、新しいトークンで届くようになる） | 回転はファイルを差し替えるだけで、走行中のセッションは attach 時の `hello` の値で照合し続ける — 漏洩を閉じるには再起動が必要（出力もそう言う） |
+
 所要時間の目安: `StartSession` → `welcome` まで 2〜4 秒、psql の接続確立 +50〜100 ms。
 
-結果は `docs/specs/2026-09-12-v1-macos-design.md` §12 の 5・6、および v0.3a の節に追記する。
+結果は `docs/specs/2026-09-12-v1-macos-design.md` §12 の 5・6、および v0.3a / v0.3b の節に追記する。
+
+## v0.4 に持ち越した行
+
+`doctor` のターゲットグループの検査は **v0.3b に入らなかった**（理由は spec §12 の v0.3b）。行が入るまでこの 31 行は実施できないので、番号だけ確保してここに置いてある。26〜30 行の番号は動かしていない。
+
+**この行は dev 環境を一時的に壊す。** ターゲットグループを HTTP2 にすると ALB は h2c でタスクに話しかけるが、agent は HTTP/1.1 サーバなのでヘルスチェックが落ち、ターゲットが unhealthy になって ALB が 5xx を返す。**実施は最後に回し、確認できたらすぐ HTTP1 に戻すこと。** `protocol_version` は作成時にしか設定できない属性なので（`ModifyTargetGroup` では変えられない）Terraform は置き換えになるが、`create_before_destroy` + `name_prefix` が入っているので v0.3a の `ResourceInUse`（§12）は起きない。
+
+| # | コマンド | 期待 | 確認すること |
+|---|---|---|---|
+| 31 | developer policy に `elasticloadbalancing:DescribeTargetGroups` を当てる**前**に `./bin/tetherd doctor`、当てた**後**にもう一度、最後に `alb.tf` の `aws_lb_target_group.app` に `protocol_version = "HTTP2"` を足して `terraform apply` してもう一度 | 当てる前は `? target group  not checked: …`（`elasticloadbalancing:DescribeTargetGroups` を名指しし、**exit code は 0 のまま**）。当てた後は `✓`。HTTP2 にすると `✗` で `protocol_version` を名指しして exit 1 | steal の要件検査（spec §5.1 が gRPC / HTTP2 を対象外としている）。`?` が exit code を動かさないこと — 権限が古い開発者の環境は壊れていないので `✗` にしてはいけない — が 1 段目の要点 |
