@@ -2570,6 +2570,206 @@ func stealingOpts(cmd ...string) RunOptions {
 	return o
 }
 
+// --- the duplicate_user retry (v0.3b) --------------------------------------
+//
+// The agent unregisters a session on the goroutine that notices the
+// disconnect, so for a moment after `tetherd run` exits the old session is
+// still registered - measured: still held in 60 of 60 runs at the instant
+// the client returned (see waitDetached). A developer who stops a run and
+// immediately starts another one is refused for a conflict that is already
+// over, and both runs are steal sessions, which is the one case the agent's
+// narrowed one-session-per-user rule still refuses.
+
+// countingTransport is agentTransport that counts its dials. Each attach
+// attempt opens its own connection, so the count is how many helloes were
+// sent - which is what distinguishes "the attach retried" from "the attach
+// got in on its first try". Nothing else a test can observe says that: the
+// real agent does not report the helloes it refused.
+type countingTransport struct {
+	addr string
+	n    atomic.Int64
+}
+
+func (c *countingTransport) Dial(ctx context.Context, t transport.Task) (net.Conn, error) {
+	c.n.Add(1)
+	return agentTransport{addr: c.addr}.Dial(ctx, t)
+}
+
+func (c *countingTransport) dials() int { return int(c.n.Load()) }
+
+// attachOutcome carries dialAgent's two results off the goroutine that ran
+// it. The goroutine touches nothing else of the test's - no t, no logger -
+// because it outlives a failing test by design: t.Fatal from there would
+// call Goexit on that goroutine instead of failing the test, and a late
+// call into a finished t panics the binary.
+type attachOutcome struct {
+	sess *session.Client
+	err  error
+}
+
+// wantDuplicateUser fails unless err carries the agent's duplicate_user
+// refusal. It reads the wire contract itself rather than calling
+// isDuplicateUser: asserting through the production predicate would make
+// the assertion mutate with the thing it is meant to pin - measured, a
+// mutation of that predicate turned this check into a failure about the
+// wrong thing.
+func wantDuplicateUser(t *testing.T, err error) {
+	t.Helper()
+	var rej *session.RejectedError
+	if !errors.As(err, &rej) {
+		t.Fatalf("err = %v, want the agent's refusal (a *session.RejectedError) in the chain", err)
+	}
+	if rej.Err.Code != proto.CodeDuplicateUser {
+		t.Fatalf("refusal code = %q, want %q", rej.Err.Code, proto.CodeDuplicateUser)
+	}
+}
+
+// backgroundAttach runs one dialAgent as a steal session and reports what it
+// returned. ctx is the test's, so a test that gives up does not leave the
+// retry loop running for the rest of the binary.
+func backgroundAttach(ctx context.Context, opts RunOptions, d Deps, p *fakeProvider, task transport.Task) <-chan attachOutcome {
+	done := make(chan attachOutcome, 1)
+	st, err := stealSettings(opts)
+	if err != nil {
+		done <- attachOutcome{err: err}
+		return done
+	}
+	go func() {
+		s, err := dialAgent(ctx, opts, d, p, task, noLog, st.Incoming, func(net.Conn) {})
+		done <- attachOutcome{sess: s, err: err}
+	}()
+	return done
+}
+
+// TestAttachRetriesADuplicateUserRefusalUntilThePreviousSessionCloses is the
+// case the retry exists for: the previous run is still registered, the new
+// one is refused, and the moment the old session goes the new one gets in.
+// Without the retry a developer sees a refusal they can do nothing about
+// except run the same command again.
+func TestAttachRetriesADuplicateUserRefusalUntilThePreviousSessionCloses(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	// The previous run: same user, taking requests, so it is in the
+	// registry and the next steal hello for this name is refused.
+	held := attachAs(t, ag.addr, "tester")
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 1 }, "the previous session to register")
+
+	tr := &countingTransport{addr: ag.addr}
+	task := transport.Task{ID: "t1", SubnetID: "subnet-a"}
+	p := &fakeProvider{region: "r", task: task, tr: tr}
+	// A budget the test never means to exhaust: what ends the refusal here
+	// is the old session closing, not the clock. A short budget would make
+	// this test pass for the wrong reason on a loaded machine.
+	d := Deps{AttachRetryBudget: 30 * time.Second}.withDefaults()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := backgroundAttach(ctx, stealingOpts("true"), d, p, task)
+
+	// A second dial means the first hello was refused and the attach came
+	// back for another go. Asserted before the old session is closed, so
+	// the success below cannot be a first attempt that simply won a race.
+	waitFor(t, func() bool { return tr.dials() >= 2 }, "the refused attach to try again")
+	if got := len(ag.a.Sessions()); got != 1 {
+		t.Fatalf("the agent holds %d sessions while the attach is being refused, want only the previous run's", got)
+	}
+	select {
+	case o := <-done:
+		t.Fatalf("the attach must not finish while the previous session is held: sess=%v err=%v", o.sess != nil, o.err)
+	default:
+	}
+
+	held.Close()
+	select {
+	case o := <-done:
+		if o.err != nil {
+			t.Fatalf("the attach must succeed once the previous session closes, got %v (dials=%d)", o.err, tr.dials())
+		}
+		o.sess.Close()
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the attach never completed after the previous session closed (dials=%d)", tr.dials())
+	}
+}
+
+// TestAttachGivesUpOnADuplicateUserRefusalWithAnActionableError is the other
+// half: the retry must not weaken the rule. A second steal session for one
+// user is still refused - just later - and what a developer reads has to
+// say that the wait happened and what to do next, because "retry in a
+// moment" (the agent's own wording) is advice this CLI has already taken.
+func TestAttachGivesUpOnADuplicateUserRefusalWithAnActionableError(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	attachAs(t, ag.addr, "tester") // held for the whole test: a genuine conflict
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 1 }, "the conflicting session to register")
+
+	tr := &countingTransport{addr: ag.addr}
+	task := transport.Task{ID: "t1", SubnetID: "subnet-a"}
+	p := &fakeProvider{region: "r", task: task, tr: tr}
+	const budget = 200 * time.Millisecond
+	d := Deps{AttachRetryBudget: budget}.withDefaults()
+
+	start := time.Now()
+	o := <-backgroundAttach(context.Background(), stealingOpts("true"), d, p, task)
+	elapsed := time.Since(start)
+	if o.err == nil {
+		o.sess.Close()
+		t.Fatal("a second steal session for the same user must still be refused")
+	}
+	// The refusal itself survives the wrapping: the code is what the other
+	// commands match on (statusReason reads it through errors.As), and a
+	// retry that turned it into some other error would break them.
+	wantDuplicateUser(t, o.err)
+	if n := tr.dials(); n < 2 {
+		t.Fatalf("dials = %d, want the attach to have tried again before giving up", n)
+	}
+	// Each assertion names one thing a developer needs: that the wait
+	// happened and for how long, and the two ways out. Checked
+	// individually rather than as one line, so a reworded message fails on
+	// the part that went missing.
+	for _, want := range []string{`attach as "tester"`, "for " + budget.String(), "--user"} {
+		if !strings.Contains(o.err.Error(), want) {
+			t.Errorf("the give-up error must carry %q, got: %v", want, o.err)
+		}
+	}
+	// The injected budget is what bounds the wait. Without this, a retry
+	// that ignored Deps and used DefaultAttachRetryBudget would pass every
+	// assertion above while taking ten times as long here and two seconds
+	// in front of every refused developer.
+	if elapsed > time.Second {
+		t.Errorf("gave up after %s, want about the injected %s: the budget must be what bounds the retry", elapsed, budget)
+	}
+}
+
+// TestReadOnlyAttachIsNotRetried pins the scope of the retry. `tetherd
+// status` and `tetherd doctor` attach read-only, which the agent does not
+// register and so never refuses for being a second session; a refusal they
+// do see comes from an agent older than that rule, which is holding a live
+// run. Retrying there would spend a doctor check's whole bound, and delay
+// the row `status` prints, to cover a case a wait almost never fixes.
+func TestReadOnlyAttachIsNotRetried(t *testing.T) {
+	refusing := &refusingAgentHandler{err: proto.Error{
+		Code:    proto.CodeDuplicateUser,
+		Message: `another session for user "tester" is already attached`,
+	}}
+	tr := &countingTransport{addr: startFakeAgent(t, refusing)}
+	task := transport.Task{ID: "t1", SubnetID: "subnet-a"}
+	p := &fakeProvider{region: "r", task: task, tr: tr}
+	// Long enough that a retry here would be unmistakable, short enough
+	// that this test failing does not cost half a minute.
+	d := Deps{AttachRetryBudget: 5 * time.Second}.withDefaults()
+
+	start := time.Now()
+	sess, err := dialAgent(context.Background(), ssmOpts("true"), d, p, task, noLog, proto.Incoming{}, nil)
+	if err == nil {
+		sess.Close()
+		t.Fatal("this agent refuses every hello")
+	}
+	wantDuplicateUser(t, err)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("a read-only attach waited %s on a refusal, want it reported at once", elapsed)
+	}
+	if n := tr.dials(); n != 1 {
+		t.Errorf("dials = %d, want exactly one: a read-only attach must not retry", n)
+	}
+}
+
 // --- sessionLoss, the "every session is gone" decision ---------------------
 //
 // The interleaving these two tests cannot reach is the one inside watch: a

@@ -604,6 +604,25 @@ func targetLine(opts RunOptions, tasks []transport.Task) string {
 	return fmt.Sprintf("%s/%s  %d tasks (%s)%s", opts.Cluster, opts.Service, len(tasks), strings.Join(ids, ", "), started)
 }
 
+// DefaultAttachRetryBudget is how long an attach refused with
+// duplicate_user keeps trying before it gives up. Deps.AttachRetryBudget
+// overrides it.
+//
+// Two seconds is chosen for the one case that can still hit this refusal:
+// the agent unregisters a session on the goroutine that notices the
+// disconnect, so for a moment after `tetherd run` exits the old session is
+// still registered (measured: at the instant RunWithDeps returns the agent
+// still held it in 60 of 60 runs). A developer who stops a run and
+// immediately starts another one lands in that window, and two seconds is
+// long enough to cover it while staying short enough that a genuine
+// conflict is reported promptly.
+const DefaultAttachRetryBudget = 2 * time.Second
+
+// attachRetryInterval is how long the retry waits between attempts. Each
+// attempt is a fresh transport dial and handshake, so this is a floor on
+// the wait, not the period.
+const attachRetryInterval = 100 * time.Millisecond
+
 // dialAgent opens the transport and completes the control handshake. The
 // second half of Run's original steps 1 and 3.
 //
@@ -614,7 +633,78 @@ func targetLine(opts RunOptions, tasks []transport.Task) string {
 // never to take a request - and a nil handler is also what makes the
 // session refuse an http stream with proto.CodeNoIncoming, so an agent that
 // steals anyway learns why instead of waiting on a stream nobody reads.
+//
+// A steal attach the agent refuses with duplicate_user is retried briefly;
+// see attachWithRetry for why that is this function's business and not the
+// session layer's.
 func dialAgent(ctx context.Context, opts RunOptions, d Deps, prov awsProvider, task transport.Task, logf func(string, ...any), inc proto.Incoming, onHTTP func(stream net.Conn)) (*session.Client, error) {
+	if !inc.Enabled {
+		// Nothing to retry for. One user may hold one *steal* session at a
+		// time; a session that declares no Incoming is not entered in the
+		// agent's registry at all and so is never refused for being a
+		// second one. A read-only attach that a refusal did reach came
+		// from an agent older than that rule, which is holding a live run
+		// - waiting there would delay the refusal `tetherd status` prints
+		// (and could spend a `tetherd doctor` check's whole bound) to
+		// cover a case a retry almost never fixes.
+		return attachAgent(ctx, opts, d, prov, task, logf, inc, onHTTP)
+	}
+	return attachWithRetry(ctx, opts, d, prov, task, logf, inc, onHTTP)
+}
+
+// attachWithRetry is how the CLI reacts to one refusal, which is a policy
+// question and so lives here rather than in internal/session: the session
+// layer's job is to report what the agent said, not to decide how long a
+// command should keep asking.
+//
+// duplicate_user on a steal attach is usually this developer's own previous
+// run. The agent unregisters on the goroutine that notices the disconnect,
+// so for a moment after `tetherd run` exits the old session is still
+// registered, and the next run - a steal session too - is refused for a
+// conflict that is already over. Retrying turns that confusing refusal into
+// a short pause. Nothing about the refusal is weakened: a genuine second
+// steal session is still refused, just later, and the error says so.
+//
+// It is silent while it waits. A line per attempt would be noise in
+// `tetherd run`'s status output and, from the Follower's per-poll attach, a
+// line every poll for as long as a task stays refused.
+func attachWithRetry(ctx context.Context, opts RunOptions, d Deps, prov awsProvider, task transport.Task, logf func(string, ...any), inc proto.Incoming, onHTTP func(stream net.Conn)) (*session.Client, error) {
+	budget := d.AttachRetryBudget
+	if budget <= 0 {
+		// Deps.withDefaults fills this in for every command; a caller that
+		// built a Deps itself still gets the documented behaviour.
+		budget = DefaultAttachRetryBudget
+	}
+	deadline := time.Now().Add(budget)
+	for {
+		sess, err := attachAgent(ctx, opts, d, prov, task, logf, inc, onHTTP)
+		if err == nil || !isDuplicateUser(err) {
+			return sess, err
+		}
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("the agent kept refusing to attach as %q for %s: %w; stop the session that is holding it, or attach under a different --user (`tetherd status` shows who is attached)", opts.User, budget, err)
+		}
+		select {
+		case <-ctx.Done():
+			// The caller is going away (the run is shutting down, or a
+			// bound expired). Report the refusal, which is what actually
+			// happened, rather than a wait that was never finished.
+			return nil, err
+		case <-time.After(attachRetryInterval):
+		}
+	}
+}
+
+// isDuplicateUser reports whether err is the agent refusing a hello because
+// this user already holds a session. errors.As, not a string match: the
+// code is the wire contract and the message is not.
+func isDuplicateUser(err error) bool {
+	var rej *session.RejectedError
+	return errors.As(err, &rej) && rej.Err.Code == proto.CodeDuplicateUser
+}
+
+// attachAgent is one attempt: one transport dial and one handshake.
+func attachAgent(ctx context.Context, opts RunOptions, d Deps, prov awsProvider, task transport.Task, logf func(string, ...any), inc proto.Incoming, onHTTP func(stream net.Conn)) (*session.Client, error) {
 	tr := prov.Transport(logf)
 	conn, err := tr.Dial(ctx, task)
 	if err != nil {

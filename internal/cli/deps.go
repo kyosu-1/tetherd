@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -116,6 +117,13 @@ type Deps struct {
 	LookPath func(file string) (string, error)
 	// InterfaceAddrs lists this machine's own addresses (net.InterfaceAddrs).
 	InterfaceAddrs func() ([]net.Addr, error)
+
+	// AttachRetryBudget is how long an attach the agent refused with
+	// duplicate_user keeps trying before it gives up (see dialAgent).
+	// Zero means DefaultAttachRetryBudget. It is injected rather than
+	// fixed so that the test of the give-up path costs milliseconds
+	// instead of the whole budget.
+	AttachRetryBudget time.Duration
 }
 
 func (d Deps) withDefaults() Deps {
@@ -152,6 +160,9 @@ func (d Deps) withDefaults() Deps {
 	}
 	if d.InterfaceAddrs == nil {
 		d.InterfaceAddrs = net.InterfaceAddrs
+	}
+	if d.AttachRetryBudget <= 0 {
+		d.AttachRetryBudget = DefaultAttachRetryBudget
 	}
 	return d
 }
