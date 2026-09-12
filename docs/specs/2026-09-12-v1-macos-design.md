@@ -152,7 +152,7 @@ CLI が `127.0.0.1:<redirect_port>` で accept したら、helper に `natlook{p
 3. `network.remote_cidrs`。ピアリング先 VPC、Transit Gateway 越しのオンプレなど
 4. `network.remote_services` に書いた AWS サービスの managed prefix list（`com.amazonaws.<region>.s3` / `.dynamodb`）。`DescribeManagedPrefixLists` → `GetManagedPrefixListEntries`
 
-から `network.local_cidrs` を除く。
+から `network.local_cidrs` を除く。引き算は範囲を分割する正確なもので、`10.0.0.0/16` から `10.0.5.0/24` を除けば残りは 8 個のプレフィックスになる（pf は 1 つのテーブルに集合として持つ）。ただし 2 の `169.254.170.0/24` だけは引かれない床で、`local_cidrs` に何を書いても残る — ここが捕捉から外れると子プロセスはタスクロールを失い、開発者自身の身元で動いてしまうため。`local_cidrs` が床以外のすべてを消した場合は、起動時にエラーにして `local_cidrs` を名指しする（`10.0.0.0/8` と書いて `10.0.0.0/16` の VPC を丸ごと消す、が現実的な失敗）。
 
 それ以外（インターネット、localhost、LAN）は子プロセスからそのまま出る。`go run` のモジュール取得、`npm install`、外部 API はラップトップの回線。dev タスクの ENI を踏み台にインターネットへ出る経路は既定で無い。`remote_cidrs: [0.0.0.0/0]` を書けば可能だが `doctor` が警告する。
 

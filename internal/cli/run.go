@@ -209,11 +209,15 @@ var errLocalCIDRsExcludeEverything = errors.New("network.local_cidrs excludes th
 // `doctor` must agree on - a negated table would make the printed set a lie
 // about what pf actually enforces.
 //
-// IPv4 only: v1 captures no IPv6, so an IPv6 p is returned untouched rather
-// than run through the byte-indexing below, which assumes a 4-byte address.
+// IPv4 only: v1 captures no IPv6, and the halving below indexes a 4-byte
+// address. An IPv6 prefix is dropped rather than kept: keeping it would mean
+// a range the operator asked to hold local survives every exclude, including
+// an identical one, which is the unsafe direction to fail in. Unreachable
+// today - every producer of the set filters IPv6 out first - so this is the
+// guard's shape, not a live path.
 func subtractOne(p, e netip.Prefix) []netip.Prefix {
 	if !p.Addr().Is4() {
-		return []netip.Prefix{p}
+		return nil
 	}
 	if !e.Overlaps(p) {
 		return []netip.Prefix{p}
@@ -255,11 +259,21 @@ func Subtract(all []netip.Prefix, exclude []netip.Prefix) []netip.Prefix {
 // applyLocalCIDRs subtracts local (already-parsed network.local_cidrs
 // prefixes) from cidrs, then adds back floor - prefixes local_cidrs can
 // never remove because they are required infrastructure, not part of the
-// operator-tunable remote set (ssm's TaskRoleCIDR; direct has none). It
-// fails loudly if nothing survives even including floor, instead of
-// silently handing the helper zero remote ranges to capture.
+// operator-tunable remote set (ssm's TaskRoleCIDR; direct has none).
+//
+// Emptiness is judged before the floor goes back on. Judging it after would
+// make the check unreachable under ssm, where the floor is never empty, and
+// the failure it exists to catch is a quiet one: `network.local_cidrs:
+// [10.0.0.0/8]` written to mean a home LAN, against a 10.0.0.0/16 VPC,
+// removes the whole VPC. The run then starts normally, prints a green
+// network line, and every connection to the VPC leaves over the laptop's
+// own route to time out somewhere else.
 func applyLocalCIDRs(cidrs, local, floor []netip.Prefix) ([]netip.Prefix, error) {
-	out := append(Subtract(cidrs, local), floor...)
+	kept := Subtract(cidrs, local)
+	if len(cidrs) > 0 && len(kept) == 0 {
+		return nil, errLocalCIDRsExcludeEverything
+	}
+	out := append(kept, floor...)
 	if len(out) == 0 {
 		return nil, errLocalCIDRsExcludeEverything
 	}

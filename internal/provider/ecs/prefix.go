@@ -23,6 +23,11 @@ type PrefixListAPI interface {
 // by leaving through the task's ENI (spec §4.2).
 var gatewayServices = map[string]bool{"s3": true, "dynamodb": true}
 
+// maxPrefixListPages bounds the NextToken walk. At 100 entries per page it
+// is far more than any real AWS-managed list needs, so reaching it means the
+// endpoint is not terminating rather than that the list is large.
+const maxPrefixListPages = 200
+
 // ServiceCIDRs resolves service names to the IPv4 prefixes of
 // com.amazonaws.<region>.<service>.
 func ServiceCIDRs(ctx context.Context, api PrefixListAPI, region string, services []string) ([]netip.Prefix, error) {
@@ -66,7 +71,13 @@ func ServiceCIDRs(ctx context.Context, api PrefixListAPI, region string, service
 		// follow NextToken to the end rather than reading only the first
 		// page.
 		var token *string
-		for {
+		for page := 0; ; page++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if page >= maxPrefixListPages {
+				return nil, fmt.Errorf("GetManagedPrefixListEntries %s: still paging after %d requests; giving up", id, page)
+			}
 			entries, err := api.GetManagedPrefixListEntries(ctx, &awsec2.GetManagedPrefixListEntriesInput{PrefixListId: aws.String(id), NextToken: token})
 			if err != nil {
 				return nil, fmt.Errorf("GetManagedPrefixListEntries %s: %w", id, err)
@@ -80,6 +91,12 @@ func ServiceCIDRs(ctx context.Context, api PrefixListAPI, region string, service
 			}
 			if entries.NextToken == nil {
 				break
+			}
+			if token != nil && *entries.NextToken == *token {
+				// An endpoint (or a proxy in front of one) that echoes the
+				// token back would otherwise spin here forever, growing out
+				// without bound and ignoring Ctrl-C.
+				return nil, fmt.Errorf("GetManagedPrefixListEntries %s: the endpoint repeated its page token", id)
 			}
 			token = entries.NextToken
 		}

@@ -283,7 +283,7 @@ utun に `route-to` してユーザー空間スタックで終端する案は、
 3. `network.remote_cidrs`（ピアリング先 VPC、Transit Gateway 越しのオンプレなど）
 4. `network.remote_services` に書いた AWS サービスの managed prefix list（S3 / DynamoDB）
 
-から `network.local_cidrs` を除く。インターネット、localhost、LAN は子プロセスからそのまま出る。`go run` のモジュール取得や `npm install`、外部 API はラップトップの回線で、dev タスクの ENI を踏み台にした egress は既定で存在しない。mirrord の「egress IP まで Pod」とは逆の側を取る。
+から `network.local_cidrs` を除く。引き算は範囲を分割する正確なもので、`10.0.0.0/16` から `10.0.5.0/24` を除けば残りは 8 個のプレフィックスになる（pf は 1 つのテーブルに集合として持つ）。ただし 2 の `169.254.170.0/24` だけは引かれない床で、`local_cidrs` に何を書いても残る — ここが捕捉から外れると子プロセスはタスクロールを失い、開発者自身の身元で動いてしまうため。`local_cidrs` が床以外のすべてを消した場合は、起動時にエラーにして `local_cidrs` を名指しする（`10.0.0.0/8` と書いて `10.0.0.0/16` の VPC を丸ごと消す、が現実的な失敗）。インターネット、localhost、LAN は子プロセスからそのまま出る。`go run` のモジュール取得や `npm install`、外部 API はラップトップの回線で、dev タスクの ENI を踏み台にした egress は既定で存在しない。mirrord の「egress IP まで Pod」とは逆の側を取る。
 
 macOS の DNS は `mDNSResponder` が出すので pf の group マッチでは見えず、**ホスト名での振り分けは不可**。これが CIDR ベースにする理由でもある。VPC CIDR とラップトップの LAN が重なると、その範囲の LAN 宛通信（子プロセスのものだけ）がリモートに回るので、`run` が起動時に警告して `local_cidrs` を案内する。
 

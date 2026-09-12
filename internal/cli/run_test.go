@@ -530,13 +530,18 @@ func TestRemoteSet(t *testing.T) {
 // identity while the status line still printed a green iam line.
 func TestRemoteSetTaskRoleCIDRSurvivesLocalCIDRs(t *testing.T) {
 	p := &fakeProvider{vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}}
-	opts := RunOptions{LocalCIDRs: []string{"0.0.0.0/0"}}
+	// "keep link-local on the laptop" is the plausible spelling of this
+	// mistake, and it covers 169.254.170.0/24 exactly.
+	opts := RunOptions{LocalCIDRs: []string{"169.254.0.0/16"}}
 	got, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !addrIn(got, "169.254.170.2") {
-		t.Fatalf("the task-role endpoint must survive local_cidrs 0.0.0.0/0: %v", got)
+		t.Fatalf("the task-role endpoint must survive local_cidrs 169.254.0.0/16: %v", got)
+	}
+	if !addrIn(got, "10.0.0.42") {
+		t.Fatalf("the VPC must still be captured: %v", got)
 	}
 }
 
@@ -590,22 +595,21 @@ func TestRemoteSetParsesLocalCIDRsBeforeAnyAWSCall(t *testing.T) {
 	}
 }
 
-// TestRemoteSetNeverEmptiesOutUnderSSM documents the flip side of
-// TestRemoteSetTaskRoleCIDRSurvivesLocalCIDRs: under ssm, TaskRoleCIDR is an
-// unconditional floor, so remoteSet's result can never be truly empty and
-// errLocalCIDRsExcludeEverything can never fire here even when local_cidrs
-// wipes out every VPC/extra/service range. The same "excludes everything"
-// scenario is a real, reachable error under --transport direct instead,
-// which has no such floor (see TestRunDirectRejectsLocalCIDRsExcludingEverything
-// in run_e2e_test.go).
-func TestRemoteSetNeverEmptiesOutUnderSSM(t *testing.T) {
-	p := &fakeProvider{} // no VPC CIDRs at all
-	opts := RunOptions{RemoteCIDRs: []string{"10.9.0.0/16"}, LocalCIDRs: []string{"10.9.0.0/16"}}
-	got, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {})
-	if err != nil {
-		t.Fatal(err)
+// TestRemoteSetRejectsLocalCIDRsThatRemoveEverything is the other half of
+// TestRemoteSetTaskRoleCIDRSurvivesLocalCIDRs. The task-role floor must not
+// double as a reason to accept a local_cidrs that leaves nothing else: the
+// realistic version of this is "10.0.0.0/8" written to mean a home LAN
+// against a 10.0.0.0/16 VPC, which removes the whole VPC. Judged after the
+// floor went back on, that run started normally with a green network line
+// and every VPC connection quietly left over the laptop's own route.
+func TestRemoteSetRejectsLocalCIDRsThatRemoveEverything(t *testing.T) {
+	p := &fakeProvider{vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}}
+	opts := RunOptions{LocalCIDRs: []string{"10.0.0.0/8"}}
+	_, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {})
+	if err == nil {
+		t.Fatal("a local_cidrs that removes every remote range must be reported, not hidden by the task-role floor")
 	}
-	if !addrIn(got, "169.254.170.2") {
-		t.Fatalf("only TaskRoleCIDR should remain: %v", got)
+	if !strings.Contains(err.Error(), "local_cidrs") {
+		t.Fatalf("the error must name local_cidrs: %v", err)
 	}
 }
