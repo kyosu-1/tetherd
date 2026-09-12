@@ -234,10 +234,9 @@ func TestRunBuildsTheRemoteSet(t *testing.T) {
 		vpc:    []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
 		agentAddr: ag.addr,
 	}
-	var applied helper.PfSpec
 	cap := &fakeCapturer{}
 	d := depsFor(p)
-	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{applied: &applied}, nil }
+	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
 	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return cap }
 
 	opts := ssmOpts("true")
@@ -249,13 +248,15 @@ func TestRunBuildsTheRemoteSet(t *testing.T) {
 	if err != nil || code != 0 {
 		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
 	}
+	// The set Run hands the capturer is the thing under test; the pf rules it
+	// turns into are pfrdr's business and are tested there.
 	got := map[string]bool{}
-	for _, p := range applied.RemoteCIDRs {
+	for _, p := range cap.spec.RemoteCIDRs {
 		got[p.String()] = true
 	}
 	for _, want := range []string{"10.0.0.0/16", "169.254.170.0/24", "10.9.0.0/16"} {
 		if !got[want] {
-			t.Errorf("%s missing from the captured set: %v", want, applied.RemoteCIDRs)
+			t.Errorf("%s missing from the captured set: %v", want, cap.spec.RemoteCIDRs)
 		}
 	}
 }
@@ -324,16 +325,10 @@ func TestRunWarnsWhenTheCredentialEndpointIsNotCaptured(t *testing.T) {
 // --- fakes for the helper and the capturer ---
 
 type fakeHelperClient struct {
-	applied *helper.PfSpec
 	domains []string
 }
 
-func (f *fakeHelperClient) PfApply(spec helper.PfSpec) error {
-	if f.applied != nil {
-		*f.applied = spec
-	}
-	return nil
-}
+func (f *fakeHelperClient) PfApply(helper.PfSpec) error { return nil }
 func (f *fakeHelperClient) PfClear() error { return nil }
 func (f *fakeHelperClient) NatLook(string, netip.AddrPort, netip.AddrPort) (netip.AddrPort, error) {
 	return netip.MustParseAddrPort("10.0.0.1:5432"), nil
@@ -345,10 +340,14 @@ func (f *fakeHelperClient) Close() error                              { return n
 type fakeCapturer struct {
 	started bool
 	closed  bool
+	spec    capture.Spec
 	accept  chan capture.Conn
 }
 
-func (f *fakeCapturer) Start(context.Context, capture.Spec) error { f.started = true; return nil }
+func (f *fakeCapturer) Start(_ context.Context, spec capture.Spec) error {
+	f.started, f.spec = true, spec
+	return nil
+}
 func (f *fakeCapturer) Accept() (capture.Conn, error) {
 	if f.accept == nil {
 		f.accept = make(chan capture.Conn)
