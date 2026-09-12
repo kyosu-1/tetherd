@@ -1590,7 +1590,11 @@ func TestDoctorWarnsWhenNothingWouldTakeAStolenRequest(t *testing.T) {
 	if r.mark != "⚠" {
 		t.Fatalf("steal = %q %q, want ⚠: nothing is listening on the local port", r.mark, r.detail)
 	}
-	if !strings.Contains(r.detail, fmt.Sprint(port)) || !strings.Contains(r.detail, "502") {
+	// "would come back 502", not "502": the detail names the port, and a
+	// bare "502" is a substring of about one ephemeral port in a hundred
+	// and twenty - so this assertion could be satisfied by the port number
+	// alone, passing for a detail that never said what the caller gets.
+	if !strings.Contains(r.detail, fmt.Sprint(port)) || !strings.Contains(r.detail, "would come back 502") {
 		t.Errorf("the warning must name the port and what the caller would get, got %q", r.detail)
 	}
 	if !strings.Contains(r.next, "--no-incoming") {
@@ -1672,9 +1676,26 @@ func TestDoctorSaysItCouldNotCheckStealWithoutTheSettings(t *testing.T) {
 // it - and this test has one, so the ⚠ would be a lie about a measurement
 // doctor never took.
 //
-// The budget is spent before the row is reached (a blocking LookPath, as in
-// TestDoctorStopsAtTheOverallBudget), which is the reachable shape: the
-// connect's own context is already dead, so nothing is dialed at all.
+// The report is out of time before the row is reached, which is the
+// reachable shape (the overall budget expiring, or the developer's own
+// interrupt): the connect's own context is already dead, so nothing is
+// dialed at all.
+//
+// Two things about the first version of this test were wrong, and they are
+// separate. What actually made it flaky is the "502" assertion below, not a
+// clock - see the comment there; the report it failed on was correct, which
+// is why every failure quoted a detail that reads exactly right.
+//
+// What was fragile without ever having been the failure is how the ordering
+// was established: Budget=300ms plus a blocking LookPath, trusting the
+// 300ms to be gone by the time the row ran. Nothing here trusts a wall
+// clock now. The per-check bound is taken out of the report through the
+// boundedAfter seam, and the report's own time is ended by hand from inside
+// the plugin check - the row immediately before this one - so bounded's only
+// reachable exit for that check is ctx.Done(), and the report's context is
+// dead before stealRow is entered on any machine, under any load. The test
+// also costs no wall time at all now, which is what made 50,000 runs cheap
+// enough to find the collision below in the first place.
 func TestDoctorDoesNotCallAClockAnEmptyPort(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1685,13 +1706,27 @@ func TestDoctorDoesNotCallAClockAnEmptyPort(t *testing.T) {
 
 	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
 	d := healthyDoctorDeps(healthyProvider(ag.addr))
+
+	// The bound's clock, removed: a nil channel is never ready, so no
+	// bounded call in this report can be ended by its per-check timeout.
+	// Every check here either answers or is ended by the report's own
+	// context, and no row's outcome can turn on how long this machine took.
+	restoreBoundedAfter(t, func(time.Duration, <-chan struct{}) <-chan time.Time { return nil })
+
+	// The report's clock, spent on demand. LookPath ends the report's time
+	// and only then blocks, and it never returns, so the plugin check can
+	// leave bounded through ctx.Done() and nothing else - which makes
+	// "the report has run out of time" a fact established before the check
+	// that precedes the steal row has even returned.
+	ctx, spend := context.WithCancel(context.Background())
+	defer spend()
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	d.LookPath = func(string) (string, error) {
-		select {
-		case <-time.After(8 * time.Second):
-		case <-release:
-		}
+		spend()
+		// bounded abandons this call rather than joining it; the test
+		// releases it on the way out so the goroutine does not outlive it.
+		<-release
 		return "/opt/homebrew/bin/session-manager-plugin", nil
 	}
 
@@ -1699,13 +1734,14 @@ func TestDoctorDoesNotCallAClockAnEmptyPort(t *testing.T) {
 	opts.NoIncoming = false
 	opts.Token = "a-token"
 	opts.LocalPort = port
-	// Generous per check, so only the overall budget can be what ends the
-	// report - the same split TestDoctorStopsAtTheOverallBudget uses.
-	opts.Timeout = 5 * time.Second
-	opts.Budget = 300 * time.Millisecond
+	// Both bounds out of reach on purpose. Neither is what ends this
+	// report - spend() is - and a test about a clock misreported as a
+	// finding should not itself depend on one.
+	opts.Timeout = time.Hour
+	opts.Budget = time.Hour
 
 	var out strings.Builder
-	code, err := DoctorRunWithDeps(context.Background(), opts, &out, d)
+	code, err := DoctorRunWithDeps(ctx, opts, &out, d)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1716,7 +1752,15 @@ func TestDoctorDoesNotCallAClockAnEmptyPort(t *testing.T) {
 	if r.mark != "?" {
 		t.Fatalf("steal = %q %q, want ? (the clock, not a verdict)", r.mark, r.detail)
 	}
-	for _, never := range []string{"nothing is listening", "502"} {
+	// The phrases CheckSteal's ⚠ detail is made of, not a fragment of one.
+	// A bare "502" was this test's flake: the detail names the port, and
+	// 137 of the 16384 ephemeral ports contain those three digits (52502,
+	// 50231, 65029), so about one run in a hundred and twenty failed here
+	// on a ? row that had just satisfied every assertion above. Anchoring
+	// on the wording fixes that and tightens the check while it is at it:
+	// "would come back 502" can only come from the ⚠ arm, where "502" on
+	// its own could come from anywhere in the row.
+	for _, never := range []string{"nothing is listening", "would come back 502"} {
 		if strings.Contains(r.detail, never) {
 			t.Errorf("a clock must not be reported as a finding about the port: %q", r.detail)
 		}
