@@ -17,6 +17,7 @@ import (
 	"github.com/kyosu-1/tetherd/internal/awsid"
 	"github.com/kyosu-1/tetherd/internal/capture"
 	"github.com/kyosu-1/tetherd/internal/dnsproxy"
+	"github.com/kyosu-1/tetherd/internal/doctor"
 	"github.com/kyosu-1/tetherd/internal/env"
 	"github.com/kyosu-1/tetherd/internal/helper"
 	"github.com/kyosu-1/tetherd/internal/proto"
@@ -605,7 +606,10 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 			}
 			dnsStatus = fmt.Sprintf("local (+ %s via the VPC resolver on 127.0.0.1:%d)", strings.Join(opts.RemoteDomains, ", "), daddr.Port())
 		}
-		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s · DNS: %s", joinPrefixes(cidrs), dnsStatus)
+		// The same formatter doctor's remote CIDRs row uses, so the two
+		// surfaces cannot drift again - and so neither prints the whole
+		// managed prefix list on one line.
+		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s · DNS: %s", doctor.FormatPrefixes(cidrs), dnsStatus)
 		if taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "" && !taskRoleReachable(taskEnv, cidrs) {
 			logf("⚠ iam      the task advertises a role but %s is not captured; the child keeps your own AWS credentials (with --transport direct, pass --remote-cidr %s and make sure network.local_cidrs does not exclude it)", ecsprov.TaskRoleCIDR, ecsprov.TaskRoleCIDR)
 		}
@@ -705,17 +709,6 @@ func short(id string) string {
 		return id[:8] + "…"
 	}
 	return id
-}
-
-func joinPrefixes(ps []netip.Prefix) string {
-	s := ""
-	for i, p := range ps {
-		if i > 0 {
-			s += ", "
-		}
-		s += p.String()
-	}
-	return s
 }
 
 func joinArgs(a []string) string {

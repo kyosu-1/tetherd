@@ -240,7 +240,7 @@ func CheckRemoteCIDRs(cidrs []netip.Prefix) Result {
 		r.Next = "list only the ranges you need in remote_cidrs / remote_services"
 		return r
 	}
-	r.Detail = joinPrefixes(cidrs)
+	r.Detail = FormatPrefixes(cidrs)
 	return r
 }
 
@@ -342,13 +342,45 @@ func whollyPrivate(p netip.Prefix) bool {
 	return false
 }
 
-func joinPrefixes(cidrs []netip.Prefix) string {
+// maxListedPrefixes is how many prefixes FormatPrefixes names in full, and
+// prefixesPreviewed how many of them a longer set shows as a sample. Both
+// are about what fits on one line of a status report and stays readable, not
+// about any limit of pf's.
+const (
+	maxListedPrefixes  = 8
+	prefixesPreviewed  = 3
+	noPrefixesCaptured = "none"
+)
+
+// FormatPrefixes renders a captured set for a human to read: the prefixes
+// comma-joined while there are few enough to take in, and a count with a
+// sample once there are not.
+//
+// The cap earns its place because the set is often not small.
+// `remote_services: [s3]` adds a whole managed prefix list (15 entries in
+// ap-northeast-1, more in other regions), and every network.local_cidrs
+// entry splits what it carves out of into up to 32 more - 10.0.0.0/16 minus
+// 10.0.5.0/24 is 8 prefixes. Comma-joining all of that printed a line
+// nobody reads in the middle of the two places a developer actually looks.
+//
+// One implementation for both of those places - `tetherd run`'s network
+// status line and doctor's remote CIDRs row - because the two had their own
+// copies and the copies had already drifted: an empty set rendered as ""
+// from one and "none" from the other.
+func FormatPrefixes(cidrs []netip.Prefix) string {
 	if len(cidrs) == 0 {
-		return "none"
+		return noPrefixesCaptured
 	}
+	if len(cidrs) <= maxListedPrefixes {
+		return strings.Join(prefixStrings(cidrs), ", ")
+	}
+	return fmt.Sprintf("%d prefixes (%s, …)", len(cidrs), strings.Join(prefixStrings(cidrs[:prefixesPreviewed]), ", "))
+}
+
+func prefixStrings(cidrs []netip.Prefix) []string {
 	out := make([]string, 0, len(cidrs))
 	for _, p := range cidrs {
 		out = append(out, p.String())
 	}
-	return strings.Join(out, ", ")
+	return out
 }

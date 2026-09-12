@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"net/netip"
 	"os/exec"
@@ -347,6 +348,54 @@ func TestCheckRemoteCIDRsWarnsOnlyOnWidePublicRanges(t *testing.T) {
 	}
 	if empty := CheckRemoteCIDRs(nil); empty.Status != OK || empty.Detail == "" {
 		t.Errorf("an empty captured set is fine but must still say so: %+v", empty)
+	}
+}
+
+// TestFormatPrefixesTruncatesALongSet: `remote_services: [s3]` adds a whole
+// managed prefix list, and each network.local_cidrs entry splits what it
+// carves out of into up to 32 more, so the captured set is routinely tens of
+// prefixes. Comma-joining all of them printed a line nobody reads in the two
+// places a developer actually looks - `tetherd run`'s network line and
+// doctor's remote CIDRs row - which is why both now go through this one
+// function.
+func TestFormatPrefixesTruncatesALongSet(t *testing.T) {
+	if got := FormatPrefixes(nil); got != "none" {
+		t.Errorf("an empty set = %q, want %q (the two old copies disagreed here: %q against %q)", got, "none", "", "none")
+	}
+
+	short := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16"), netip.MustParsePrefix("169.254.170.0/24")}
+	if got := FormatPrefixes(short); got != "10.0.0.0/16, 169.254.170.0/24" {
+		t.Errorf("a set small enough to read must be listed in full, got %q", got)
+	}
+
+	// The realistic long set: a /16 with a /24 carved out of it (8
+	// prefixes) plus the credential endpoint plus a handful of prefix-list
+	// entries.
+	var long []netip.Prefix
+	for i := 0; i < 20; i++ {
+		long = append(long, netip.MustParsePrefix(fmt.Sprintf("52.219.%d.0/24", i)))
+	}
+	got := FormatPrefixes(long)
+	if !strings.Contains(got, "20 prefixes") {
+		t.Errorf("a long set must be summarised by count, got %q", got)
+	}
+	if !strings.Contains(got, "52.219.0.0/24") {
+		t.Errorf("the summary must still show a sample so the line is recognisable, got %q", got)
+	}
+	if strings.Contains(got, long[len(long)-1].String()) {
+		t.Errorf("a long set must not be joined in full, got %q", got)
+	}
+	if n := strings.Count(got, "/24"); n > prefixesPreviewed {
+		t.Errorf("the summary lists %d prefixes, want at most %d: %q", n, prefixesPreviewed, got)
+	}
+
+	// The row that prints it has to be truncated too, not just the helper.
+	row := CheckRemoteCIDRs(long)
+	if row.Status != OK {
+		t.Fatalf("a long set of ordinary public /24s is not a warning: %+v", row)
+	}
+	if row.Detail != got {
+		t.Errorf("the remote CIDRs row must use the shared formatter: %q against %q", row.Detail, got)
 	}
 }
 

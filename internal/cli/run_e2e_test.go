@@ -225,6 +225,61 @@ func TestRunBuildsTheRemoteSet(t *testing.T) {
 	}
 }
 
+// TestRunTruncatesTheRemoteSetInItsStatusLine: the network line printed
+// every prefix comma-joined, and with `remote_services: [s3]` that is a
+// whole managed prefix list plus whatever local_cidrs splitting added - one
+// unreadable line in the place a developer looks first. doctor's remote
+// CIDRs row had the same problem, and both now go through
+// doctor.FormatPrefixes, so the two cannot drift apart again.
+func TestRunTruncatesTheRemoteSetInItsStatusLine(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	// A stand-in for the S3 prefix list: 15 entries in ap-northeast-1.
+	var svc []netip.Prefix
+	for i := 0; i < 15; i++ {
+		svc = append(svc, netip.MustParsePrefix(fmt.Sprintf("52.219.%d.0/24", i)))
+	}
+	p := &fakeProvider{
+		region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		svc:       svc,
+		agentAddr: ag.addr,
+	}
+	cap := newFakeCapturer()
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return cap }
+
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.RemoteServices = []string{"s3"}
+	opts.ExecPath = "/usr/bin/true"
+	var out strings.Builder
+	code, err := RunWithDeps(context.Background(), opts, &out, d)
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+
+	var line string
+	for _, l := range strings.Split(out.String(), "\n") {
+		if strings.Contains(l, "✓ network") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("no network status line at all: %s", out.String())
+	}
+	// pf still gets every prefix; only the line a human reads is shortened.
+	if len(cap.spec.RemoteCIDRs) < len(svc) {
+		t.Fatalf("truncating the line must not truncate the captured set: %d prefixes", len(cap.spec.RemoteCIDRs))
+	}
+	if !strings.Contains(line, fmt.Sprintf("%d prefixes", len(cap.spec.RemoteCIDRs))) {
+		t.Errorf("the network line must say how many prefixes are captured, got %q", line)
+	}
+	if strings.Contains(line, svc[len(svc)-1].String()) {
+		t.Errorf("the network line must not list the whole prefix list, got %q", line)
+	}
+}
+
 // The task role has to be claimed only when its endpoint is captured.
 func TestRunVerifiesTheTaskRoleThroughTheAgent(t *testing.T) {
 	// The endpoint fails on purpose. Serving usable credentials would send
