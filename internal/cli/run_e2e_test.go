@@ -2999,10 +2999,40 @@ func TestRunFailsWhenEverySessionDiesDuringTheAttach(t *testing.T) {
 		t.Fatal("the second task was never dialed; this test proves nothing")
 	}
 	tr.breakFirst()
-	// The agent unregistering is the sequencing point: the session the run
-	// is holding is provably gone before the second dial is allowed to
-	// fail, so the set the run then reads holds one dead entry and nothing
-	// else.
+	// This wait is not a sequencing point, and the comment that claimed it
+	// was is what this test's flakiness hid behind. It waits on the agent's
+	// session count while the assertion below is about the client's:
+	// Primary() skips a session whose Done has fired, Done belongs to
+	// session.Client, and follow.go:66-69 already says in those words that
+	// the agent's count answers a different question, because unregistering
+	// is asynchronous. breakFirst cuts the conn under both ends, so the
+	// agent can get there first, and the run then reads a set whose one
+	// entry nobody has yet declared dead.
+	//
+	// Measured rather than reasoned about, and the condition is part of the
+	// measurement: 20 rounds of `-race -count=5` with this test alone, 0
+	// red; the same 20 rounds with sixteen more busy cores, 2 red - both at
+	// the assertion below, both with the child started. (The first row is
+	// not a quiet machine either: it had most of fifteen cores already
+	// spoken for. This test is a coin whose weighting is the machine's load,
+	// which is exactly what a scheduling race looks like from outside.)
+	//
+	// Waiting on the client instead does not fix it, which is the part
+	// worth leaving here. A conn wrapper recording session.Client's own
+	// teardown closing the mux - the last client-side event a test can see
+	// - still went 4 of 20 rounds red under that load. What is left is one
+	// goroutine: close(c.done) is the final statement of
+	// session.Client.finish, and every act of the client a test can observe
+	// (its reads, its writes, its Close, and so the agent's unregister)
+	// happens before it, so nothing outside the client can order itself
+	// after it. A 200ms sleep here goes to 0 of 20, which confirms that
+	// scheduling is all that remains - and a sleep is not a fix.
+	//
+	// Sound needs the predicate the assertion rests on: the run's own set,
+	// reachable from here, so that this wait is `set.Primary() == nil`.
+	// That is a real edge - Primary is mutex-guarded and a closed Done
+	// never reopens - and it is a field on Deps plus a line in run.go,
+	// neither of which is this file.
 	waitFor(t, func() bool { return len(ag.a.Sessions()) == 0 }, "the first task's session to end")
 	close(tr.release)
 
