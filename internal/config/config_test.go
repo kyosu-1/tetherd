@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -140,5 +141,134 @@ func TestEnsurePersonalCreatesOnceWithAToken(t *testing.T) {
 	}
 	if again.Token != got.Token || again.User != "shota" {
 		t.Fatalf("the existing file must win: %+v", again)
+	}
+}
+
+// TestEnsurePersonalIsRaceSafe pins the TOCTOU fix: every `tetherd run`
+// invocation calls EnsurePersonal on a path that may not exist yet, so
+// concurrent first runs (e.g. two terminals) must agree on exactly one
+// token, and exactly one of them must report created=true.
+func TestEnsurePersonalIsRaceSafe(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sub", "config.yml")
+	const n = 8
+	var wg sync.WaitGroup
+	results := make([]Personal, n)
+	createdFlags := make([]bool, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], createdFlags[i], errs[i] = EnsurePersonal(path, "shota")
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+	}
+	createdCount := 0
+	token := results[0].Token
+	if token == "" {
+		t.Fatal("the winning token must not be empty")
+	}
+	for i := 0; i < n; i++ {
+		if createdFlags[i] {
+			createdCount++
+		}
+		if results[i].Token != token {
+			t.Errorf("goroutine %d got a different token: %q vs %q", i, results[i].Token, token)
+		}
+		if results[i].User != "shota" {
+			t.Errorf("goroutine %d got a different user: %q", i, results[i].User)
+		}
+	}
+	if createdCount != 1 {
+		t.Errorf("created=true count = %d, want exactly 1", createdCount)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Errorf("the token file must be 0600, got %v", st.Mode().Perm())
+	}
+}
+
+// TestLoadRejectsVersionBeforeCheckingUnknownKeys pins the ordering the
+// review demanded: a newer schema (version: 2 plus a v2-only block) must be
+// reported as an unsupported version, not as an unknown-field error from
+// decoding it against the v1 struct - the version gate has to fire first.
+func TestLoadRejectsVersionBeforeCheckingUnknownKeys(t *testing.T) {
+	dir := t.TempDir()
+	p := write(t, dir, "v2.yml", "version: 2\ndns:\n  enabled: true\n")
+	_, err := Load(p, "")
+	if err == nil || !strings.Contains(err.Error(), "version") {
+		t.Fatalf("the version must be reported even with an unknown block present: %v", err)
+	}
+	if strings.Contains(err.Error(), "dns") {
+		t.Fatalf("the version error must fire before the unknown-key error: %v", err)
+	}
+}
+
+// TestLoadMissingVersionKeyNamesTheFileAndSuggestsTheFix covers the
+// commonest mistake - a .tetherd.yml that simply forgot the `version` line
+// (or is empty, or comments-only) - which must not be reported as
+// "unsupported version 0".
+func TestLoadMissingVersionKeyNamesTheFileAndSuggestsTheFix(t *testing.T) {
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"noversion.yml": "target:\n  cluster: c\n",
+		"empty.yml":     "",
+		"comments.yml":  "# just a comment\n",
+	} {
+		p := write(t, dir, name, body)
+		_, err := Load(p, "")
+		if err == nil {
+			t.Fatalf("%s: expected an error", name)
+		}
+		if !strings.Contains(err.Error(), p) {
+			t.Errorf("%s: error must name the file: %v", name, err)
+		}
+		if !strings.Contains(err.Error(), "version: 1") {
+			t.Errorf("%s: error must suggest `version: 1`: %v", name, err)
+		}
+		if strings.Contains(err.Error(), "version 0") {
+			t.Errorf("%s: must not say \"unsupported version 0\": %v", name, err)
+		}
+	}
+}
+
+// TestLoadEmptyPersonalFileIsFine keeps "an empty file is an empty config"
+// true for the personal file specifically: it carries no version gate.
+func TestLoadEmptyPersonalFileIsFine(t *testing.T) {
+	dir := t.TempDir()
+	sp := write(t, dir, ".tetherd.yml", shared)
+	pp := write(t, dir, "personal.yml", "")
+	cfg, err := Load(sp, pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Personal.User != "" || cfg.Personal.Token != "" {
+		t.Fatalf("an empty personal file must decode to the zero value: %+v", cfg.Personal)
+	}
+}
+
+// TestEnsurePersonalOmitsEmptyAWSBlock is the one nitpick from review:
+// EnsurePersonal writes a file a developer hand-edits, so it should not end
+// with an empty `aws: {profile: "", region: ""}` block.
+func TestEnsurePersonalOmitsEmptyAWSBlock(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.yml")
+	if _, _, err := EnsurePersonal(p, "shota"); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "aws:") {
+		t.Errorf("an empty aws block must be omitted: %s", body)
 	}
 }

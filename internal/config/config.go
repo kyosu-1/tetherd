@@ -4,6 +4,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -70,11 +71,13 @@ type Shared struct {
 	Incoming Incoming `yaml:"incoming"`
 }
 
-// Personal is ~/.tetherd/config.yml.
+// Personal is ~/.tetherd/config.yml. AWS is omitempty because this is the
+// one file a developer hand-edits: EnsurePersonal should not leave a
+// generated file ending in an empty `aws: {profile: "", region: ""}` block.
 type Personal struct {
 	User  string `yaml:"user"`
 	Token string `yaml:"token"`
-	AWS   AWS    `yaml:"aws"`
+	AWS   AWS    `yaml:"aws,omitempty"`
 }
 
 // Config is both files, with the shared file's path for error messages.
@@ -113,19 +116,22 @@ func DefaultPersonalPath() (string, error) {
 }
 
 // Load reads both files. A missing file is not an error (defaults are used);
-// an unknown key is, so a typo cannot be silently ignored.
+// an unknown key is, so a typo cannot be silently ignored. Whether a missing
+// shared path should instead be an error (an explicit --config that does not
+// exist) is the caller's call to make before calling Load — see
+// cli.applyConfig.
 func Load(sharedPath, personalPath string) (Config, error) {
 	var cfg Config
 	if sharedPath != "" {
-		if err := decodeFile(sharedPath, &cfg.Shared); err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
+		data, err := os.ReadFile(sharedPath)
+		switch {
+		case err == nil:
+			if err := decodeShared(sharedPath, data, &cfg.Shared); err != nil {
 				return Config{}, err
 			}
-		} else {
 			cfg.SharedPath = sharedPath
-			if cfg.Shared.Version != Version {
-				return Config{}, fmt.Errorf("%s: unsupported version %d (this tetherd understands version %d)", sharedPath, cfg.Shared.Version, Version)
-			}
+		case !errors.Is(err, os.ErrNotExist):
+			return Config{}, err
 		}
 	}
 	if personalPath != "" {
@@ -136,6 +142,39 @@ func Load(sharedPath, personalPath string) (Config, error) {
 	return cfg, nil
 }
 
+// decodeShared decodes the shared file's `version` key first, in a lenient
+// (non-strict) pass, and rejects anything but Version before the strict,
+// unknown-key-rejecting decode of the rest of the document. Doing the
+// version check first, on its own, matters for two reasons: a newer schema
+// (version: 2 with a v2-only block) must be reported as "unsupported
+// version", not as an unknown-field error from decoding it against the v1
+// struct; and a file with no `version` key at all - the commonest mistake -
+// gets a message that names the file and says what to add, instead of
+// "unsupported version 0".
+func decodeShared(path string, data []byte, into *Shared) error {
+	var probe struct {
+		Version *int `yaml:"version"`
+	}
+	if err := yaml.Unmarshal(data, &probe); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	switch {
+	case probe.Version == nil:
+		return fmt.Errorf("%s: missing `version` key; add `version: %d` at the top of the file", path, Version)
+	case *probe.Version != Version:
+		return fmt.Errorf("%s: unsupported version %d (this tetherd understands version %d)", path, *probe.Version, Version)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(into); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
+}
+
+// decodeFile decodes the personal config. Unlike the shared file it carries
+// no version gate, so an empty file (like a missing one) is simply an empty
+// config.
 func decodeFile(path string, into any) error {
 	f, err := os.Open(path)
 	if err != nil {
