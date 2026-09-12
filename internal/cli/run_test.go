@@ -103,7 +103,9 @@ func TestLocalOverlaps(t *testing.T) {
 }
 
 func TestRunSSMRequiresClusterAndService(t *testing.T) {
-	code, err := Run(context.Background(), RunOptions{Transport: "ssm", Command: []string{"true"}}, io.Discard)
+	// NoIncoming because this is about the target flags: steal is on by
+	// default and would otherwise be the first thing refused (no token).
+	code, err := Run(context.Background(), RunOptions{Transport: "ssm", Command: []string{"true"}, NoIncoming: true}, io.Discard)
 	if code != 2 || err == nil || !strings.Contains(err.Error(), "--cluster") {
 		t.Fatalf("code %d err %v", code, err)
 	}

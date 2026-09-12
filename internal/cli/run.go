@@ -54,6 +54,28 @@ type RunOptions struct {
 	EnvExclude     []string
 	ConfigPath     string // the .tetherd.yml read; shown in the status line
 
+	// The steal settings (spec §5.2). NoIncoming is --no-incoming: take no
+	// request at all, whatever the configuration says, and it is the only
+	// way to turn steal off - a request reaching the laptop needs this
+	// developer's name and token, so being able to take one is the default.
+	// LocalPort is --local-port / incoming.local_port, the port the
+	// developer's own process listens on; zero means DefaultLocalPort. As
+	// is --as: the name the agent matches against the request's user
+	// header, which is the same value as hello.user (it lands in User).
+	// Token comes from the personal config and is matched against the token
+	// header; it is never logged, which is what StealToken is for.
+	// MatchHeader and MatchTokenHeader are incoming.match.*.
+	//
+	// Every default is applied by stealSettings and nowhere else: config
+	// holds none, and the agent reads an empty header name as "matches
+	// nothing", silently.
+	NoIncoming       bool
+	LocalPort        int
+	As               string
+	Token            StealToken
+	MatchHeader      string
+	MatchTokenHeader string
+
 	// PinCredentialRoute is network.pin_credential_route (default false):
 	// pin a machine-wide host route to 169.254.170.2 and capture it, for a
 	// tool inside the child's tree that hardcodes the address instead of
@@ -512,13 +534,28 @@ func discoverTask(ctx context.Context, opts RunOptions, d Deps, logf func(string
 
 // dialAgent opens the transport and completes the control handshake. The
 // second half of Run's original steps 1 and 3.
-func dialAgent(ctx context.Context, opts RunOptions, d Deps, prov awsProvider, task transport.Task, logf func(string, ...any)) (*session.Client, error) {
+//
+// inc and onHTTP are the two halves of one decision and must agree: inc is
+// what the agent matches a request against, onHTTP is what serves the
+// stream it opens as a result. `tetherd env` and `tetherd doctor` pass the
+// zero Incoming and a nil handler - they attach to read the environment,
+// never to take a request - and a nil handler is also what makes the
+// session refuse an http stream with proto.CodeNoIncoming, so an agent that
+// steals anyway learns why instead of waiting on a stream nobody reads.
+func dialAgent(ctx context.Context, opts RunOptions, d Deps, prov awsProvider, task transport.Task, logf func(string, ...any), inc proto.Incoming, onHTTP func(stream net.Conn)) (*session.Client, error) {
 	tr := prov.Transport(logf)
 	conn, err := tr.Dial(ctx, task)
 	if err != nil {
 		return nil, fmt.Errorf("connect to agent: %w", err)
 	}
-	sess, err := session.Dial(ctx, conn, proto.Hello{Version: proto.Version, User: opts.User}, session.Options{})
+	hello := proto.Hello{Version: proto.Version, User: opts.User, Incoming: inc}
+	if inc.Enabled {
+		// Only a session that is taking requests sends the token: it is
+		// what the agent compares the token header against, and a session
+		// with nothing to match has no use for it on the wire.
+		hello.Token = string(opts.Token)
+	}
+	sess, err := session.Dial(ctx, conn, hello, session.Options{OnHTTP: onHTTP})
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -545,6 +582,18 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 	extra, err := ParseRemoteCIDRs("--remote-cidr", opts.RemoteCIDRs)
 	if err != nil {
 		return 2, err
+	}
+	// Decided before the first AWS call, like every other value the
+	// operator gave us: asking to take requests with no token to match is
+	// wrong in a way no round trip can fix.
+	st, err := stealSettings(opts)
+	if err != nil {
+		return exitFor(err), err
+	}
+	var onHTTP func(net.Conn)
+	if st.Incoming.Enabled {
+		steal := &StealServer{LocalPort: st.LocalPort, Logf: logf}
+		onHTTP = steal.Serve
 	}
 
 	// 1. transport, task, remote set
@@ -616,7 +665,7 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 	}
 
 	// 3. session
-	sess, err := dialAgent(ctx, opts, d, prov, task, logf)
+	sess, err := dialAgent(ctx, opts, d, prov, task, logf, st.Incoming, onHTTP)
 	if err != nil {
 		return 1, err
 	}
@@ -630,6 +679,15 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 		return 1, err
 	}
 	logf("%s", envStatus)
+	// The receiver has been live since session.Dial (the agent may push a
+	// stream the moment it has the hello), so this line reports what the
+	// agent was told rather than announcing something about to start. There
+	// is deliberately no line at all when this session takes nothing:
+	// nothing printed is how --no-incoming, a repository with no
+	// incoming.local_port and `tetherd env` all read.
+	if st.Incoming.Enabled {
+		logf("✓ steal    %s: %s (+ %s) → localhost:%d", st.Incoming.Header, opts.User, st.Incoming.TokenHeader, st.LocalPort)
+	}
 
 	// 4. the task's credential and metadata endpoint, on loopback. Before
 	// the capture on purpose: it needs no pf rule and no root, only the

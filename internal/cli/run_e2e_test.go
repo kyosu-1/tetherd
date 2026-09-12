@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -22,7 +25,9 @@ import (
 	"github.com/kyosu-1/tetherd/internal/capture"
 	"github.com/kyosu-1/tetherd/internal/env"
 	"github.com/kyosu-1/tetherd/internal/helper"
+	"github.com/kyosu-1/tetherd/internal/proto"
 	ecsprov "github.com/kyosu-1/tetherd/internal/provider/ecs"
+	"github.com/kyosu-1/tetherd/internal/session"
 	"github.com/kyosu-1/tetherd/internal/transport"
 )
 
@@ -144,6 +149,12 @@ func ssmOpts(cmd ...string) RunOptions {
 	return RunOptions{
 		Transport: "ssm", Cluster: "c", Service: "api", TargetEnv: "dev",
 		User: "tester", NoNetwork: true, Command: cmd,
+		// Steal is on by default (see DefaultLocalPort) and a session that
+		// takes requests must carry a token, so a bare RunOptions with
+		// neither would be refused before it ever reached the agent. The
+		// tests that are about steal say so by clearing this and setting a
+		// port and a token; every other test here is about something else.
+		NoIncoming: true,
 	}
 }
 
@@ -760,7 +771,7 @@ func TestRunExitsTwoForEveryBadCIDRValue(t *testing.T) {
 	}
 	directCase := func(mod func(*RunOptions)) RunOptions {
 		o := RunOptions{
-			Transport: "direct", AgentAddr: "127.0.0.1:1", TargetEnv: "dev", User: "tester",
+			Transport: "direct", AgentAddr: "127.0.0.1:1", TargetEnv: "dev", User: "tester", NoIncoming: true,
 			RemoteCIDRs: []string{"10.0.0.0/16"}, ExecPath: "/usr/bin/true", Command: []string{"true"},
 		}
 		mod(&o)
@@ -830,7 +841,7 @@ func TestRunDirectAppliesLocalCIDRs(t *testing.T) {
 	}
 
 	opts := RunOptions{
-		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
+		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester", NoIncoming: true,
 		RemoteCIDRs: []string{"10.0.0.0/16"}, LocalCIDRs: []string{"10.0.5.0/24"},
 		ExecPath: "/usr/bin/true", Command: []string{"true"},
 	}
@@ -859,7 +870,7 @@ func TestRunDirectIgnoresRemoteServicesWithALogLine(t *testing.T) {
 	}
 
 	opts := RunOptions{
-		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
+		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester", NoIncoming: true,
 		RemoteCIDRs: []string{"10.0.0.0/16"}, RemoteServices: []string{"s3"},
 		ExecPath: "/usr/bin/true", Command: []string{"true"},
 	}
@@ -885,7 +896,7 @@ func TestRunDirectIgnoresRemoteServicesWithALogLine(t *testing.T) {
 // same mistake.
 func TestRunDirectRejectsLocalCIDRsExcludingEverything(t *testing.T) {
 	opts := RunOptions{
-		Transport: "direct", AgentAddr: "127.0.0.1:1", TargetEnv: "dev", User: "tester",
+		Transport: "direct", AgentAddr: "127.0.0.1:1", TargetEnv: "dev", User: "tester", NoIncoming: true,
 		RemoteCIDRs: []string{"10.0.0.0/16"}, LocalCIDRs: []string{"10.0.0.0/8"},
 		ExecPath: "/usr/bin/true", Command: []string{"true"},
 	}
@@ -917,7 +928,7 @@ func TestRunGivesTheChildTheTaskRoleWithoutCapturingTheEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	opts := RunOptions{
-		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
+		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester", NoIncoming: true,
 		RemoteCIDRs: []string{"10.0.0.0/16"}, ExecPath: script, Command: []string{"true"},
 	}
 	var out strings.Builder
@@ -1694,7 +1705,7 @@ func TestRunCapturesTheEndpointWheneverItPinsTheRoute(t *testing.T) {
 		NewCapturer: func(HelperClient, func(string, ...any)) Capturer { return cap },
 	}
 	opts := RunOptions{
-		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
+		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester", NoIncoming: true,
 		RemoteCIDRs: []string{"10.9.0.0/16"}, PinCredentialRoute: true,
 		ExecPath: "/usr/bin/true", Command: []string{"true"},
 	}
@@ -1785,5 +1796,366 @@ func TestRunExplainsABusyHelperFromPfApply(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Stop the other") {
 		t.Errorf("err = %q, want the next step a developer can act on", err)
+	}
+}
+
+// --- the steal receiver, over a real session -------------------------------
+//
+// The agent end of steal (its L7 proxy) is Task 4's; these tests stand in
+// for it with the one thing it will do that matters here - open a stream
+// toward this CLI, write the http header on it and speak HTTP/1.1 - so that
+// what is exercised is the real session, the real accept loop, the real
+// OnHTTP contract and the real receiver.
+
+// stealAgent is a session.Handler that records the hello it was sent and
+// keeps the Opener it was handed, which is how the agent pushes a stolen
+// request at a CLI.
+type stealAgent struct {
+	addr string
+
+	mu       sync.Mutex
+	hello    proto.Hello
+	open     session.Opener
+	attached chan struct{}
+	once     sync.Once
+}
+
+func startStealAgent(t *testing.T) *stealAgent {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &stealAgent{addr: ln.Addr().String(), attached: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go session.Serve(ctx, c, a, session.ServeOptions{})
+		}
+	}()
+	return a
+}
+
+func (a *stealAgent) Hello(h proto.Hello, _ string, open session.Opener) (proto.Welcome, *proto.Error) {
+	a.mu.Lock()
+	a.hello, a.open = h, open
+	a.mu.Unlock()
+	a.once.Do(func() { close(a.attached) })
+	return proto.Welcome{Version: proto.Version, TaskARN: "arn:test", Env: "dev", AppEnv: map[string]string{"A": "1"}}, nil
+}
+
+func (a *stealAgent) Dial(context.Context, string) (net.Conn, error) {
+	return nil, errors.New("this agent does not dial")
+}
+
+func (a *stealAgent) Resolve(context.Context, string) ([]string, int, error) {
+	return nil, 0, errors.New("this agent does not resolve")
+}
+
+func (a *stealAgent) Closed() {}
+
+// waitAttached blocks until a CLI has completed the handshake and returns
+// the hello it sent.
+func (a *stealAgent) waitAttached(t *testing.T) proto.Hello {
+	t.Helper()
+	select {
+	case <-a.attached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no CLI attached")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.hello
+}
+
+// steal opens an http stream at the attached CLI and returns the response,
+// or the proto error the CLI answered with instead.
+func (a *stealAgent) steal(t *testing.T, req *http.Request) (*http.Response, *proto.Error) {
+	t.Helper()
+	a.mu.Lock()
+	open := a.open
+	a.mu.Unlock()
+	if open == nil {
+		t.Fatal("the agent has no opener: no session")
+	}
+	s, err := open.OpenStream()
+	if err != nil {
+		t.Fatalf("open a stream toward the CLI: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := proto.NewEncoder(s).Encode(proto.TypeHTTP, proto.HTTPHeader{User: req.Header.Get("X-Dev-User")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := req.Write(s); err != nil {
+		t.Fatal(err)
+	}
+	s.SetReadDeadline(time.Now().Add(10 * time.Second))
+	br := bufio.NewReader(s)
+	// A CLI that is not taking requests answers with the proto error the
+	// session layer sends, not with an HTTP response. The first byte tells
+	// them apart: "{" is JSON Lines, "H" is HTTP/1.1.
+	first, err := br.Peek(1)
+	if err != nil {
+		t.Fatalf("the CLI answered nothing: %v", err)
+	}
+	if first[0] == '{' {
+		line, err := br.ReadBytes('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		var e proto.Error
+		if err := json.Unmarshal(line, &e); err != nil {
+			t.Fatalf("unparseable refusal %q: %v", line, err)
+		}
+		return nil, &e
+	}
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		t.Fatalf("reading the response off the stream: %v", err)
+	}
+	return resp, nil
+}
+
+// safeLog is Run's stderr for the tests below: Run writes to it from its own
+// goroutine while the test reads it, which a strings.Builder does not allow.
+type safeLog struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *safeLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *safeLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+func devRequest(method, path, user, token string) *http.Request {
+	r := httptest.NewRequest(method, "http://api.example.com"+path, nil)
+	r.Header.Set("X-Dev-User", user)
+	r.Header.Set("X-Dev-Token", token)
+	r.Header.Set("X-Forwarded-For", "203.0.113.5")
+	return r
+}
+
+func TestRunTakesAStolenRequestToTheDevelopersProcess(t *testing.T) {
+	port := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "LOCAL %s xff=%s", r.URL.Path, r.Header.Get("X-Forwarded-For"))
+	}))
+	ag := startStealAgent(t)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+
+	opts := ssmOpts("sleep", "30")
+	opts.NoIncoming = false
+	opts.LocalPort = port
+	opts.User = "shota"
+	opts.Token = "tok-shota"
+	var out safeLog
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() {
+		code, _ := RunWithDeps(ctx, opts, &out, depsFor(p))
+		done <- code
+	}()
+
+	// What the agent matches against has to arrive in the hello, all of it:
+	// the user name, the token, and both header names (config applies no
+	// defaults, and the agent reads an empty name as "matches nothing").
+	hello := ag.waitAttached(t)
+	if hello.User != "shota" || hello.Token != "tok-shota" {
+		t.Errorf("hello = user %q token %q, want both carried", hello.User, hello.Token)
+	}
+	if hello.Incoming != (proto.Incoming{Enabled: true, Header: "X-Dev-User", TokenHeader: "X-Dev-Token"}) {
+		t.Errorf("hello.Incoming = %+v", hello.Incoming)
+	}
+	waitFor(t, func() bool { return strings.Contains(out.String(), "✓ steal") }, "the steal line")
+	if l := out.String(); !strings.Contains(l, "X-Dev-User: shota") || !strings.Contains(l, fmt.Sprintf("localhost:%d", port)) {
+		t.Errorf("the steal line must say what is matched and where it goes: %s", l)
+	}
+
+	resp, perr := ag.steal(t, devRequest("GET", "/api/orders", "shota", "tok-shota"))
+	if perr != nil {
+		t.Fatalf("the CLI refused the stream: %+v", perr)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || !strings.Contains(string(b), "LOCAL /api/orders") {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, b)
+	}
+	if !strings.Contains(string(b), "xff=203.0.113.5") {
+		t.Errorf("the caller must reach the developer's process: %s", b)
+	}
+	waitFor(t, func() bool { return strings.Contains(out.String(), "/api/orders  200") }, "the request log line")
+	// The token must not be anywhere in what the developer's terminal saw.
+	if strings.Contains(out.String(), "tok-shota") {
+		t.Errorf("the token leaked into the log: %s", out.String())
+	}
+	cancel()
+	<-done
+}
+
+// Nothing in the repository configures steal: the agent must still be told
+// this session can take a request, on the default port and with the default
+// header names, because --no-incoming is the only way to turn steal off.
+func TestRunStealsOnTheDefaultPortWhenNothingConfiguresIt(t *testing.T) {
+	ag := startStealAgent(t)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+
+	opts := ssmOpts("sleep", "30")
+	opts.NoIncoming = false
+	opts.LocalPort = 0
+	opts.User = "shota"
+	opts.Token = "tok-shota"
+	var out safeLog
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() {
+		code, _ := RunWithDeps(ctx, opts, &out, depsFor(p))
+		done <- code
+	}()
+
+	if in := ag.waitAttached(t).Incoming; !in.Enabled {
+		t.Fatalf("incoming = %+v, want it enabled with no configuration at all", in)
+	}
+	waitFor(t, func() bool { return strings.Contains(out.String(), "✓ steal") }, "the steal line")
+	if l := out.String(); !strings.Contains(l, fmt.Sprintf("localhost:%d", DefaultLocalPort)) {
+		t.Errorf("the steal line must name the default port: %s", l)
+	}
+	cancel()
+	<-done
+}
+
+func TestRunWithNoIncomingTakesNothing(t *testing.T) {
+	port := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("the developer's process must not be reached at all: %s", r.URL.Path)
+	}))
+	ag := startStealAgent(t)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+
+	opts := ssmOpts("sleep", "30")
+	opts.NoIncoming = true
+	opts.LocalPort = port
+	opts.User = "shota"
+	opts.Token = "tok-shota"
+	var out safeLog
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() {
+		code, _ := RunWithDeps(ctx, opts, &out, depsFor(p))
+		done <- code
+	}()
+
+	hello := ag.waitAttached(t)
+	if hello.Incoming.Enabled {
+		t.Errorf("--no-incoming must not advertise incoming requests: %+v", hello.Incoming)
+	}
+	if hello.Token != "" {
+		t.Errorf("a session with nothing to match has no use for the token on the wire: %q", hello.Token)
+	}
+	waitFor(t, func() bool { return strings.Contains(out.String(), "✓ env") }, "the session to come up")
+	if strings.Contains(out.String(), "✓ steal") {
+		t.Errorf("--no-incoming must not print a steal line: %s", out.String())
+	}
+
+	// The backstop: an agent that steals anyway must be told why, so its
+	// proxy passes the request to the application instead of waiting on a
+	// stream nobody reads.
+	resp, perr := ag.steal(t, devRequest("GET", "/api/orders", "shota", "tok-shota"))
+	if perr == nil {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("the stream must be refused, got an HTTP response: %s", b)
+	}
+	if perr.Code != proto.CodeNoIncoming {
+		t.Errorf("refusal code = %q, want %q so the proxy knows to serve from the app", perr.Code, proto.CodeNoIncoming)
+	}
+	cancel()
+	<-done
+}
+
+// A session that advertises incoming requests with no token is one the
+// agent can never match: it would attach, print a green line, and leave
+// every request with the application forever. That has to be a startup
+// failure, before any AWS call and before the agent is dialled at all.
+func TestRunRefusesToTakeRequestsWithNoToken(t *testing.T) {
+	ag := startStealAgent(t)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+
+	opts := ssmOpts("true")
+	opts.NoIncoming = false
+	opts.LocalPort = 3000
+	opts.User = "shota"
+	opts.Token = ""
+	var out safeLog
+	code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p))
+	if code != 2 || err == nil {
+		t.Fatalf("code=%d err=%v, want exit 2 and a refusal", code, err)
+	}
+	if !strings.Contains(err.Error(), "token") {
+		t.Errorf("err = %q, want it to name the token", err)
+	}
+	select {
+	case <-ag.attached:
+		t.Error("the agent was dialled anyway; a value the developer gave must be checked first")
+	default:
+	}
+}
+
+// `tetherd env` and `tetherd doctor` attach to read the task and then exit.
+// A session either of them opened that advertised incoming requests would
+// have the agent steal them into a process that is about to be gone, and
+// would put the token on the wire for no reason - so both must attach with
+// incoming off no matter what the steal settings in RunOptions say. They
+// register no steal flags at all, which is why RunOptions can still carry
+// a port and a token here.
+func TestEnvAndDoctorAttachWithoutTakingRequests(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		run  func(t *testing.T, ag *stealAgent, p *fakeProvider)
+	}{
+		{"env", func(t *testing.T, ag *stealAgent, p *fakeProvider) {
+			opts := EnvOptions{RunOptions: ssmOpts(), Format: "dotenv"}
+			opts.NoIncoming = false
+			opts.LocalPort = 3000
+			opts.User = "shota"
+			opts.Token = "tok-shota"
+			var out, logs strings.Builder
+			if code, err := EnvRunWithDeps(context.Background(), opts, &out, &logs, depsFor(p)); err != nil || code != 0 {
+				t.Fatalf("code=%d err=%v logs=%s", code, err, logs.String())
+			}
+		}},
+		{"doctor", func(t *testing.T, ag *stealAgent, p *fakeProvider) {
+			opts := DoctorOptions{RunOptions: ssmOpts()}
+			opts.NoIncoming = false
+			opts.LocalPort = 3000
+			opts.User = "shota"
+			opts.Token = "tok-shota"
+			var out strings.Builder
+			DoctorRunWithDeps(context.Background(), opts, &out, depsFor(p))
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ag := startStealAgent(t)
+			p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a", DefinitionARN: "arn:def"}, agentAddr: ag.addr}
+			c.run(t, ag, p)
+			hello := ag.waitAttached(t)
+			if hello.Incoming != (proto.Incoming{}) {
+				t.Errorf("hello.Incoming = %+v, want nothing advertised", hello.Incoming)
+			}
+			if hello.Token != "" {
+				t.Errorf("hello.Token = %q, want no token on the wire for a session that takes nothing", hello.Token)
+			}
+		})
 	}
 }
