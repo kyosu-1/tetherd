@@ -88,6 +88,14 @@ type fakeProvider struct {
 	secretsARN string
 	pidMode    string
 	pidModeErr error
+	// pidModeARN records which definitionARN PIDMode was asked about, so a
+	// test can pin that the task's own is passed through.
+	pidModeARN string
+
+	// identity and identityErr back Identity, which only `tetherd doctor`
+	// calls.
+	identity    string
+	identityErr error
 }
 
 // errAlwaysFails stands in for an AWS permission failure (e.g. no
@@ -114,8 +122,12 @@ func (f *fakeProvider) SecretNames(_ context.Context, definitionARN string) (map
 	f.secretsARN = definitionARN
 	return f.secrets, f.secretsErr
 }
-func (f *fakeProvider) PIDMode(context.Context, string) (string, error) {
+func (f *fakeProvider) PIDMode(_ context.Context, definitionARN string) (string, error) {
+	f.pidModeARN = definitionARN
 	return f.pidMode, f.pidModeErr
+}
+func (f *fakeProvider) Identity(context.Context) (string, error) {
+	return f.identity, f.identityErr
 }
 
 func ssmOpts(cmd ...string) RunOptions {

@@ -2,13 +2,19 @@ package cli
 
 import (
 	"context"
+	"io/fs"
+	"net"
 	"net/netip"
+	"os"
+	"os/exec"
+	"syscall"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
 	awsecs "github.com/aws/aws-sdk-go-v2/service/ecs"
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
+	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/kyosu-1/tetherd/internal/capture"
 	"github.com/kyosu-1/tetherd/internal/capture/pfrdr"
@@ -37,6 +43,10 @@ type awsProvider interface {
 	// the agent to read the app container's environment). Task 7 (doctor)
 	// uses this.
 	PIDMode(ctx context.Context, definitionARN string) (string, error)
+	// Identity returns the ARN the current credentials resolve to. `tetherd
+	// doctor` asks it first, so a machine with no working credentials is
+	// told so, instead of being told its dev service has no attachable task.
+	Identity(ctx context.Context) (string, error)
 }
 
 // HelperClient is the part of the privileged helper the CLI uses.
@@ -56,12 +66,31 @@ type Capturer interface {
 	RedirectPort() int
 }
 
-// Deps are Run's replaceable collaborators. The zero value is production:
-// the real AWS SDK, the real privileged helper, the real pf capturer.
+// Deps are the replaceable collaborators of Run, EnvRun and DoctorRun. The
+// zero value is production: the real AWS SDK, the real privileged helper,
+// the real pf capturer, the real machine.
 type Deps struct {
 	NewAWSProvider func(ctx context.Context, opts RunOptions) (awsProvider, error)
 	DialHelper     func(socket string) (HelperClient, error)
 	NewCapturer    func(h HelperClient, logf func(string, ...any)) Capturer
+
+	// The four below are what `tetherd doctor` reads about the machine it
+	// runs on, injected for the same reason the AWS provider is: a check
+	// whose facts come straight from dscl, /usr/local/libexec, $PATH and
+	// the live interface list can only be exercised on a machine that
+	// happens to be in the state the test wants, which is no test at all.
+
+	// LookupGroup returns the gid of a local group and whether it exists,
+	// plus any failure of the lookup itself - "there is no tetherd group"
+	// and "the group database could not be asked" are different problems.
+	LookupGroup func(name string) (gid int, found bool, err error)
+	// StatFile returns a file's mode and owning gid. The mode is Go's, so
+	// the setgid bit survives in fs.ModeSetgid.
+	StatFile func(path string) (fs.FileMode, int, error)
+	// LookPath finds an executable on PATH (exec.LookPath).
+	LookPath func(file string) (string, error)
+	// InterfaceAddrs lists this machine's own addresses (net.InterfaceAddrs).
+	InterfaceAddrs func() ([]net.Addr, error)
 }
 
 func (d Deps) withDefaults() Deps {
@@ -78,7 +107,41 @@ func (d Deps) withDefaults() Deps {
 			return c
 		}
 	}
+	if d.LookupGroup == nil {
+		d.LookupGroup = func(name string) (int, bool, error) { return helper.GroupGID(runCommand, name) }
+	}
+	if d.StatFile == nil {
+		d.StatFile = statGID
+	}
+	if d.LookPath == nil {
+		d.LookPath = exec.LookPath
+	}
+	if d.InterfaceAddrs == nil {
+		d.InterfaceAddrs = net.InterfaceAddrs
+	}
 	return d
+}
+
+// runCommand is what helper.GroupGID shells out with (dscl on macOS).
+func runCommand(name string, args ...string) (string, error) {
+	out, err := exec.Command(name, args...).Output()
+	return string(out), err
+}
+
+// statGID reports a file's mode and owning group. The mode is returned
+// exactly as os.Stat produced it: rebuilding it from the raw st_mode
+// permission bits would drop fs.ModeSetgid, which is the single bit the
+// setgid check is about.
+func statGID(path string) (fs.FileMode, int, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fi.Mode(), 0, nil
+	}
+	return fi.Mode(), int(st.Gid), nil
 }
 
 // sdkProvider is the production awsProvider.
@@ -126,4 +189,12 @@ func (p *sdkProvider) SecretNames(ctx context.Context, definitionARN string) (ma
 
 func (p *sdkProvider) PIDMode(ctx context.Context, definitionARN string) (string, error) {
 	return ecsprov.PIDMode(ctx, awsecs.NewFromConfig(p.cfg), definitionARN)
+}
+
+func (p *sdkProvider) Identity(ctx context.Context) (string, error) {
+	out, err := awssts.NewFromConfig(p.cfg).GetCallerIdentity(ctx, &awssts.GetCallerIdentityInput{})
+	if err != nil {
+		return "", err
+	}
+	return aws.ToString(out.Arn), nil
 }

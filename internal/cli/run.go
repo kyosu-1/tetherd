@@ -359,6 +359,10 @@ func (directProvider) ServiceCIDRs(context.Context, []string) ([]netip.Prefix, e
 
 func (directProvider) Transport(func(string, ...any)) transport.Transport { return direct.Transport{} }
 
+func (directProvider) Identity(context.Context) (string, error) {
+	return "", errors.New("--transport direct has no AWS session, so there is no caller identity to report")
+}
+
 // SecretNames and PIDMode delegate to the ecs package with a nil API: a
 // direct task's DefinitionARN is always empty, so describe() refuses before
 // ever touching the API - there is no task definition to read over direct.

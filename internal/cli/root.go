@@ -33,6 +33,17 @@ func defaultEnv(opts EnvOptions) (int, error) {
 	return EnvRun(ctx, opts, os.Stdout, os.Stderr)
 }
 
+// doctorFn is swapped in tests, the same way runFn is.
+var doctorFn = defaultDoctor
+
+// defaultDoctor writes the report to stdout: it is what the developer is
+// asking for, not a progress log about producing it.
+func defaultDoctor(opts DoctorOptions) (int, error) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return DoctorRun(ctx, opts, os.Stdout)
+}
+
 // NewRootCommand builds `tetherd`.
 func NewRootCommand() *cobra.Command {
 	root := &cobra.Command{
@@ -42,7 +53,7 @@ func NewRootCommand() *cobra.Command {
 		SilenceErrors: true,
 		Version:       version.Version,
 	}
-	root.AddCommand(newRunCommand(), newEnvCommand())
+	root.AddCommand(newRunCommand(), newEnvCommand(), newDoctorCommand())
 	return root
 }
 
@@ -131,6 +142,43 @@ func newEnvCommand() *cobra.Command {
 	f := cmd.Flags()
 	f.StringVar(&opts.Format, "format", "dotenv", "output format: dotenv | shell | json")
 	f.BoolVar(&opts.Reveal, "reveal", false, "print secret values instead of ***")
+	return cmd
+}
+
+func newDoctorCommand() *cobra.Command {
+	var opts DoctorOptions
+	cmd := &cobra.Command{
+		Use:   "doctor",
+		Short: "Check that this machine and the dev service are set up for tetherd",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := applyConfig(cmd, &opts.RunOptions); err != nil {
+				return err
+			}
+			code, err := doctorFn(opts)
+			if err != nil {
+				if code == 0 {
+					code = 1
+				}
+				return &exitError{code: code, err: err}
+			}
+			if code != 0 {
+				// Every failing row has already printed what is wrong and
+				// what to do about it; child marks the error as one main
+				// must not print a line of its own for.
+				return &exitError{code: 1, child: true}
+			}
+			return nil
+		},
+	}
+	// The shared target flags are what applyConfig's changed() guards look
+	// up by name; registering them here is what keeps `tetherd doctor` from
+	// panicking inside that guard.
+	addTargetFlags(cmd, &opts.RunOptions)
+	f := cmd.Flags()
+	f.StringArrayVar(&opts.RemoteCIDRs, "remote-cidr", nil, "additional destination CIDR the run being checked would route through the agent (repeatable)")
+	f.StringVar(&opts.HelperSocket, "helper-socket", helper.DefaultSocket, "tetherd-helper socket")
+	f.StringVar(&opts.ExecPath, "exec-path", helper.ExecInstallDir+"/"+helper.ExecName, "path of the setgid tetherd-exec")
 	return cmd
 }
 
