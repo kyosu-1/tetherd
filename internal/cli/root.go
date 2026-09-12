@@ -65,7 +65,7 @@ func NewRootCommand() *cobra.Command {
 		SilenceErrors: true,
 		Version:       version.Version,
 	}
-	root.AddCommand(newRunCommand(), newEnvCommand(), newDoctorCommand(), newStatusCommand())
+	root.AddCommand(newRunCommand(), newEnvCommand(), newDoctorCommand(), newStatusCommand(), newTokenCommand())
 	return root
 }
 
@@ -195,9 +195,20 @@ func newDoctorCommand() *cobra.Command {
 		Short: "Check that this machine and the dev service are set up for tetherd",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if _, err := applyConfig(cmd, &opts.RunOptions); err != nil {
+			cfg, err := applyConfig(cmd, &opts.RunOptions)
+			if err != nil {
 				return err
 			}
+			// The steal settings, so the steal row is a judgement about
+			// this machine rather than "could not be checked" on all of
+			// them. Not applyIncoming: doctor registers none of run's
+			// incoming flags, and applyIncoming's changed() guards panic on
+			// a command without them. The port comes through
+			// applyIncomingPort, which is where "this command has no
+			// --local-port whose precedence could be lost" is asserted
+			// rather than assumed.
+			applySharedIncoming(cfg, &opts.RunOptions)
+			applyIncomingPort(cmd, cfg, &opts.RunOptions)
 			// A bound the operator did not type must reach DoctorRun as
 			// zero, not as the flag's default. Zero is what means "use the
 			// defaults", and the defaults are not one number: the
@@ -240,7 +251,7 @@ func newDoctorCommand() *cobra.Command {
 	f.StringVar(&opts.ExecPath, "exec-path", helper.ExecInstallDir+"/"+helper.ExecName, "path of the setgid tetherd-exec")
 	// No backticks in this help text: cobra reads a backquoted word as the
 	// flag's argument name, which for a bool flag prints as nonsense.
-	f.BoolVar(&opts.SkipAgent, "skip-agent", false, "do not open a session to the agent; the agent session, task env and remote domain rows are then reported as not checked, and they are the only ones that prove tetherd run can attach at all")
+	f.BoolVar(&opts.SkipAgent, "skip-agent", false, "do not open a session to the agent; the agent session, task env, task role and remote domain rows are then reported as not checked, and they are the only ones that prove tetherd run can attach at all")
 	// The two bounds the report runs under. They were honoured by
 	// DoctorRun from the start but reachable only in-process, so an
 	// operator whose network makes a row time out had nothing to turn. The
@@ -249,7 +260,11 @@ func newDoctorCommand() *cobra.Command {
 	// row, whose default is longer, and RunE above for why not typing
 	// these is not the same as typing their defaults.
 	f.DurationVar(&opts.Timeout, "timeout", DefaultDoctorTimeout, "how long any one check may take before it is reported as not having answered")
-	f.DurationVar(&opts.Budget, "budget", DefaultDoctorBudget, "how long the whole report may take; what it cuts short is reported as not checked")
+	// Not "reported as not checked": that wording belongs to the ? rows,
+	// which never fail the command. A row the budget cuts short is a ✗ on
+	// purpose - an incomplete report that exited 0 would tell a script the
+	// machine is fine.
+	f.DurationVar(&opts.Budget, "budget", DefaultDoctorBudget, "how long the whole report may take; a row it cuts short is reported as a failure")
 	return cmd
 }
 

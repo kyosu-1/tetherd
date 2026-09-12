@@ -125,27 +125,68 @@ func applyConfig(cmd *cobra.Command, opts *RunOptions) (config.Config, error) {
 	return cfg, nil
 }
 
-// applyIncoming fills the steal settings from the same two files
-// applyConfig read: the repository's incoming block, and the token from the
-// personal file. Only `tetherd run` calls it, because only `tetherd run`
-// registers --local-port, --no-incoming and --as - which is what keeps the
-// changed() guard below honest, since changed() panics on a flag the
-// command does not have rather than quietly answering false.
+// applySharedIncoming fills the steal settings that no flag binds at all:
+// the two header names (a property of the deployment's ALB and its browser
+// extension, not of one run) and the developer's token from the personal
+// file. Empty header names are left empty here and defaulted in
+// stealSettings, so that one place decides what the agent is told.
+//
+// Consulting no flag is what makes it callable from a command that
+// registers none of run's incoming flags: changed() panics on a flag the
+// command does not have, so a helper that asks about "local-port" can only
+// ever run under `tetherd run`. `tetherd doctor` calls this (plus
+// applyIncomingPort) so that its steal row is a judgement about this
+// machine - which port a taken request would go to, and whether there is a
+// token for the agent to match at all - instead of the "could not be
+// checked" it printed on every machine before the settings reached it.
+//
+// incoming.local_port is deliberately *not* here, even though doctor needs
+// it too: --local-port overrides that key, and precedence in this project
+// is decided on whether the flag was passed (flags > personal > shared >
+// defaults), not on whether its value is non-zero. An unconditional
+// assignment in the flag-free half would silently put a typed
+// --local-port 3000 back to whatever the repository committed.
+func applySharedIncoming(cfg config.Config, opts *RunOptions) {
+	opts.MatchHeader = cfg.Shared.Incoming.Match.Header
+	opts.MatchTokenHeader = cfg.Shared.Incoming.Match.TokenHeader
+	opts.Token = StealToken(cfg.Personal.Token)
+}
+
+// applyIncomingPort applies incoming.local_port for a command that has no
+// --local-port of its own - today only `tetherd doctor`, which needs the
+// port because its steal row reports where a stolen request would really
+// go: a default applied downstream would tell every repository that sets
+// 3000 that nothing is listening on 8080.
+//
+// It panics if the command does register --local-port, in the same spirit
+// as changed(): the precedence for a flag belongs in applyIncoming's guard,
+// and an unguarded assignment under a command that has the flag would
+// quietly beat a port the developer typed - a bug with no other signal.
+func applyIncomingPort(cmd *cobra.Command, cfg config.Config, opts *RunOptions) {
+	if cmd.Flags().Lookup("local-port") != nil {
+		panic("tetherd: applyIncomingPort under a command that registers --local-port; apply it through applyIncoming so the flag wins")
+	}
+	opts.LocalPort = cfg.Shared.Incoming.LocalPort
+}
+
+// applyIncoming is applySharedIncoming plus the two settings a `tetherd
+// run` flag can override. Only `tetherd run` calls it, because only
+// `tetherd run` registers --local-port, --no-incoming and --as - which is
+// what keeps the changed() guards below honest, since changed() panics on a
+// flag the command does not have rather than quietly answering false.
+//
+// Both settings stay inside their guards and inside this function: the
+// guard is the precedence rule, so hoisting either assignment into the
+// flag-free half above would drop a value the developer typed.
 //
 // --as wins over both --user and the personal file's user, deliberately:
 // hello.user and the name the agent matches the request's user header
 // against are one value, so there is nothing to reconcile.
 func applyIncoming(cmd *cobra.Command, cfg config.Config, opts *RunOptions) {
+	applySharedIncoming(cfg, opts)
 	if !changed(cmd, "local-port") {
 		opts.LocalPort = cfg.Shared.Incoming.LocalPort
 	}
-	// No flags bind the header names (they are a property of the
-	// deployment's ALB and its browser extension, not of one run), so these
-	// are unconditional. Empty is left empty here and defaulted in
-	// stealSettings, so that one place decides what the agent is told.
-	opts.MatchHeader = cfg.Shared.Incoming.Match.Header
-	opts.MatchTokenHeader = cfg.Shared.Incoming.Match.TokenHeader
-	opts.Token = StealToken(cfg.Personal.Token)
 	if changed(cmd, "as") {
 		opts.User = opts.As
 	}

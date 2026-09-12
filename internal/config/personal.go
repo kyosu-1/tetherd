@@ -283,3 +283,65 @@ func newToken() (string, error) {
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
+
+// RotateToken replaces the personal file's steal token with a fresh one and
+// returns the file's new contents. The token is the only thing standing
+// between a public ALB and this laptop, so there has to be a way to replace
+// one that may have leaked; this is it.
+//
+// Every other field is preserved. That is not politeness: losing `user`
+// would silently change which requests the agent matches this developer's
+// session against, and losing the `aws` block would change which account
+// the next run talks to.
+//
+// A machine that has never run tetherd gets a file rather than an error:
+// EnsurePersonal creates it, with the same atomic publish and the same
+// 0600, and the token minted there is then rotated once - a handful of
+// wasted random bytes in exchange for one code path that does not care
+// whether the file was there.
+//
+// The replacement holds the same exclusive flock across re-read, mint and
+// write that ensureToken's backfill does, for the same reason: two
+// rotations starting together must each end with the token it returned
+// either on disk or replaced by the other's, never with a caller printing a
+// token no file holds. Re-reading under the lock (rather than trusting what
+// EnsurePersonal just returned) is what makes the preservation above hold
+// against a concurrent writer too.
+//
+// The mode is re-asserted under the lock, so a hand-created 0644 file comes
+// out 0600. The command whose reason for existing is "this token may be
+// known to someone else" is the wrong one to leave the new token
+// world-readable.
+func RotateToken(path, user string) (Personal, error) {
+	if _, _, err := EnsurePersonal(path, user); err != nil {
+		return Personal{}, err
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		return Personal{}, fmt.Errorf("open %s to rotate its token: %w", path, err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return Personal{}, fmt.Errorf("lock %s: %w", path, err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+
+	cur, err := decodeLocked(f, path)
+	if err != nil {
+		return Personal{}, err
+	}
+	if cur.Token, err = newToken(); err != nil {
+		return Personal{}, err
+	}
+	body, err := yaml.Marshal(cur)
+	if err != nil {
+		return Personal{}, err
+	}
+	if err := writeLocked(f, path, body); err != nil {
+		return Personal{}, err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		return Personal{}, fmt.Errorf("chmod %s: %w", path, err)
+	}
+	return cur, nil
+}

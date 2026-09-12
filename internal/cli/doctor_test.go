@@ -1462,11 +1462,13 @@ func TestDoctorWarnsWhenNothingWouldTakeAStolenRequest(t *testing.T) {
 	}
 }
 
-// `tetherd doctor` registers none of run's incoming flags, so today nothing
-// fills the token or the port from the config files (see stealRow). The row
-// must then say it could not be checked: reporting the refusal as a failure
-// would fail doctor on every machine, including the ones whose personal file
-// holds a perfectly good token.
+// The command now fills the token and the port from the config files
+// (applySharedIncoming, exercised by
+// TestDoctorCommandJudgesStealFromTheConfigFiles), so this is the arm that
+// is left: a machine whose personal file holds no token at all, which is
+// also the machine `tetherd run` refuses to start on. The row must say it
+// could not be checked rather than fail - a report is about the setup, and
+// what is missing here is a settings file, which the next step names.
 func TestDoctorSaysItCouldNotCheckStealWithoutTheSettings(t *testing.T) {
 	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
 	opts := doctorOpts()
@@ -2122,4 +2124,93 @@ func TestDoctorGivesTheAgentRowABoundThatCoversItsWork(t *testing.T) {
 			t.Errorf("the agent dial had %s left, want no more than the --timeout the operator typed", tr.left)
 		}
 	})
+}
+
+// TestDoctorCommandJudgesStealFromTheConfigFiles closes the gap the steal
+// row shipped with: every other test of that row hands DoctorRun its
+// settings in-process, which proves the judgement but not that the command
+// ever makes it - and it did not. `tetherd doctor` called applyConfig and
+// nothing that fills the token, the port or the header names, so the row
+// read "?" on every machine, including ones with a good token in
+// ~/.tetherd/config.yml and an incoming block in .tetherd.yml.
+//
+// This drives the real command (root -> applyConfig -> applySharedIncoming)
+// and lets it run the real report, so the wiring and the row are exercised
+// together rather than one standing in for the other. Only AWS and the
+// machine probes are stood in for; the agent is the in-process one and the
+// listener is real, on loopback.
+func TestDoctorCommandJudgesStealFromTheConfigFiles(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, ".tetherd.yml")
+	body := fmt.Sprintf("version: 1\ntarget:\n  cluster: c\n  service: api\n  env: dev\nincoming:\n  local_port: %d\n  match:\n    header: X-Team-User\n    token_header: X-Team-Token\n", port)
+	if err := os.WriteFile(cfgPath, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+	writePersonal(t, dir, "user: shota\ntoken: tok-from-personal\n")
+
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	var out strings.Builder
+	doctorFn = func(opts DoctorOptions) (int, error) {
+		return DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(ag.addr)))
+	}
+	t.Cleanup(func() { doctorFn = defaultDoctor })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"doctor", "--config", cfgPath})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("a healthy machine must exit 0: %v\n%s", err, out.String())
+	}
+
+	r := findRow(t, wantRowSet(t, out.String()), "steal")
+	if r.mark != "✓" {
+		t.Fatalf("steal = %q %q, want ✓: a machine with a token and a listener", r.mark, r.detail)
+	}
+	if strings.Contains(r.detail, "not checked") {
+		t.Errorf("the row must be a judgement, not a \"could not be checked\": %q", r.detail)
+	}
+	// The port the repository configured, as the address a stolen request
+	// would actually be dialed at - not a default guessed here, which is
+	// the other way this row can lie.
+	if want := fmt.Sprintf("127.0.0.1:%d", port); !strings.Contains(r.detail, want) {
+		t.Errorf("steal detail %q does not name %s", r.detail, want)
+	}
+	// The header names come from the same file, and both of them matter: a
+	// request needs the user header and the token header to be taken.
+	for _, want := range []string{"X-Team-User", "X-Team-Token"} {
+		if !strings.Contains(r.detail, want) {
+			t.Errorf("steal detail %q does not name the configured %s", r.detail, want)
+		}
+	}
+	// The token reached the report but must never be printed by it.
+	if strings.Contains(out.String(), "tok-from-personal") {
+		t.Errorf("the report must not print the steal token:\n%s", out.String())
+	}
+}
+
+// TestSkipAgentHelpNamesEveryRowItGivesUp: --skip-agent's help is the only
+// place a developer learns what they stop checking, and it went stale the
+// moment a fourth row started needing the session - it named three while
+// the code reported four as not checked. A list in prose that no test reads
+// is a list that drifts, so this reads it.
+func TestSkipAgentHelpNamesEveryRowItGivesUp(t *testing.T) {
+	f := newDoctorCommand().Flags().Lookup("skip-agent")
+	if f == nil {
+		t.Fatal("--skip-agent must exist")
+	}
+	// The rows DoctorRun reports as Unknown when no session is opened; see
+	// TestDoctorSkipAgentReportsTheRowsItGivesUp, which pins the behaviour
+	// this text describes.
+	for _, row := range []string{"agent session", "task env", "task role", "remote domain"} {
+		if !strings.Contains(f.Usage, row) {
+			t.Errorf("--skip-agent help does not name the %q row it gives up: %q", row, f.Usage)
+		}
+	}
 }
