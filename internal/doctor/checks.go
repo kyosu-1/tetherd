@@ -90,12 +90,19 @@ func CheckIdentity(arn string, err error) Result {
 // CheckTask reports whether a task is attachable: ECS Exec enabled, the agent
 // container present and its ExecuteCommandAgent running. Discovery already
 // explains every rejection, so the reasons are passed through verbatim.
+//
+// The next step names the IAM grant first, the way CheckPIDMode's does
+// ("grant ecs:DescribeTaskDefinition, or run with --no-env"). An
+// AccessDeniedException on ecs:ListTasks arrives here just like a task ECS
+// rejected does, and a report whose pidMode row calls that class of failure
+// an IAM problem while this row calls it a missing sidecar sends the
+// developer to redeploy a service that is fine.
 func CheckTask(task transport.Task, err error) Result {
 	r := Result{Name: "attachable task"}
 	if err != nil {
 		r.Status = Fail
 		r.Detail = err.Error()
-		r.Next = "enable ECS Exec on the service and deploy the tetherd-agent sidecar (see docs/dev-env.md)"
+		r.Next = "grant ecs:ListTasks / ecs:DescribeTasks, or enable ECS Exec on the service and deploy the tetherd-agent sidecar (see docs/dev-env.md)"
 		return r
 	}
 	// StartedAt is formatted in whatever location it carries, so the row does

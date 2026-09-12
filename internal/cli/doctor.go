@@ -222,7 +222,7 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 	if isContextError(taskErr) {
 		results = append(results, timedOut("attachable task", checkTimedOut(ctx, "the ECS task lookup", timeout)))
 	} else {
-		results = append(results, taskRow(task, taskErr, provErr))
+		results = append(results, taskRow(task, taskErr, idErr))
 	}
 
 	switch {
@@ -414,15 +414,36 @@ type fileFacts struct {
 	gid  int
 }
 
-// taskRow is the attachable-task row. CheckTask's next step ("enable ECS
-// Exec on the service and deploy the tetherd-agent sidecar") is the right
-// advice for a task ECS rejected, and the wrong advice for the two failures
-// that never got as far as asking ECS anything: an invocation with no
-// --cluster/--service, and a session that could not be opened. Both are
-// reported by a row of their own rather than dressed up as a task problem.
-func taskRow(task transport.Task, taskErr, provErr error) doctor.Result {
+// taskRow is the attachable-task row. CheckTask's next step (grant the
+// ecs:*Tasks calls, or enable ECS Exec and deploy the sidecar) is the right
+// advice for a task ECS actually answered a question about, and the wrong
+// advice for the two failures that got no usable answer out of AWS at all:
+// an invocation with no --cluster/--service, and credentials that do not
+// work. Both get a row of their own rather than being dressed up as a task
+// problem.
+//
+// idErr - the identity call's failure - is what decides the second of those,
+// not the error from opening the AWS session. awsconfig.LoadDefaultConfig
+// succeeds for a profile whose SSO token has expired, because credentials
+// resolve lazily on first use: the session opens cleanly and the expiry
+// arrives as the failure of the first call that needs it. Keying this off
+// the session error left the arm dead in production and rendered the
+// commonest AWS failure there is as
+//
+//	✗ attachable task   operation error ECS: ListTasks, ExpiredToken
+//	                    → enable ECS Exec on the service and deploy ...
+//
+// which is precisely what this function exists to prevent. The identity row
+// above has already failed with the real reason and already names the
+// action, so repeating it here would double the noise and send the developer
+// to edit their ECS service over an authentication problem.
+func taskRow(task transport.Task, taskErr, idErr error) doctor.Result {
 	switch {
 	case taskErr == nil:
+		// A task lookup that worked is reported as working even when the
+		// identity call did not: a role denied sts:GetCallerIdentity but
+		// allowed ecs:ListTasks is unusual but legal, and this arm coming
+		// first is what keeps its row green.
 		return doctor.CheckTask(task, nil)
 	case isUsageError(taskErr):
 		return doctor.Result{
@@ -431,12 +452,8 @@ func taskRow(task transport.Task, taskErr, provErr error) doctor.Result {
 			Detail: taskErr.Error(),
 			Next:   "name the service to check (--cluster/--service, or target.cluster / target.service in .tetherd.yml)",
 		}
-	case provErr != nil:
-		// The identity row above already failed with this same reason, and
-		// gives the action. Repeating it here as a failure would double the
-		// noise and, with CheckTask's next step, send the developer to edit
-		// their ECS service over an authentication problem.
-		return notChecked("attachable task", "there is no AWS session to ask")
+	case idErr != nil:
+		return notChecked("attachable task", "the AWS identity above failed, so nothing could be asked of ECS")
 	default:
 		return doctor.CheckTask(task, taskErr)
 	}

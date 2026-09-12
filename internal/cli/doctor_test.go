@@ -363,26 +363,76 @@ func TestDoctorBlamesTheRightRowWhenDiscoveryFails(t *testing.T) {
 // failure there is, and it is exactly what the separate Identity call exists
 // to attribute: without it the report reads "✓ AWS identity" above an
 // ExpiredToken blamed on the ECS service.
+//
+// Both rows are asserted, because asserting only the identity row is what
+// let the real bug through: the "AWS failed, not ECS" arm of taskRow was
+// keyed off the error from *opening* the session, which is nil in exactly
+// this shape (credentials resolve lazily), so the arm was dead in
+// production and the very failure being simulated here rendered as
+//
+//	✗ attachable task   operation error ECS: ListTasks, ExpiredToken
+//	                    → enable ECS Exec on the service and deploy ...
+//
+// A row that tells a developer with an expired SSO token to redeploy their
+// ECS service is worse than no row, so the advice is asserted too, not just
+// the mark.
 func TestDoctorBlamesTheRightRowWhenCredentialsExpire(t *testing.T) {
-	p := healthyProvider("127.0.0.1:1")
-	p.identity, p.identityErr = "", errors.New("operation error STS: GetCallerIdentity, ExpiredToken: the security token included in the request is expired")
-	p.discErr = errors.New("operation error ECS: ListTasks, ExpiredToken")
+	// Both spellings of "AWS answered, and the answer was no": an expired
+	// token and a missing IAM grant. LoadDefaultConfig succeeds for either.
+	for _, c := range []struct {
+		name   string
+		idErr  error
+		discEr error
+	}{
+		{
+			name:   "expired token",
+			idErr:  errors.New("operation error STS: GetCallerIdentity, ExpiredToken: the security token included in the request is expired"),
+			discEr: errors.New("operation error ECS: ListTasks, ExpiredToken"),
+		},
+		{
+			name:   "no permission",
+			idErr:  errors.New("operation error STS: GetCallerIdentity, AccessDenied"),
+			discEr: errors.New("AccessDeniedException: not authorized to perform ecs:ListTasks"),
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := healthyProvider("127.0.0.1:1")
+			p.identity, p.identityErr = "", c.idErr
+			p.discErr = c.discEr
 
-	var out strings.Builder
-	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, healthyDoctorDeps(p))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if code != 1 {
-		t.Fatalf("code = %d, want 1\n%s", code, out.String())
-	}
-	rows := wantRowSet(t, out.String())
-	r := findRow(t, rows, "AWS identity")
-	if r.mark != "✗" || !strings.Contains(r.detail, "ExpiredToken") {
-		t.Fatalf("expired credentials must fail the identity row with the reason: %q %q", r.mark, r.detail)
-	}
-	if !strings.Contains(r.next, "aws sso login") {
-		t.Errorf("the next step must be to authenticate, got %q", r.next)
+			var out strings.Builder
+			code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, healthyDoctorDeps(p))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if code != 1 {
+				t.Fatalf("code = %d, want 1\n%s", code, out.String())
+			}
+			rows := wantRowSet(t, out.String())
+			r := findRow(t, rows, "AWS identity")
+			if r.mark != "✗" || !strings.Contains(r.detail, c.idErr.Error()) {
+				t.Fatalf("broken credentials must fail the identity row with the reason: %q %q", r.mark, r.detail)
+			}
+			if !strings.Contains(r.next, "aws sso login") {
+				t.Errorf("the next step must be to authenticate, got %q", r.next)
+			}
+
+			// The row below it is the one the bug misdiagnosed. The
+			// credentials never worked, so nothing was learned about the
+			// task: that is "not checked" (a warning - the identity row
+			// already carries the failure), never a failure of the ECS
+			// service.
+			task := findRow(t, rows, "attachable task")
+			if task.mark != "!" {
+				t.Fatalf("attachable task = %q %q, want ! (not checked): the identity row above is what failed", task.mark, task.detail)
+			}
+			if !strings.Contains(task.detail, "not checked") || !strings.Contains(task.detail, "AWS identity") {
+				t.Errorf("attachable task detail = %q, want it to say it was not checked and why", task.detail)
+			}
+			if strings.Contains(task.next, "ECS Exec") || strings.Contains(task.next, "sidecar") {
+				t.Errorf("a credential failure must not send the developer to redeploy their ECS service: %q", task.next)
+			}
+		})
 	}
 }
 

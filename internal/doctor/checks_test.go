@@ -480,6 +480,10 @@ func TestEveryFailureNamesAnActionTheDeveloperCanTake(t *testing.T) {
 		{"plugin", CheckPlugin("", exec.ErrNotFound), "brew install"},
 		{"identity", CheckIdentity("", errors.New("no credentials")), "aws sso login"},
 		{"task", CheckTask(transport.Task{}, errors.New("no attachable task")), "ECS Exec"},
+		// The same class of failure the pidMode row calls an IAM problem
+		// reaches this row too, as an AccessDeniedException on ListTasks,
+		// so the two rows must not describe it differently.
+		{"task denied", CheckTask(transport.Task{}, errors.New("AccessDeniedException: not authorized to perform ecs:ListTasks")), "ecs:ListTasks"},
 		{"pidMode unreadable", CheckPIDMode("", errors.New("AccessDenied")), "ecs:DescribeTaskDefinition"},
 		{"pidMode wrong", CheckPIDMode("host", nil), `"pidMode": "task"`},
 		{"agent unreachable", CheckAgentSession("", "", "dev", errors.New("connection refused")), "tetherd-agent"},
