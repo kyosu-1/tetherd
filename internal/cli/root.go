@@ -44,6 +44,18 @@ func defaultDoctor(opts DoctorOptions) (int, error) {
 	return DoctorRun(ctx, opts, os.Stdout)
 }
 
+// statusFn is swapped in tests, the same way runFn is.
+var statusFn = defaultStatus
+
+// defaultStatus writes the report to stdout: who is attached is what the
+// developer is asking for, not a progress log about finding out. The target
+// line and any transport chatter stay on stderr.
+func defaultStatus(opts StatusOptions) (int, error) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return StatusRun(ctx, opts, os.Stdout, os.Stderr)
+}
+
 // NewRootCommand builds `tetherd`.
 func NewRootCommand() *cobra.Command {
 	root := &cobra.Command{
@@ -53,16 +65,16 @@ func NewRootCommand() *cobra.Command {
 		SilenceErrors: true,
 		Version:       version.Version,
 	}
-	root.AddCommand(newRunCommand(), newEnvCommand(), newDoctorCommand())
+	root.AddCommand(newRunCommand(), newEnvCommand(), newDoctorCommand(), newStatusCommand())
 	return root
 }
 
-// addTargetFlags registers the flags `run` and `env` share: everything
-// needed to discover the task and reach its agent. Both commands' RunE call
-// applyConfig, whose changed() guards look up "user", "profile", "region",
-// "cluster", "service" and "env" by name - registering all of them here on
-// both commands is what keeps applyConfig callable (and its guards
-// non-panicking) under either one.
+// addTargetFlags registers the flags `run`, `env`, `doctor` and `status`
+// share: everything needed to discover the task and reach its agent. Every
+// one of those commands' RunE calls applyConfig, whose changed() guards
+// look up "user", "profile", "region", "cluster", "service" and "env" by
+// name - registering all of them here on all four commands is what keeps
+// applyConfig callable (and its guards non-panicking) under any of them.
 func addTargetFlags(cmd *cobra.Command, opts *RunOptions) {
 	f := cmd.Flags()
 	f.StringVar(&opts.Transport, "transport", "ssm", "how to reach the agent: ssm | direct")
@@ -238,6 +250,49 @@ func newDoctorCommand() *cobra.Command {
 	// these is not the same as typing their defaults.
 	f.DurationVar(&opts.Timeout, "timeout", DefaultDoctorTimeout, "how long any one check may take before it is reported as not having answered")
 	f.DurationVar(&opts.Budget, "budget", DefaultDoctorBudget, "how long the whole report may take; what it cuts short is reported as not checked")
+	return cmd
+}
+
+func newStatusCommand() *cobra.Command {
+	var opts StatusOptions
+	cmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show who is attached to each task of the dev service",
+		Long: "Show who is attached to each task of the dev service: who, from where and\n" +
+			"since when. Steal is shared - several developers attach to the same dev\n" +
+			"service and the ALB decides which task a request lands on - so this is what\n" +
+			"answers \"why are my requests not arriving?\".\n\n" +
+			"It attaches to read and closes: it takes no incoming request and sends no\n" +
+			"token, so it never becomes the target another developer's requests are\n" +
+			"routed to.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if _, err := applyConfig(cmd, &opts.RunOptions); err != nil {
+				return err
+			}
+			// applyIncoming is deliberately not called: `status` has none
+			// of the steal flags its changed() guards look up, and nothing
+			// here wants the personal file's token.
+			code, err := statusFn(opts)
+			if err != nil {
+				if code == 0 {
+					code = 1
+				}
+				return &exitError{code: code, err: err}
+			}
+			if code != 0 {
+				// Every task that could not be read has already printed
+				// its own reason; child marks the error as one main must
+				// not print a line of its own for.
+				return &exitError{code: code, child: true}
+			}
+			return nil
+		},
+	}
+	// The shared target flags, which is also what applyConfig's changed()
+	// guards look up by name - registering them here is what keeps
+	// `tetherd status` from panicking inside that guard.
+	addTargetFlags(cmd, &opts.RunOptions)
 	return cmd
 }
 

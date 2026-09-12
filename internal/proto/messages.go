@@ -3,6 +3,8 @@
 // JSON header at the start of every other yamux stream.
 package proto
 
+import "time"
+
 // Version is the protocol version. hello/welcome carry it; a mismatch is
 // rejected with CodeVersionMismatch.
 const Version = "1"
@@ -80,7 +82,24 @@ type Hello struct {
 	Incoming Incoming `json:"incoming"`
 }
 
+// SessionInfo describes one attached session in Welcome.Sessions.
+type SessionInfo struct {
+	User  string    `json:"user"`
+	From  string    `json:"from"`
+	Since time.Time `json:"since"`
+}
+
 // Welcome is the agent's reply to Hello.
+//
+// Others and Sessions are the same set - every session attached other than
+// the one being welcomed - and differ only in detail. Others is user names
+// alone and is what every CLI up to v0.3a reads; Sessions adds where each
+// session attached from and since when, which is what `tetherd status`
+// prints and what answers "is my colleague still attached, and since
+// when?". Both are sent, because fields are additive only and a CLI that
+// predates Sessions must keep working against this agent - just as this
+// CLI must keep working against the v0.3a agent that is deployed today,
+// which sends Others and no Sessions at all.
 type Welcome struct {
 	Version  string            `json:"version"`
 	TaskARN  string            `json:"task_arn"`
@@ -88,6 +107,7 @@ type Welcome struct {
 	AppEnv   map[string]string `json:"app_env,omitempty"`
 	EnvError string            `json:"env_error,omitempty"`
 	Others   []string          `json:"others,omitempty"`
+	Sessions []SessionInfo     `json:"sessions,omitempty"`
 }
 
 // Error is sent by the agent instead of Welcome, or at any time before

@@ -130,12 +130,42 @@ func (a *Agent) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
-func (a *Agent) others(user string) []string {
-	var out []string
+// sessionInfos is what Welcome.Sessions carries: every session attached
+// other than user's own, with where it attached from and since when.
+//
+// It reuses Sessions()'s sort, which is a contract rather than tidiness
+// (see registry.go): unsorted, the welcome one developer reads would differ
+// from one attach to the next and so would `tetherd status`'s output.
+//
+// user's own session is left out so that this is exactly the set others()
+// returns, one field richer - see Welcome. It is also what makes `tetherd
+// status`, which has to attach in order to ask, not report itself as an
+// attached developer.
+func (a *Agent) sessionInfos(user string) []proto.SessionInfo {
+	var out []proto.SessionInfo
 	for _, s := range a.Sessions() {
 		if s.User != user {
-			out = append(out, s.User)
+			out = append(out, proto.SessionInfo{User: s.User, From: s.From, Since: s.Since})
 		}
+	}
+	return out
+}
+
+// others is Welcome.Others: the user names of sessionInfos, which is what
+// every CLI up to v0.3a reads. Derived from the same slice rather than from
+// a second snapshot of the registry, so the two fields of one welcome can
+// never describe different sets.
+func (a *Agent) others(user string) []string {
+	return sessionUsers(a.sessionInfos(user))
+}
+
+// sessionUsers projects the user names out of infos. It returns nil for an
+// empty input, not an empty slice, so that Welcome.Others keeps being
+// omitted from the wire when nobody else is attached.
+func sessionUsers(infos []proto.SessionInfo) []string {
+	var out []string
+	for _, s := range infos {
+		out = append(out, s.User)
 	}
 	return out
 }
@@ -158,7 +188,16 @@ func (h *handler) Hello(hello proto.Hello, remote string, open session.Opener) (
 	}
 	h.user = hello.User
 	h.a.logf("user %q attached from %s", hello.User, remote)
-	w := proto.Welcome{Version: proto.Version, TaskARN: h.a.cfg.TaskARN, Env: h.a.cfg.Env, Others: h.a.others(hello.User)}
+	// One snapshot of the registry for both views of it: Others is the
+	// names, Sessions the same set with the detail `tetherd status` needs.
+	sessions := h.a.sessionInfos(hello.User)
+	w := proto.Welcome{
+		Version:  proto.Version,
+		TaskARN:  h.a.cfg.TaskARN,
+		Env:      h.a.cfg.Env,
+		Others:   sessionUsers(sessions),
+		Sessions: sessions,
+	}
 	if h.a.env == nil {
 		w.EnvError = "no ECS metadata endpoint (agent is not running in ECS)"
 	} else {
