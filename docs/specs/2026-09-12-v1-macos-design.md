@@ -272,7 +272,9 @@ Ctrl-C は端末がプロセスグループ全体に SIGINT を送るので、CL
 
 タスク env から既定で除外: `PATH HOME HOSTNAME USER LOGNAME SHELL TMPDIR PWD OLDPWD TERM LANG LC_* SHLVL _ AWS_EXECUTION_ENV`。
 
-`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` と `ECS_CONTAINER_METADATA_URI_V4` は透過モードで必要なので残す。`--no-network` のときだけ除外する（残すと SDK が `169.254.170.2` に行って失敗し、フォールバックしない）。
+これに加えて、**コンテナのファイルシステムを指し、ランタイムの信頼やコード解決を黙って変えてしまう変数**も既定で除外する: `SSL_CERT_FILE` `SSL_CERT_DIR` `AWS_CA_BUNDLE` `REQUESTS_CA_BUNDLE` `CURL_CA_BUNDLE` `NODE_EXTRA_CA_CERTS` `LD_LIBRARY_PATH` `LD_PRELOAD` `DYLD_LIBRARY_PATH` `DYLD_INSERT_LIBRARIES` `JAVA_HOME` `GOROOT` `PYTHONHOME` `PYTHONPATH`。実機で確認した例: distroless イメージは `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` を設定しており、macOS にこのパスは無いため、これを尊重する子プロセス（Go の `crypto/x509` など）の TLS が全部 `certificate signed by unknown authority` で落ちた（独自の CA バンドルを持つ `aws` CLI は影響を受けなかった）。
+
+`169.254.170.2` を指すエンドポイント変数（`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`、`ECS_CONTAINER_METADATA_URI_V4`、`ECS_CONTAINER_METADATA_URI`、`ECS_AGENT_URI`）は透過モードでは残し（これがタスクロールとタスクメタデータを効かせる）、`--no-network` では 4 つとも落とす。
 
 透過モードでタスクの env が `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` を持つときは、それだけでは子プロセスがタスクロールにならない。どの SDK も**共有設定プロファイルをコンテナクレデンシャルより先に**評価するので、開発者の `~/.aws/config` の `default` プロファイルが認証ソース（SSO、login session、`credential_process` など）を持っていると、そちらが勝つ（実機で確認: 子プロセスの `aws sts get-caller-identity` が「session has expired」を返し、共有設定を隠すと即座にタスクロールを返した）。そこで tetherd は静的キーと `AWS_PROFILE` を除去するだけでなく、`AWS_CONFIG_FILE` と `AWS_SHARED_CREDENTIALS_FILE` をセッション用の空ファイルに向け、`AWS_REGION` / `AWS_DEFAULT_REGION` をタスクのリージョンで明示する。`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` は残すので、認証情報の自動更新は SDK 任せのまま。共有設定を隠すことは `✓ iam` の次の行に明示する。
 

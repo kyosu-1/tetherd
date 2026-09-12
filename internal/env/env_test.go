@@ -96,3 +96,60 @@ func TestMergeSkipsMalformedLocalEntry(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+// A distroless image's SSL_CERT_FILE points inside the container; injecting
+// it into a laptop process makes every TLS dial fail with "certificate
+// signed by unknown authority" (observed on real Fargate).
+func TestMergeExcludesContainerPathVars(t *testing.T) {
+	task := map[string]string{
+		"SSL_CERT_FILE":   "/etc/ssl/certs/ca-certificates.crt",
+		"LD_LIBRARY_PATH": "/usr/local/lib",
+		"JAVA_HOME":       "/opt/java/openjdk",
+		"PYTHONPATH":      "/app",
+		"DB_HOST":         "db.example",
+	}
+	got := toMap(Merge([]string{"SSL_CERT_FILE=/opt/homebrew/etc/ca.pem"}, task, Options{}))
+	for _, k := range []string{"LD_LIBRARY_PATH", "JAVA_HOME", "PYTHONPATH"} {
+		if _, ok := got[k]; ok {
+			t.Errorf("%s must not be injected (container path)", k)
+		}
+	}
+	if got["SSL_CERT_FILE"] != "/opt/homebrew/etc/ca.pem" {
+		t.Errorf("the local SSL_CERT_FILE must survive, got %q", got["SSL_CERT_FILE"])
+	}
+	if got["DB_HOST"] != "db.example" {
+		t.Errorf("application variables must still be injected, got %q", got["DB_HOST"])
+	}
+}
+
+func TestAWSContainerVarsCoverEveryLinkLocalEndpoint(t *testing.T) {
+	task := map[string]string{
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x",
+		"ECS_CONTAINER_METADATA_URI_V4":          "http://169.254.170.2/v4/a",
+		"ECS_CONTAINER_METADATA_URI":             "http://169.254.170.2/v3/a",
+		"ECS_AGENT_URI":                          "http://169.254.170.2/api",
+		"DB_HOST":                                "db.example",
+	}
+	// Transparent mode keeps them: they resolve through the agent.
+	kept := toMap(Merge(nil, task, Options{}))
+	for k := range task {
+		if _, ok := kept[k]; !ok {
+			t.Errorf("%s must be kept in transparent mode", k)
+		}
+	}
+	// --no-network drops every endpoint that only exists inside the task.
+	dropped := toMap(Merge(nil, task, Options{DropAWSContainer: true}))
+	for _, k := range AWSContainerVars {
+		if _, ok := dropped[k]; ok {
+			t.Errorf("%s must be dropped with DropAWSContainer", k)
+		}
+	}
+	if dropped["DB_HOST"] != "db.example" {
+		t.Error("unrelated variables must survive DropAWSContainer")
+	}
+	for _, k := range []string{"ECS_CONTAINER_METADATA_URI", "ECS_AGENT_URI"} {
+		if !Excluded(k, AWSContainerVars) {
+			t.Errorf("%s must be part of AWSContainerVars", k)
+		}
+	}
+}

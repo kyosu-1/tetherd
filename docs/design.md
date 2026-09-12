@@ -358,7 +358,7 @@ aws:
   profile: myapp-dev-shota
 ```
 
-タスク env から既定で除外するもの: `PATH HOME HOSTNAME USER LOGNAME SHELL TMPDIR PWD OLDPWD TERM LANG LC_* SHLVL _ AWS_EXECUTION_ENV`。`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` と `ECS_CONTAINER_METADATA_URI_V4` は透過モードで必要なので残し、`--no-network` のときだけ除外する（残すと SDK が失敗する）。
+タスク env から既定で除外するもの: `PATH HOME HOSTNAME USER LOGNAME SHELL TMPDIR PWD OLDPWD TERM LANG LC_* SHLVL _ AWS_EXECUTION_ENV`。`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` と `ECS_CONTAINER_METADATA_URI_V4` は透過モードで必要なので残し、`--no-network` のときだけ除外する（残すと SDK が失敗する）。さらに、コンテナのパスを指してランタイムの挙動を変える変数（`SSL_CERT_FILE`、`LD_LIBRARY_PATH`、`JAVA_HOME`、`PYTHONPATH` など）も既定で除外する。distroless の `SSL_CERT_FILE` が macOS に注入されると子プロセスの TLS が全部壊れることを実機で確認したため。
 
 ---
 

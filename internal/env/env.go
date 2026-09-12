@@ -8,17 +8,41 @@ import (
 	"strings"
 )
 
-// DefaultExclude are task variables never injected. "LC_*" style patterns
-// match a prefix.
-var DefaultExclude = []string{
-	"PATH", "HOME", "HOSTNAME", "USER", "LOGNAME", "SHELL", "TMPDIR", "PWD", "OLDPWD",
-	"TERM", "LANG", "LC_*", "SHLVL", "_", "AWS_EXECUTION_ENV",
+// ContainerPathVars point into the container's filesystem and silently
+// change how a runtime resolves trust or code, so injecting them into a
+// process on the laptop breaks it. Observed on real Fargate: distroless
+// images set SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt, a path that
+// does not exist on macOS, and every TLS dial from a Go child then failed
+// with "certificate signed by unknown authority" (the AWS CLI, which
+// carries its own CA bundle, was unaffected). Excluded for the same reason
+// as PATH and HOME: the value describes the container, not the app.
+var ContainerPathVars = []string{
+	// TLS trust stores
+	"SSL_CERT_FILE", "SSL_CERT_DIR", "AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+	"CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+	// dynamic loader
+	"LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+	// language roots
+	"JAVA_HOME", "GOROOT", "PYTHONHOME", "PYTHONPATH",
 }
 
-// AWSContainerVars make the AWS SDK fetch the task role through
-// 169.254.170.2. They are kept in transparent mode and dropped with
-// --no-network (the SDK would fail hard, not fall back).
-var AWSContainerVars = []string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "ECS_CONTAINER_METADATA_URI_V4"}
+// DefaultExclude are task variables never injected. "LC_*" style patterns
+// match a prefix.
+var DefaultExclude = append([]string{
+	"PATH", "HOME", "HOSTNAME", "USER", "LOGNAME", "SHELL", "TMPDIR", "PWD", "OLDPWD",
+	"TERM", "LANG", "LC_*", "SHLVL", "_", "AWS_EXECUTION_ENV",
+}, ContainerPathVars...)
+
+// AWSContainerVars only resolve inside the task: they address
+// 169.254.170.2, which the child reaches through the agent in transparent
+// mode. They are kept there (that is what makes the task role and the task
+// metadata work) and dropped with --no-network, where nothing would answer.
+var AWSContainerVars = []string{
+	"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+	"ECS_CONTAINER_METADATA_URI_V4",
+	"ECS_CONTAINER_METADATA_URI",
+	"ECS_AGENT_URI",
+}
 
 // LocalAWSCredentialVars are the developer's own AWS credential/profile
 // variables. Every AWS SDK credential chain ranks these above container
