@@ -55,7 +55,7 @@ v0.3a から、agent は常に ALB のデータパス上に居る（§5.1）。�
 
 v0.3b から、`tetherd run` は**サービスの対象タスク全部**に接続し、rolling deploy に追従する（§6.2 / §6.3）。以下はそれと `status` / `token rotate` / `doctor` の確認。
 
-**27 と 28 は `desired_count = 2` が必要**（`terraform apply -var desired_count=2`）。ALB がどのタスクにリクエストを落とすかを決めるので、1 タスクでは「どのタスクに落ちても届く」を検証できない。**終わったら 1 に戻す** — Fargate の課金が倍になる。
+**27 と 28 は `desired_count = 2` が必要**（`terraform apply -var desired_count=2`）。ALB がどのタスクにリクエストを落とすかを決めるので、1 タスクでは「どのタスクに落ちても届く」を検証できない。**終わったら 1 に戻す** — Fargate の課金が倍になる。31 はターゲットグループを HTTP2 にするので、**dev 環境を一時的に壊す**（agent は HTTP/1.1 サーバなので ALB が h2c で話すとヘルスチェックが落ち、ターゲットが unhealthy になって ALB が 5xx を返す）。31 は最後に実施し、すぐ HTTP1 に戻すこと。`protocol_version` は作成時にしか設定できない属性なので（`ModifyTargetGroup` の入力に無い）Terraform は置き換えになるが、`create_before_destroy` + `name_prefix` が入っているので v0.3a の `ResourceInUse`（§12）は起きない。
 
 | # | コマンド | 期待 | 確認すること |
 |---|---|---|---|
@@ -63,20 +63,11 @@ v0.3b から、`tetherd run` は**サービスの対象タスク全部**に接�
 | 28 | `$RUN -- <自分のサーバ>` を動かしたまま別端末で `aws ecs update-service --cluster tetherd-dev --service api --force-new-deployment`。入れ替わりの間、一致するヘッダーで `curl` を続ける | 新しいタスクに `↻ session   task <id>… attached (N total)`（primary でなければ `(N total)`、primary なら `attached and is now the primary`）が出て繋がり、古いタスクが落ちると `↻ session   task <id>… went away (…); N left`。**`run` は生き続け、子プロセスも動き続ける**。primary が入れ替わった場合は `dial and DNS now go through task <id>…` が出る。`curl` はその間もラップトップに届く | deploy 追従。タスク一覧は 10 秒おきなので反映に最大 10 秒の遅れがある。**secondary が 1 本落ちても `run` は終わらない**こと（`✗ agent session lost` が出ないこと）が見どころ — 終わるのは全セッションを失ったときだけ |
 | 29 | `$RUN` を別端末で生かしたまま `./bin/tetherd status`。続けて `$RUN` を止めてもう一度 | 1 回目はタスクごとの節に自分の名前・`from <自分の IP>`・`attached <n>s ago` が出る（`run` は全タスクに繋ぐので**両方のタスクに**出る）。2 回目は両タスクが `(nobody attached)`。exit 0。helper（sudo）は要らない | 共有時の診断。`status` は読むためだけに attach するので、**トークンを送らず steal の対象にならない**（29 の実行中に一致するヘッダーで `curl` してもタスクの応答になり、`status` 側には何も来ない）。タスクが 1 本読めなくても残りが出ること（`(not read: …)`）も、片方を `aws ecs stop-task` して確認できる |
 | 30 | `$RUN` を生かしたまま別の端末で `./bin/tetherd token rotate`、その後 **古い**トークンのヘッダーで `curl` | 新しいトークンが表示され、`~/.tetherd/config.yml` は 0600 のまま `user` と `aws` も残る。**古いトークンの `curl` はまだラップトップに届く**（`$RUN` を再起動すると届かなくなり、新しいトークンで届くようになる） | 回転はファイルを差し替えるだけで、走行中のセッションは attach 時の `hello` の値で照合し続ける — 漏洩を閉じるには再起動が必要（出力もそう言う） |
+| 31 | developer policy に `elasticloadbalancing:DescribeTargetGroups` を当てる**前**に `./bin/tetherd doctor`、当てた**後**にもう一度、最後に `alb.tf` の `aws_lb_target_group.app` に `protocol_version = "HTTP2"` を足して `terraform apply` してもう一度 | 当てる前は `? target group  not checked: …`（`elasticloadbalancing:DescribeTargetGroups` を名指しし、**exit code は 0 のまま**）。当てた後は `✓`。HTTP2 にすると `✗` で `protocol_version` を名指しして exit 1 | steal の要件検査（spec §5.1 が gRPC / HTTP2 を対象外としている）。`?` が exit code を動かさないこと — 権限が古い開発者の環境は壊れていないので `✗` にしてはいけない — が 1 段目の要点。**実施後すぐ HTTP1 に戻す**こと |
 
 所要時間の目安: `StartSession` → `welcome` まで 2〜4 秒、psql の接続確立 +50〜100 ms。
 
 結果は `docs/specs/2026-09-12-v1-macos-design.md` §12 の 5・6、および v0.3a / v0.3b の節に追記する。
-
-## v0.4 に持ち越した行
-
-`doctor` のターゲットグループの検査は **v0.3b に入らなかった**（理由は spec §12 の v0.3b）。行が入るまでこの 31 行は実施できないので、番号だけ確保してここに置いてある。26〜30 行の番号は動かしていない。
-
-**この行は dev 環境を一時的に壊す。** ターゲットグループを HTTP2 にすると ALB は h2c でタスクに話しかけるが、agent は HTTP/1.1 サーバなのでヘルスチェックが落ち、ターゲットが unhealthy になって ALB が 5xx を返す。**実施は最後に回し、確認できたらすぐ HTTP1 に戻すこと。** `protocol_version` は作成時にしか設定できない属性なので（`ModifyTargetGroup` では変えられない）Terraform は置き換えになるが、`create_before_destroy` + `name_prefix` が入っているので v0.3a の `ResourceInUse`（§12）は起きない。
-
-| # | コマンド | 期待 | 確認すること |
-|---|---|---|---|
-| 31 | developer policy に `elasticloadbalancing:DescribeTargetGroups` を当てる**前**に `./bin/tetherd doctor`、当てた**後**にもう一度、最後に `alb.tf` の `aws_lb_target_group.app` に `protocol_version = "HTTP2"` を足して `terraform apply` してもう一度 | 当てる前は `? target group  not checked: …`（`elasticloadbalancing:DescribeTargetGroups` を名指しし、**exit code は 0 のまま**）。当てた後は `✓`。HTTP2 にすると `✗` で `protocol_version` を名指しして exit 1 | steal の要件検査（spec §5.1 が gRPC / HTTP2 を対象外としている）。`?` が exit code を動かさないこと — 権限が古い開発者の環境は壊れていないので `✗` にしてはいけない — が 1 段目の要点 |
 
 ## v0.4: 初回インストールの検証（32〜38、未実施）
 

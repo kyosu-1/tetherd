@@ -462,6 +462,12 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
       "Resource": "arn:aws:ssm:*:*:session/${aws:username}-*"
     },
     {
+      "Sid": "InspectTargetGroup",
+      "Effect": "Allow",
+      "Action": "elasticloadbalancing:DescribeTargetGroups",
+      "Resource": "*"
+    },
+    {
       "Sid": "Optional",
       "Effect": "Allow",
       "Action": ["sts:GetCallerIdentity", "servicediscovery:ListNamespaces"],
@@ -473,6 +479,7 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 
 - 認証は AWS SDK の標準チェーン（SSO プロファイル、アクセスキー、AssumeRole）をそのまま使う。tetherd が `ssm:StartSession` を呼んでストリーム URL とトークンを得て session-manager-plugin に渡す（AWS CLI と同じ手順だが AWS CLI 自体は不要）
 - IAM Identity Center（SSO）では `${aws:username}` が無いので `OwnSessions` の Resource は `arn:aws:ssm:*:*:session/*` にする
+- `InspectTargetGroup` は `tetherd doctor` のターゲットグループの行だけが使う（steal は HTTP1 のターゲットグループでしか成立しない。spec §5.1。同じ呼び出しでターゲットグループのポートも分かるが、agent の受け口は `TETHERD_PROXY` で動かせるので既定と違っても `⚠` 止まり）。ELB の `Describe*` はリソースレベルの権限を取らない（Service Authorization Reference にリソース型が無い）ので `Resource` は `*` 以外に書けず、`doctor` を配らないなら外してよい
 - タスクロールの認証情報は CLI のループバック口から（`pin_credential_route` を有効にしたときは `169.254.170.2` の固定経路からも）ラップトップに届くので、開発者はローカルからタスクロールの権限を実質的に使える。「dev タスクができることは開発者もできる」という意味で dev では通常許容範囲だが、タスクロールが必要以上に広くないかは一度見ておく
 
 ---

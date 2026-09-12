@@ -336,9 +336,11 @@ tetherd token rotate
 - `doctor` の検査項目（各項目に「次に何をするか」を付ける）:
   helper が応答しバージョンが一致 / `tetherd` グループと setgid `tetherd-exec` / session-manager-plugin の有無 / AWS 認証 / サービスの `enableExecuteCommand` / タスクの agent コンテナと ExecuteCommandAgent / タスク定義の `pidMode: task` / ターゲットグループが HTTP1 / ECS・EC2 の読み取り権限 / VPC CIDR とローカル IF の重なり / `remote_domains` が agent 側で解けるか / `remote_cidrs` に `0.0.0.0/0` が無いか
 
-  v0.2b で実装したのは 9 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲の広さ / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査は v0.3b にも入らず、v0.4 に送った** — `elasticloadbalancing:DescribeTargetGroups` を呼ぶ SDK が無いため。理由と残作業は §12 の v0.3b に書いた。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
+  v0.2b で実装したのは 9 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲の広さ / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査は v0.4 で入れた**（`target group` の行。`aws-sdk-go-v2/service/elasticloadbalancingv2` を足し、developer policy に `elasticloadbalancing:DescribeTargetGroups` を戻した。v0.3b に入らなかった理由は §12 の v0.3b）。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
 
   v0.3a / v0.3b で足したのは、`agent session`（tetherd 自身が通した handshake。ECS の見解とは別）・`task env`（agent が読めた変数と `env_error`）・`task role`（子プロセスと同じ経路でループバック口から取った認証情報の ARN）・`steal`（一致条件と、ラップトップ側に listener が居るか）の 4 行と、**`?`（検査できなかった）ステータス**。`?` は「動くが注意」の `⚠` と分けてあり、**どの行でも exit code を動かさない**（失敗した行は既にそれ自身で数えられているため）。`pin_credential_route` の行は入っていない
+
+  v0.4 で足したのは `target group` の 1 行。`protocol_version` が `HTTP1` でなければ `✗`（spec §5.1 が gRPC / HTTP2 を対象外にしており、agent は HTTP/1.1 サーバなので ALB の h2c ヘルスチェックが落ちる）、`elasticloadbalancing:DescribeTargetGroups` が無ければ `?`（権限が古い開発者の環境は壊れていない）、**ターゲットグループのポートが agent の受け口と違えば `⚠` で、`✗` にはしない** — `TETHERD_PROXY` で動かせる以上、違うポートを向けた配置は正しく設定されている。その `TETHERD_PROXY` はタスク定義の agent コンテナの env から読むので、ポートの比較は既定値の当て推量ではなく実際の値どうしになる（env-file や Secrets 経由で設定されていて読めないときは `?`）
 
 ### 6.6 出力
 
