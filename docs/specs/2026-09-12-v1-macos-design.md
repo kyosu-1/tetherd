@@ -206,7 +206,7 @@ S3 / DynamoDB / SQS / Secrets Manager / Bedrock など VPC 外のサービスは
 
 README に書くこと: 条件が無い環境ではラップトップ経路のほうが緩い（NAT の無い VPC でもラップトップは自前で出られる）、CloudTrail の `sourceIPAddress` はラップトップの IP になる。
 
-### 4.3 開発者の IAM ポリシー
+### 4.4 開発者の IAM ポリシー
 
 design.md §9 のものに EC2 の読み取り 4 つを追加。
 

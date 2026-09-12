@@ -57,9 +57,11 @@ there is no way to attach to an existing one unchanged. Before the first
   the agent already reads the task's resolved environment for you.
 
 [`deploy/dev-env`](deploy/dev-env) is a working Terraform example of exactly
-this setup. The full details, including the IAM policy JSON, are in
-[the v1 macOS design spec](docs/specs/2026-09-12-v1-macos-design.md) (§9) and
-[design.md](docs/design.md) (§9).
+this setup, and its `outputs` include a ready-made `.tetherd.yml`. The
+developer IAM policy is spelled out as JSON in
+[the v1 macOS design spec](docs/specs/2026-09-12-v1-macos-design.md) (§4.4),
+the dev environment it belongs to is §9.1, and
+[design.md](docs/design.md) (§9) explains why each change is needed.
 
 ## First run
 
@@ -126,7 +128,7 @@ Only `✗` rows affect the exit code.
 - **The root helper stays resident.** `sudo tetherd-helper install` registers a
   LaunchDaemon that runs whether or not you are using tetherd. Having launchd
   hold the socket and start the helper only on demand is the intended design
-  (spec §7) and is not implemented yet.
+  (spec §8) and is not implemented yet.
 
 ## Trust boundary
 
