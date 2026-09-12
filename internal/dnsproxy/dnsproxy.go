@@ -230,15 +230,24 @@ func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
 	// stale /etc/resolver files it would have removed become the helper's
 	// disconnect backstop's problem instead of never existing.
 	defer func() {
-		if r := recover(); r != nil {
-			s.logf("dns: recovered from a panic handling a query: %v", r)
-			resp := new(dns.Msg)
-			if req != nil {
-				resp.SetReply(req)
-			}
-			resp.Rcode = dns.RcodeServerFailure
-			w.WriteMsg(resp)
+		r := recover()
+		if r == nil {
+			return
 		}
+		// Answer before logging. s.logf is caller-supplied, so it can
+		// itself be the panic source; logging first would re-panic inside
+		// the recover and kill the process anyway - turning the insurance
+		// path into the crash path it exists to prevent.
+		resp := new(dns.Msg)
+		if req != nil {
+			resp.SetReply(req)
+		}
+		resp.Rcode = dns.RcodeServerFailure
+		w.WriteMsg(resp)
+		func() {
+			defer func() { _ = recover() }()
+			s.logf("dns: recovered from a panic handling a query: %v", r)
+		}()
 	}()
 
 	resp := new(dns.Msg)

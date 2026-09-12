@@ -367,9 +367,13 @@ func TestCloseCancelsInFlightResolvesInsteadOfWaiting(t *testing.T) {
 		t.Fatal("Resolve was never invoked")
 	}
 
+	// Close without cancelling ctx first. run.go registers its own
+	// defer cancel() *before* defer dsrv.Close(), so LIFO runs Close
+	// first and a normal `tetherd run` exit depends entirely on Close
+	// cancelling in-flight work itself. Cancelling here too would let
+	// that half be deleted with the suite still green.
 	closeDone := make(chan struct{})
 	go func() {
-		cancel()
 		s.Close()
 		close(closeDone)
 	}()
@@ -378,6 +382,7 @@ func TestCloseCancelsInFlightResolvesInsteadOfWaiting(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatal("Close took far longer than it should have - it must cancel in-flight resolves instead of waiting QueryTimeout out")
 	}
+	cancel()
 	select {
 	case <-sawCancel:
 	case <-time.After(time.Second):
