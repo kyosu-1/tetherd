@@ -20,6 +20,8 @@ import (
 
 	"github.com/kyosu-1/tetherd/internal/agent"
 	"github.com/kyosu-1/tetherd/internal/doctor"
+	"github.com/kyosu-1/tetherd/internal/proto"
+	ecsprov "github.com/kyosu-1/tetherd/internal/provider/ecs"
 	"github.com/kyosu-1/tetherd/internal/session"
 	"github.com/kyosu-1/tetherd/internal/transport"
 	ssmtr "github.com/kyosu-1/tetherd/internal/transport/ssm"
@@ -97,6 +99,11 @@ var everyDoctorRow = []string{
 	"your AWS identity",
 	"attachable task",
 	"pidMode",
+	// The ALB target group sits with the other reads keyed on the task
+	// rather than beside the steal row, because the agent handshake between
+	// them carries the report's longest allowance: a row gathered after it
+	// is the first the budget cuts short.
+	"target group",
 	"agent session",
 	"task env",
 	"task role",
@@ -227,18 +234,60 @@ func wantMarks(t *testing.T, rows []doctorRow, want map[string]string) {
 // is the state of every machine the test suite runs on.
 var errNoHelperForTest = errors.New("tetherd-helper is not running (/var/run/tetherd.sock): no such file")
 
+// albProvider is a fakeProvider that also reads an ALB target group - the
+// one capability `tetherd doctor` needs and `tetherd run` does not, which is
+// why it is a second interface in production too (see targetGroupReader).
+//
+// A wrapper rather than fields on fakeProvider: run's fixtures are built in
+// dozens of places and none of them has an opinion about a target group, so
+// the fixture that does lives with the tests that read it. Field promotion
+// means every existing doctor test still sets p.pidModeErr and the rest
+// through this type unchanged.
+type albProvider struct {
+	*fakeProvider
+	tg    doctor.TargetGroup
+	tgErr error
+	// tgTarget and tgDefinitionARN record what the row asked about, so a
+	// test can pin that it asks about the service under test and the task
+	// definition of the task that was discovered - not, say, a stale ARN.
+	tgTarget        ecsprov.Target
+	tgDefinitionARN string
+}
+
+func (p *albProvider) TargetGroup(_ context.Context, t ecsprov.Target, definitionARN string) (doctor.TargetGroup, error) {
+	p.tgTarget, p.tgDefinitionARN = t, definitionARN
+	return p.tg, p.tgErr
+}
+
+// healthyTargetGroup is the dev environment's own target group: HTTP/1.1 on
+// the port the agent serves the ALB on by default. The port is
+// proto.DefaultProxyPort and not 8080 because that is the whole point of
+// exporting the constant - a literal here would pass a test that the agent
+// and the check disagree about.
+func healthyTargetGroup() doctor.TargetGroup {
+	return doctor.TargetGroup{
+		Name:            "tethrd-dev",
+		Protocol:        "HTTP",
+		ProtocolVersion: doctor.TargetGroupHTTP1,
+		Port:            proto.DefaultProxyPort,
+	}
+}
+
 // healthyProvider is an AWS that answers every question correctly.
-func healthyProvider(agentAddr string) *fakeProvider {
-	return &fakeProvider{
-		region: "ap-northeast-1",
-		task: transport.Task{
-			ID: "t1", SubnetID: "subnet-a", DefinitionARN: "arn:def",
-			StartedAt: time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC),
+func healthyProvider(agentAddr string) *albProvider {
+	return &albProvider{
+		fakeProvider: &fakeProvider{
+			region: "ap-northeast-1",
+			task: transport.Task{
+				ID: "t1", SubnetID: "subnet-a", DefinitionARN: "arn:def",
+				StartedAt: time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC),
+			},
+			vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+			agentAddr: agentAddr,
+			pidMode:   "task",
+			identity:  "arn:aws:sts::1:assumed-role/dev/me",
 		},
-		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
-		agentAddr: agentAddr,
-		pidMode:   "task",
-		identity:  "arn:aws:sts::1:assumed-role/dev/me",
+		tg: healthyTargetGroup(),
 	}
 }
 
@@ -247,8 +296,8 @@ func healthyProvider(agentAddr string) *fakeProvider {
 // about. None of them touches the machine the tests run on: no dscl, no
 // /usr/local/libexec, no PATH lookup and no real interface list, so the rows
 // mean the same thing on a developer's laptop and in CI.
-func healthyDoctorDeps(p *fakeProvider) Deps {
-	d := depsFor(p)
+func healthyDoctorDeps(p *albProvider) Deps {
+	d := Deps{NewAWSProvider: func(context.Context, RunOptions) (awsProvider, error) { return p, nil }}
 	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
 	d.LookupGroup = func(context.Context, string) (int, bool, error) { return 309, true, nil }
 	d.StatFile = func(string) (fs.FileMode, int, error) { return 0o755 | fs.ModeSetgid, 309, nil }
@@ -263,7 +312,7 @@ func healthyDoctorDeps(p *fakeProvider) Deps {
 // can pin that it opens exactly one: the identity row needs a session of its
 // own to attribute failures correctly, and that same session is handed to
 // discoverTask rather than letting it build a second.
-func countSessions(d *Deps, p *fakeProvider, sessions *int) {
+func countSessions(d *Deps, p *albProvider, sessions *int) {
 	d.NewAWSProvider = func(context.Context, RunOptions) (awsProvider, error) {
 		*sessions++
 		return p, nil
@@ -2777,5 +2826,171 @@ func TestSkipAgentHelpNamesEveryRowItGivesUp(t *testing.T) {
 		if !strings.Contains(f.Usage, row) {
 			t.Errorf("--skip-agent help does not name the %q row it gives up: %q", row, f.Usage)
 		}
+	}
+}
+
+// --- the target group row --------------------------------------------------
+
+// TestDoctorReportsTheTargetGroup: the row reads the service under test and
+// the task definition of the task discovery actually found, and reports the
+// group it got. An ARN from somewhere else would be a verdict about
+// somebody else's target group.
+func TestDoctorReportsTheTargetGroup(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	p := healthyProvider(ag.addr)
+	d := healthyDoctorDeps(p)
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	wantMarks(t, rows, map[string]string{"target group": "✓"})
+	if code != 0 {
+		t.Fatalf("a healthy target group must not fail the report, got %d\n%s", code, out.String())
+	}
+	if p.tgTarget.Cluster != "c" || p.tgTarget.Service != "api" {
+		t.Errorf("the row asked about %+v, not the service under test", p.tgTarget)
+	}
+	if p.tgDefinitionARN != p.task.DefinitionARN {
+		t.Errorf("the row asked about task definition %q, want the discovered task's %q", p.tgDefinitionARN, p.task.DefinitionARN)
+	}
+}
+
+// TestDoctorFailsAnHTTP2TargetGroup is the verdict half of the row: spec
+// §5.1 puts HTTP2 and gRPC out of scope, the agent is an HTTP/1.1 server, so
+// behind such a group no request reaches it at all. That is a ✗ and it fails
+// the command.
+func TestDoctorFailsAnHTTP2TargetGroup(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	p := healthyProvider(ag.addr)
+	p.tg.ProtocolVersion = "HTTP2"
+	d := healthyDoctorDeps(p)
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	row := findRow(t, rows, "target group")
+	if row.mark != "✗" || !strings.Contains(row.detail, "HTTP2") {
+		t.Errorf("target group = %q %q, want ✗ naming HTTP2", row.mark, row.detail)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1: steal cannot work behind an HTTP2 target group\n%s", code, out.String())
+	}
+}
+
+// TestDoctorWarnsRatherThanFailsOnADifferentTargetGroupPort is the ruling
+// this row must not lose. TETHERD_PROXY moves the port the agent serves the
+// ALB on, so a target group pointed somewhere other than the default may be
+// exactly right - and a ✗ would fail the report for a working service.
+func TestDoctorWarnsRatherThanFailsOnADifferentTargetGroupPort(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	p := healthyProvider(ag.addr)
+	p.tg.Port = 9090
+	d := healthyDoctorDeps(p)
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	row := findRow(t, rows, "target group")
+	if row.mark != "⚠" {
+		t.Errorf("target group = %q %q, want ⚠: a moved port is a question, not a verdict", row.mark, row.detail)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0: a port difference must not fail a script\n%s", code, out.String())
+	}
+	// And the same deployment with TETHERD_PROXY pointed at that port is
+	// green: the comparison is real, not a guess about the default.
+	p.tg.AgentProxy = "0.0.0.0:9090"
+	var green strings.Builder
+	if _, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &green, d); err != nil {
+		t.Fatal(err)
+	}
+	if m := findRow(t, parseDoctorRows(green.String()), "target group").mark; m != "✓" {
+		t.Errorf("target group = %q, want ✓ once TETHERD_PROXY names the port\n%s", m, green.String())
+	}
+}
+
+// TestDoctorDoesNotFailADeveloperWithoutTheTargetGroupGrant: the grant is
+// new, and a developer whose IAM policy predates it has a working
+// environment. The row says it could not be checked, names the permission,
+// and leaves the exit code alone.
+func TestDoctorDoesNotFailADeveloperWithoutTheTargetGroupGrant(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	p := healthyProvider(ag.addr)
+	p.tgErr = errors.New("operation error Elastic Load Balancing v2: DescribeTargetGroups, https response error StatusCode: 403, AccessDenied")
+	d := healthyDoctorDeps(p)
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	row := findRow(t, rows, "target group")
+	if row.mark != "?" {
+		t.Errorf("target group = %q %q, want ?", row.mark, row.detail)
+	}
+	if !strings.Contains(row.next, "elasticloadbalancing:DescribeTargetGroups") {
+		t.Errorf("the next step must name the grant: %q", row.next)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0: a missing permission is not a broken environment\n%s", code, out.String())
+	}
+}
+
+// A row that could not be gathered because the task was never found says so
+// rather than claiming a healthy target group, the way every other
+// task-dependent row does.
+func TestDoctorReportsTheTargetGroupAsNotCheckedWithoutATask(t *testing.T) {
+	p := healthyProvider("127.0.0.1:1")
+	p.discErr = errors.New("no attachable task")
+	d := healthyDoctorDeps(p)
+
+	var out strings.Builder
+	if _, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d); err != nil {
+		t.Fatal(err)
+	}
+	row := findRow(t, wantRowSet(t, out.String()), "target group")
+	if row.mark != "?" || !strings.Contains(row.detail, "task could not be found") {
+		t.Errorf("target group = %q %q, want ? saying the task was not found", row.mark, row.detail)
+	}
+	if p.tgDefinitionARN != "" {
+		t.Errorf("the target group must not be read without a task: asked about %q", p.tgDefinitionARN)
+	}
+}
+
+// The clock is not a finding about the target group. CheckTargetGroup
+// answers any error by naming the grant, which is the wrong thing to tell a
+// developer who holds it and whose report ran out of time - and it would
+// answer it as a `?`, so an incomplete report would exit 0.
+func TestDoctorFailsTheTargetGroupRowOnAClock(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	p := healthyProvider(ag.addr)
+	p.tgErr = context.DeadlineExceeded
+	d := healthyDoctorDeps(p)
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	row := findRow(t, rows, "target group")
+	if row.mark != "✗" {
+		t.Errorf("target group = %q %q, want ✗ for a check that never answered", row.mark, row.detail)
+	}
+	if strings.Contains(row.next, "elasticloadbalancing:DescribeTargetGroups") {
+		t.Errorf("a clock must not be answered with an IAM grant: %q", row.next)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1: an incomplete report must not exit 0\n%s", code, out.String())
 	}
 }

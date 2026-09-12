@@ -44,7 +44,7 @@ const DefaultDoctorTimeout = 10 * time.Second
 // one cannot leave this behind.
 const DefaultAgentCheckTimeout = ssmtr.StartupWait + session.HandshakeWait
 
-// DefaultDoctorBudget bounds the whole report, not just each row. Thirteen
+// DefaultDoctorBudget bounds the whole report, not just each row. Fourteen
 // checks plus one resolve per configured domain, each allowed
 // DefaultDoctorTimeout, adds up to minutes in the worst case; nobody waits
 // that long for a diagnostic. What the budget cuts short is reported as
@@ -283,6 +283,47 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 			results = append(results, timedOut("pidMode", checkTimedOut(ctx, "ecs:DescribeTaskDefinition", timeout)))
 		} else {
 			results = append(results, doctor.CheckPIDMode(mode, modeErr))
+		}
+	}
+
+	// 4b. The ALB target group in front of the service. This is the one
+	// precondition of steal that is invisible from everywhere else: the
+	// agent is an HTTP/1.1 server, and behind an HTTP2 or gRPC target group
+	// the ALB speaks h2c to it, so the health check fails and the target
+	// goes unhealthy - every request, stolen or not. Neither the agent nor
+	// the ECS service can report it (ecs/types carries no protocol version
+	// at all), which is why this row costs a third API and a grant nothing
+	// else needs.
+	//
+	// It sits with the other reads keyed on the task rather than beside the
+	// steal row below, so that a service whose agent never answers still
+	// gets the verdict: the handshake's allowance is the longest in the
+	// report, and a row gathered after it is the first to be cut short when
+	// the budget runs out.
+	switch {
+	case taskErr != nil:
+		results = append(results, notChecked("target group", "the task could not be found, so the service's target group is unknown"))
+	default:
+		if tgr, ok := prov.(targetGroupReader); !ok {
+			// See targetGroupReader: unreachable through the CLI, because
+			// doctor has already refused every transport whose provider
+			// does not read one.
+			results = append(results, notChecked("target group", "the AWS provider in use does not read an ALB target group"))
+		} else {
+			gctx, gcancel := context.WithTimeout(ctx, timeout)
+			tg, tgErr := tgr.TargetGroup(gctx, ecsTarget(opts.RunOptions), task.DefinitionARN)
+			gcancel()
+			// The clock, routed the way every other clock-sensitive row
+			// routes it. CheckTargetGroup answers any error with "grant
+			// elasticloadbalancing:DescribeTargetGroups", which is the
+			// wrong thing to tell a developer who already holds it and
+			// whose report simply ran out of time - and it would answer it
+			// as a `?`, so the incomplete report would exit 0.
+			if isContextError(tgErr) {
+				results = append(results, timedOut("target group", checkTimedOut(ctx, "the target group lookup", timeout)))
+			} else {
+				results = append(results, doctor.CheckTargetGroup(tg, tgErr))
+			}
 		}
 	}
 
