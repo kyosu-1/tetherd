@@ -551,11 +551,23 @@ design.md §10 に加えて:
 | 12 | `--format json` と `--reveal` | ✅ JSON として妥当、`--reveal` で 24 文字の実値 |
 | 13 | stdout と stderr の分離 | ✅ `eval "$(tetherd env --format shell)"` が成功し `PORT=8081`。ステータス行は 4 行すべて stderr |
 | — | secret が stdout / stderr に漏れない | ✅ 実値 24 文字で grep して両方とも不在 |
-| 6 | `remote_domains` で Cloud Map の名前が解け、`/etc/resolver` が run 中だけ存在する | 未実施（helper 必須） |
-| 14-15 | `tetherd doctor` の 9 項目と「1 つ失敗しても続ける」 | 未実施 |
-| 16 | `remote_services: [s3]` の prefix list がページングされて数百件入る | 未実施（helper 必須） |
-| 17-18 | `local_cidrs` の分割引き算と、全部消したときのエラー | 未実施（helper 必須） |
-| 19 | 存在しない名前が NXDOMAIN として即座に返る | 未実施（helper 必須） |
+| 1 | 捕捉ありの env 注入 | ✅ 19 変数、`✓ network` にリモート集合と DNS 行、`✓ iam` にタスクロール（`assumed-role/tetherd-dev-api-task/…`） |
+| 2 | VPC 内の RDS に pf → SSM → agent で届く | ✅ `10.0.10.164:5432` に接続して Postgres の SSL 応答 `S` |
+| 6 | `remote_domains` で Cloud Map の名前が解け、`/etc/resolver` が run 中だけ存在する | ✅ `dig @127.0.0.1 -p 53530 api.myapp.internal` → `10.0.11.30`、`getaddrinfo` も同じ、`curl http://api.myapp.internal:8081/` → `sampleapp on ip-10-0-11-30… from 10.0.11.30`（= 解決した IP も捕捉されて agent 経由で届いている）。run 中だけ `/etc/resolver/myapp.internal` が存在し、中身は `# managed by tetherd` / `nameserver 127.0.0.1` / `port 53530`、終了後に消える |
+| 8 | 1 台 1 セッション | ✅ 2 つ目が `rejected by agent (duplicate_user)` |
+| 14 | `tetherd doctor` の 10 項目 | ✅ helper・setgid・plugin・AWS 認証・タスク・pidMode・agent セッション・捕捉範囲・ローカルアドレスが緑。`remote domains` の行は偽陰性が見つかり修正（下記） |
+| 19 | 存在しない名前が NXDOMAIN として即座に返る | ✅ `dns nope.myapp.internal: not found` が出て `gaierror` が 0.06 秒で返る（SERVFAIL のリトライ待ちが無い） |
+| 15 | doctor が 1 つ失敗しても残りを続ける | 未実施 |
+| 16 | `remote_services: [s3]` の prefix list がページングされて数百件入る | 未実施 |
+| 17-18 | `local_cidrs` の分割引き算と、全部消したときのエラー | 未実施 |
+
+検証のために agent イメージを再ビルド・再デプロイした（`make push-images` + `aws ecs update-service --force-new-deployment`、linux/amd64 + linux/arm64）。再デプロイ前は `✗ remote domains: this agent does not support name resolution; upgrade the sidecar` と出ており、今夜追加したバージョン不一致メッセージが実機で正しく機能することの確認にもなった。
+
+実機で見つかった問題:
+
+1. **`doctor` の `remote domains` が健全な環境で偽陰性を出す**（修正済み）。設定されたドメインそのものを名前として解決していたが、Cloud Map の名前空間は apex に A レコードを持たないので `name not found` になる。検査の本当の問いは「このドメインの問い合わせが VPC リゾルバに届くか」であり、**not found という応答自体が到達の証明**。存在しないことが保証された名前を引いて、not found を成功として扱う形に変更。
+2. **macOS の負の DNS キャッシュ**。agent が resolve に対応する前に引いた名前は `mDNSResponder` に NXDOMAIN としてキャッシュされ、TTL の間 `getaddrinfo` が失敗し続ける（`dig` で直接引くと正しく答える）。`sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder` で解消。docs/config.md に記載。
+3. **`169.254.170.2` のルートが pf より先に評価される**（v0.3 送り、v0.2b の回帰ではない）。macOS がこのアドレスへの ARP に失敗して en0 上に拒否ルート（`UHLSW` + `LLINFO`、`netstat` の `!`）を残すため、`connect()` のルート探索が pf の `pass out route-to lo0` より先に `EHOSTUNREACH` を返すことがある。同じ子プロセス・同じ gid 309 で、curl と system python 3.9 は 200 を得るのに AWS CLI 2.34.49 が同梱する Homebrew python 3.14 は `Errno 65` で失敗し、同じ interpreter でも VPC 宛（RFC1918）は通る。ARP エントリの期限で成否が変わるので間欠的。修正はセッション中だけ `169.254.170.2` の host route を lo0 に向けること（helper に新操作が必要なため v0.3）。
 
 実機で 1 件見つかった（修正済み）:
 

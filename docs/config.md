@@ -109,6 +109,12 @@ aws:
 
 A レコードだけ答える。捕捉範囲は IPv4 のみなので、AAAA を返すと tetherd が運べない宛先に子プロセスを送ってしまうため。
 
+注意: macOS は**負の応答もキャッシュする**。agent が名前解決に対応する前や、サービスがまだ登録される前にその名前を引くと、`mDNSResponder` が NXDOMAIN を TTL の間覚えてしまい、`tetherd run` の中でも `getaddrinfo` が失敗し続ける（`dig +short @127.0.0.1 -p 53530 <name>` で直接引くと正しく答えるので、これで切り分けられる）。解消するには:
+
+```
+sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
+```
+
 注意: `/etc/resolver` を尊重するのは `getaddrinfo` 経由の解決だけ。Go の既定、Node の `dns.lookup`、JVM は尊重する。Node の `dns.resolve*`（c-ares）や `dig` は尊重しないので、それらで引くと解決できない。
 
 RDS / ElastiCache / 内部 ALB のエンドポイント名はパブリック DNS でプライベート IP に解決でき、その IP が VPC CIDR に入るので、典型的な構成では `remote_domains` は不要。
