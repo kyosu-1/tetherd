@@ -115,17 +115,37 @@ func (f fakeEnvReader) Read(context.Context) (map[string]string, string, error) 
 
 type agentTransport struct{ addr string }
 
-func (a agentTransport) Dial(ctx context.Context, _ transport.Task) (net.Conn, error) {
-	return (&net.Dialer{}).DialContext(ctx, "tcp", a.addr)
+// Dial connects to the one agent this transport was built for, or - when it
+// was built without an address - to the agent the task itself names. The
+// second form is what a multi-task fixture needs: each task has its own
+// agent, and which one a session reaches is the whole question.
+func (a agentTransport) Dial(ctx context.Context, t transport.Task) (net.Conn, error) {
+	addr := a.addr
+	if addr == "" {
+		addr = t.Addr
+	}
+	return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 }
 
 // fakeProvider stands in for AWS.
 type fakeProvider struct {
 	region string
 	task   transport.Task
-	vpc    []netip.Prefix
-	svc    []netip.Prefix
-	// discErr and vpcErr are for later tasks; nothing sets them yet.
+	// tasks is what DiscoverAll answers: a service with more than one
+	// RUNNING task, which is what `tetherd run` attaches to all of. When it
+	// is empty both Discover and DiscoverAll fall back to the single task
+	// above, so every fixture written before v0.3b still means what it did.
+	//
+	// mu guards tasks and discErr, because DiscoverAll is called from the
+	// follower's goroutine as well as the run's: a test that changes the
+	// task list mid-run (a deploy) must do it through setTasks.
+	mu    sync.Mutex
+	tasks []transport.Task
+	vpc   []netip.Prefix
+	svc   []netip.Prefix
+	// discErr fails discovery - both Discover and DiscoverAll - which is
+	// how a test gets "no attachable task" at startup, or a task list that
+	// stops being readable while a run is live.
 	discErr   error
 	vpcErr    error
 	agentAddr string
@@ -165,8 +185,52 @@ type fakeProvider struct {
 var errAlwaysFails = errors.New("simulated AWS failure")
 
 func (f *fakeProvider) Region() string { return f.region }
-func (f *fakeProvider) Discover(context.Context, ecsprov.Target) (transport.Task, error) {
-	return f.task, f.discErr
+func (f *fakeProvider) Discover(ctx context.Context, t ecsprov.Target) (transport.Task, error) {
+	all, err := f.DiscoverAll(ctx, t)
+	if err != nil {
+		return transport.Task{}, err
+	}
+	return all[0], nil
+}
+
+// DiscoverAll answers like the real one: oldest task first, only the pinned
+// task when Target.TaskID names one, and never an empty list with a nil
+// error.
+func (f *fakeProvider) DiscoverAll(_ context.Context, t ecsprov.Target) ([]transport.Task, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.discErr != nil {
+		return nil, f.discErr
+	}
+	all := f.tasks
+	if len(all) == 0 {
+		all = []transport.Task{f.task}
+	}
+	out := make([]transport.Task, 0, len(all))
+	for _, tk := range all {
+		if t.TaskID != "" && tk.ID != t.TaskID {
+			continue
+		}
+		out = append(out, tk)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("task %s is not RUNNING in %s/%s", t.TaskID, t.Cluster, t.Service)
+	}
+	return out, nil
+}
+
+// setTasks and setDiscoverErr are how a test changes what discovery says
+// while a run is live: the follower polls from its own goroutine.
+func (f *fakeProvider) setTasks(tasks ...transport.Task) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tasks = tasks
+}
+
+func (f *fakeProvider) setDiscoverErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.discErr = err
 }
 func (f *fakeProvider) VPCCIDRs(context.Context, string) ([]netip.Prefix, error) {
 	f.vpcCalls++
@@ -608,29 +672,52 @@ func TestRunStripsLocalAWSCredentialsFromTheChild(t *testing.T) {
 // it hands out, so a test can cut the session while the child is still
 // running. Nothing outside Run can arrange that otherwise: the session is
 // built and owned inside it.
+// The connections are kept per task, because with more than one session
+// only one task's is what a rolling deploy takes away at a time.
 type breakableTransport struct {
 	addr  string
 	mu    sync.Mutex
-	conns []net.Conn
+	conns map[string][]net.Conn
 }
 
-func (b *breakableTransport) Dial(ctx context.Context, _ transport.Task) (net.Conn, error) {
-	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", b.addr)
+func (b *breakableTransport) Dial(ctx context.Context, t transport.Task) (net.Conn, error) {
+	addr := b.addr
+	if addr == "" {
+		// A multi-task fixture: each task has its own agent, and the task
+		// says which one (see agentTransport.Dial).
+		addr = t.Addr
+	}
+	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 	b.mu.Lock()
-	b.conns = append(b.conns, c)
+	if b.conns == nil {
+		b.conns = map[string][]net.Conn{}
+	}
+	b.conns[t.ID] = append(b.conns[t.ID], c)
 	b.mu.Unlock()
 	return c, nil
 }
 
-// breakSession closes the transport under the session, which is what the
+// breakSession closes the transport under every session, which is what the
 // CLI sees when the session-manager-plugin dies or the task goes away.
 func (b *breakableTransport) breakSession() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, c := range b.conns {
+	for _, cs := range b.conns {
+		for _, c := range cs {
+			c.Close()
+		}
+	}
+}
+
+// breakTask closes the transport under one task's session only: what a
+// deploy does to one task while the rest of the service keeps serving.
+func (b *breakableTransport) breakTask(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, c := range b.conns[id] {
 		c.Close()
 	}
 }
@@ -2378,4 +2465,364 @@ func TestRunRow24FallsBackToTheAppOnlyWhenNothingIsListening(t *testing.T) {
 			t.Errorf("the application handled the request %d times, want 0: replaying a POST that already ran is worse than relaying the 502", n)
 		}
 	})
+}
+
+// --- one session per task (v0.3b) ------------------------------------------
+//
+// Until v0.3b `tetherd run` attached to one task while the ALB decided which
+// task a request landed on, so on a service with two tasks roughly half the
+// traffic a developer had asked to steal reached the deployed application
+// instead - silently, with every status line still green. These tests are
+// about that hole and about the two ways a rolling deploy used to close the
+// run: a secondary session ending, and a task appearing that nobody attached
+// to.
+
+// refusingTransport fails every dial, standing in for a task whose SSM port
+// forward cannot be opened at all (no connected exec agent, no
+// session-manager-plugin).
+type refusingTransport struct{}
+
+func (refusingTransport) Dial(context.Context, transport.Task) (net.Conn, error) {
+	return nil, errors.New("simulated forward failure")
+}
+
+// runWithCancel starts Run on its own goroutine under a context the test
+// cancels on its way out, and returns the channel carrying its result plus
+// that cancel.
+//
+// The cleanup waits for the goroutine, not for the result to be read: a test
+// that already took the result must not deadlock in its own cleanup. Waiting
+// at all is what makes it safe for these tests to read Run's log and to hand
+// it a child script - a run still live when the test function returns would
+// otherwise keep polling, keep logging into a buffer the test has finished
+// with, and leave its child looping for the rest of the binary.
+func runWithCancel(t *testing.T, opts RunOptions, out io.Writer, d Deps) (<-chan runResult, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan runResult, 1)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		code, err := RunWithDeps(ctx, opts, out, d)
+		done <- runResult{code: code, err: err}
+	}()
+	t.Cleanup(func() { cancel(); <-stopped })
+	return done, cancel
+}
+
+// reachedWithin is waitFor without the t.Fatal: it reports whether cond
+// came true, for a test that has stronger assertions to make afterwards and
+// must not stop at this one.
+func reachedWithin(d time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return cond()
+}
+
+// shortenFollowInterval makes the task-list poll fast enough to test
+// against. Only the tests that are about following a deploy call it: the one
+// below is about the sessions opened at startup, and a fast poll would let a
+// run that attached to a single task look correct one interval later.
+func shortenFollowInterval(t *testing.T) {
+	t.Helper()
+	restore := followPollInterval
+	followPollInterval = 20 * time.Millisecond
+	t.Cleanup(func() { followPollInterval = restore })
+}
+
+func TestRunAttachesToEveryTaskSoStealCannotMissOne(t *testing.T) {
+	// desired_count = 2: the ALB picks which task a request lands on, so a
+	// run attached to one of them silently misses half the traffic. This is
+	// the defect v0.3b exists to fix, so the assertion is the developer's
+	// own: a request arriving at *either* task reaches their process.
+	//
+	// The poll interval is left at its production value on purpose (see
+	// shortenFollowInterval): what has to work here is the attach at
+	// startup, not the follower catching up fifteen seconds later.
+	port := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "LOCAL %s", r.URL.Path)
+	}))
+	older := startStealAgent(t)
+	newer := startStealAgent(t)
+	p := &fakeProvider{
+		region: "ap-northeast-1",
+		tasks: []transport.Task{
+			{ID: "older", SubnetID: "subnet-a", StartedAt: time.Unix(1000, 0), Addr: older.addr},
+			{ID: "newer", SubnetID: "subnet-a", StartedAt: time.Unix(2000, 0), Addr: newer.addr},
+		},
+	}
+	opts := ssmOpts("sleep", "30")
+	opts.NoIncoming = false
+	opts.LocalPort = port
+	opts.User = "shota"
+	opts.Token = "tok-shota"
+	var out safeLog
+	done, cancel := runWithCancel(t, opts, &out, depsFor(p))
+
+	for _, tk := range []struct {
+		id string
+		ag *stealAgent
+	}{{"older", older}, {"newer", newer}} {
+		// waitAttached fails the test if this task never got a session,
+		// which is exactly what attaching to tasks[0] alone would do.
+		hello := tk.ag.waitAttached(t)
+		if hello.User != "shota" || !hello.Incoming.Enabled || hello.Token != "tok-shota" {
+			t.Errorf("task %s was told user=%q incoming=%+v (token carried: %v); every task has to be told what to steal, because the ALB chooses which one gets the request",
+				tk.id, hello.User, hello.Incoming, hello.Token == "tok-shota")
+		}
+		resp, perr := tk.ag.steal(t, devRequest("GET", "/api/orders", "shota", "tok-shota"))
+		if perr != nil {
+			t.Fatalf("the CLI refused the stream from task %s: %+v", tk.id, perr)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 || !strings.Contains(string(b), "LOCAL /api/orders") {
+			t.Fatalf("a request that arrived at task %s did not reach the developer's process: status=%d body=%s", tk.id, resp.StatusCode, b)
+		}
+	}
+
+	waitFor(t, func() bool { return strings.Contains(out.String(), "▶ ") }, "the child to start")
+	if l := out.String(); !strings.Contains(l, "c/api  2 tasks (older primary, newer)") {
+		t.Errorf("the status line must say how many tasks are attached and which one is the primary:\n%s", l)
+	}
+	cancel()
+	r := <-done
+	if r.err != nil {
+		t.Errorf("the run was ended by its context, so it must report no failure: code=%d err=%v\n%s", r.code, r.err, out.String())
+	}
+	if strings.Contains(out.String(), "agent session lost") {
+		t.Errorf("no session died, so nothing may report one lost:\n%s", out.String())
+	}
+}
+
+func TestRunSurvivesASecondaryTaskGoingAway(t *testing.T) {
+	// A rolling deploy replaces tasks one at a time. Losing a secondary
+	// must not end the run - before v0.3b any session loss did, so a deploy
+	// killed the developer's session (and their child process with it)
+	// halfway through.
+	//
+	// The child ignores SIGINT and blocks until this test releases it, so
+	// whether the run ended is decided by files and by its result, not by a
+	// sleep race.
+	primary := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	secondary := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	tr := &breakableTransport{} // no addr: each task's own Addr is dialed
+	p := &fakeProvider{
+		region: "r",
+		tasks: []transport.Task{
+			{ID: "older", StartedAt: time.Unix(1000, 0), Addr: primary.addr},
+			{ID: "newer", StartedAt: time.Unix(2000, 0), Addr: secondary.addr},
+		},
+		tr: tr,
+	}
+
+	dir := t.TempDir()
+	started, release, finished := filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "finished")
+	script := writeChildScript(t, "echo up > "+started+"\n"+
+		"while [ ! -f "+release+" ]; do sleep 0.05; done\n"+
+		"echo done > "+finished+"\n")
+
+	var out safeLog
+	done, _ := runWithCancel(t, ssmOpts("/bin/sh", script), &out, depsFor(p))
+
+	waitFor(t, func() bool { return len(secondary.a.Sessions()) == 1 }, "the secondary task to be attached")
+	waitForFile(t, started)
+
+	tr.breakTask("newer")
+	// Wait for the loss to have actually happened before asserting anything
+	// about it: the agent unregisters when it notices its connection is
+	// gone, so this is the point where the secondary is provably dead
+	// rather than probably.
+	waitFor(t, func() bool { return len(secondary.a.Sessions()) == 0 }, "the secondary's session to end")
+
+	select {
+	case r := <-done:
+		t.Fatalf("the run ended when a secondary task went away (code=%d err=%v); a rolling deploy does this to every task in turn\n%s", r.code, r.err, out.String())
+	case <-time.After(300 * time.Millisecond):
+	}
+	if _, err := os.Stat(finished); err == nil {
+		t.Fatal("the child finished on its own; this test proves nothing")
+	}
+	if err := os.WriteFile(release, []byte("go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.code != 0 || r.err != nil {
+			t.Errorf("the run must end with its child and nothing else: code=%d err=%v\n%s", r.code, r.err, out.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never returned after the child finished")
+	}
+	if strings.Contains(out.String(), "agent session lost") {
+		t.Errorf("losing one task of two is not losing the session:\n%s", out.String())
+	}
+}
+
+func TestRunFailsWhenNoTaskCanBeAttached(t *testing.T) {
+	// Unchanged behaviour: zero sessions is still fatal. Attaching to every
+	// task must not turn "nothing answered" into a run that carries on with
+	// no session at all.
+	t.Run("discovery finds none", func(t *testing.T) {
+		p := &fakeProvider{region: "r", discErr: &ecsprov.NotReadyError{
+			Reasons: []string{"task t1: ECS Exec is disabled"},
+		}}
+		code, err := RunWithDeps(context.Background(), ssmOpts("true"), io.Discard, depsFor(p))
+		if code != 1 || err == nil || !strings.Contains(err.Error(), "ECS Exec is disabled") {
+			t.Fatalf("code=%d err=%v, want the discovery failure and exit 1", code, err)
+		}
+	})
+	t.Run("every task refuses the session", func(t *testing.T) {
+		p := &fakeProvider{
+			region: "r",
+			tasks: []transport.Task{
+				{ID: "older", StartedAt: time.Unix(1000, 0)},
+				{ID: "newer", StartedAt: time.Unix(2000, 0)},
+			},
+			tr: refusingTransport{},
+		}
+		var out strings.Builder
+		code, err := RunWithDeps(context.Background(), ssmOpts("true"), &out, depsFor(p))
+		if code != 1 || err == nil || !strings.Contains(err.Error(), "connect to agent") {
+			t.Fatalf("code=%d err=%v, want the dial failure and exit 1\n%s", code, err, out.String())
+		}
+		// Both failures are named: a developer whose run died has to see
+		// that it was not one task's problem.
+		for _, id := range []string{"older", "newer"} {
+			if !strings.Contains(out.String(), "task "+id+" could not be attached") {
+				t.Errorf("task %s's failure is not in the log:\n%s", id, out.String())
+			}
+		}
+		if strings.Contains(out.String(), "▶ ") {
+			t.Errorf("the child must not run with no session:\n%s", out.String())
+		}
+	})
+}
+
+func TestRunFollowsADeployByAttachingToANewTask(t *testing.T) {
+	// A deploy adds a task after the run started. The ALB will send it
+	// requests whether or not tetherd noticed, so the run has to attach to
+	// it while it is live - which is the follower, running inside Run.
+	shortenFollowInterval(t)
+	first := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	second := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	older := transport.Task{ID: "older", StartedAt: time.Unix(1000, 0), Addr: first.addr}
+	newer := transport.Task{ID: "newer", StartedAt: time.Unix(2000, 0), Addr: second.addr}
+	p := &fakeProvider{region: "r", tasks: []transport.Task{older}}
+
+	var out safeLog
+	done, cancel := runWithCancel(t, ssmOpts("sleep", "30"), &out, depsFor(p))
+	waitFor(t, func() bool { return len(first.a.Sessions()) == 1 }, "the service's only task to be attached")
+
+	// The one-task status line is what `tetherd env`, `tetherd doctor` and
+	// the AWS e2e script read, and one task must not print the plural form.
+	if l := out.String(); !strings.Contains(l, "c/api  task older  (started ") {
+		t.Errorf("the one-task status line changed shape:\n%s", l)
+	}
+	if l := out.String(); strings.Contains(l, "tasks (") {
+		t.Errorf("one task must not be reported as several:\n%s", l)
+	}
+
+	p.setTasks(older, newer)
+	waitFor(t, func() bool { return len(second.a.Sessions()) == 1 }, "the task that appeared to be attached")
+	waitFor(t, func() bool { return strings.Contains(out.String(), "task newer attached") }, "the line naming the task that appeared")
+
+	cancel()
+	r := <-done
+	if r.err != nil {
+		t.Errorf("the run was ended by its context, so it must report no failure: code=%d err=%v\n%s", r.code, r.err, out.String())
+	}
+}
+
+func TestRunPinnedToOneTaskAttachesToThatTaskOnly(t *testing.T) {
+	// --task ID is how a developer debugs one task of several - the point
+	// of it is that the other tasks are left alone, so neither the attach
+	// at startup nor the follower may reach them.
+	shortenFollowInterval(t)
+	pinned := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	other := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{region: "r", tasks: []transport.Task{
+		{ID: "older", StartedAt: time.Unix(1000, 0), Addr: other.addr},
+		{ID: "newer", StartedAt: time.Unix(2000, 0), Addr: pinned.addr},
+	}}
+	opts := ssmOpts("sleep", "30")
+	opts.TaskID = "newer"
+	var out safeLog
+	done, cancel := runWithCancel(t, opts, &out, depsFor(p))
+
+	waitFor(t, func() bool { return len(pinned.a.Sessions()) == 1 }, "the pinned task to be attached")
+	// Several poll intervals of the follower not attaching the other task.
+	if reachedWithin(300*time.Millisecond, func() bool { return len(other.a.Sessions()) > 0 }) {
+		t.Errorf("--task newer attached to task older as well:\n%s", out.String())
+	}
+	if l := out.String(); !strings.Contains(l, "c/api  task newer  (started ") {
+		t.Errorf("a pinned run is a one-task run and says so:\n%s", l)
+	}
+	cancel()
+	if r := <-done; r.err != nil {
+		t.Errorf("the run was ended by its context, so it must report no failure: code=%d err=%v\n%s", r.code, r.err, out.String())
+	}
+}
+
+func TestRunKeepsItsSessionsWhenTheTaskListCannotBeRead(t *testing.T) {
+	// A throttled ListTasks, an expired credential, a brief API outage: the
+	// poll fails and the sessions already attached are untouched by it. The
+	// failure mode this guards against is a poll that reports "no tasks"
+	// instead of an error, which would detach from every task and end the
+	// run - so the warning line is asserted too, because its absence is
+	// what that mistake looks like from here.
+	shortenFollowInterval(t)
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{region: "r", tasks: []transport.Task{
+		{ID: "older", StartedAt: time.Unix(1000, 0), Addr: ag.addr},
+	}}
+
+	dir := t.TempDir()
+	started, release, finished := filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "finished")
+	script := writeChildScript(t, "echo up > "+started+"\n"+
+		"while [ ! -f "+release+" ]; do sleep 0.05; done\n"+
+		"echo done > "+finished+"\n")
+
+	var out safeLog
+	done, _ := runWithCancel(t, ssmOpts("/bin/sh", script), &out, depsFor(p))
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 1 }, "the task to be attached")
+	waitForFile(t, started)
+
+	p.setDiscoverErr(errors.New("simulated throttling"))
+	// Not waitFor: a poll that swallows its failure - the mistake this
+	// test exists for - would stop here on a missing log line and never
+	// reach the assertions below, which are the ones about the developer's
+	// session surviving.
+	if !reachedWithin(5*time.Second, func() bool {
+		return strings.Contains(out.String(), "could not re-read the task list")
+	}) {
+		t.Errorf("a poll that failed must say so, so a developer whose steal goes stale learns why:\n%s", out.String())
+	}
+
+	select {
+	case r := <-done:
+		t.Fatalf("the run ended because the task list could not be read (code=%d err=%v); the sessions it holds are unaffected by that\n%s", r.code, r.err, out.String())
+	case <-time.After(300 * time.Millisecond):
+	}
+	if _, err := os.Stat(finished); err == nil {
+		t.Fatal("the child finished on its own; this test proves nothing")
+	}
+	if err := os.WriteFile(release, []byte("go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.code != 0 || r.err != nil {
+			t.Errorf("the run must end with its child and nothing else: code=%d err=%v\n%s", r.code, r.err, out.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never returned after the child finished")
+	}
+	if strings.Contains(out.String(), "agent session lost") {
+		t.Errorf("a poll that failed is not a session that was lost:\n%s", out.String())
+	}
 }

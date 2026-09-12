@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kyosu-1/tetherd/internal/awsid"
@@ -473,6 +474,10 @@ func (directProvider) Discover(context.Context, ecsprov.Target) (transport.Task,
 	return transport.Task{}, errors.New("--transport direct has no discovery; the task is --agent-addr itself")
 }
 
+func (directProvider) DiscoverAll(context.Context, ecsprov.Target) ([]transport.Task, error) {
+	return nil, errors.New("--transport direct has no discovery; the task is --agent-addr itself")
+}
+
 func (directProvider) VPCCIDRs(context.Context, string) ([]netip.Prefix, error) {
 	return nil, errors.New("--transport direct has no VPC to look up; use --remote-cidr")
 }
@@ -521,15 +526,80 @@ func discoverTask(ctx context.Context, opts RunOptions, d Deps, logf func(string
 		if err != nil {
 			return nil, transport.Task{}, err
 		}
-		if task.StartedAt.IsZero() {
-			logf("%s/%s  task %s", opts.Cluster, opts.Service, short(task.ID))
-		} else {
-			logf("%s/%s  task %s  (started %s ago)", opts.Cluster, opts.Service, short(task.ID), time.Since(task.StartedAt).Round(time.Minute))
-		}
+		logf("%s", targetLine(opts, []transport.Task{task}))
 		return prov, task, nil
 	default:
 		return nil, transport.Task{}, usageError{fmt.Errorf("unknown transport %q (ssm | direct)", opts.Transport)}
 	}
+}
+
+// discoverTasks is discoverTask's plural: every task `tetherd run` should
+// attach to, oldest first, and the same target line. `tetherd run` attaches
+// to all of them because the ALB chooses which task a request lands on - a
+// run attached to one of two tasks silently leaves half the traffic it was
+// asked to steal at the deployed application. `--task ID` still pins one
+// task, through Target.TaskID.
+//
+// Task 5's `status` reads its tasks from here too, rather than repeating
+// the discovery: the set of tasks `status` reports on must be the set `run`
+// would attach to.
+func discoverTasks(ctx context.Context, opts RunOptions, d Deps, logf func(string, ...any)) (awsProvider, []transport.Task, error) {
+	switch opts.Transport {
+	case "direct":
+		if opts.AgentAddr == "" {
+			return nil, nil, usageError{errors.New("--transport direct needs --agent-addr")}
+		}
+		return directProvider{}, []transport.Task{{ID: "direct", Addr: opts.AgentAddr}}, nil
+	case "ssm":
+		if opts.Cluster == "" || opts.Service == "" {
+			return nil, nil, usageError{errors.New("--transport ssm needs --cluster and --service")}
+		}
+		prov, err := d.NewAWSProvider(ctx, opts)
+		if err != nil {
+			return nil, nil, fmt.Errorf("aws config: %w", err)
+		}
+		// DiscoverAll never answers an empty slice with a nil error, so
+		// tasks[0] below (and in targetLine) is always there.
+		tasks, err := prov.DiscoverAll(ctx, ecsTarget(opts))
+		if err != nil {
+			return nil, nil, err
+		}
+		logf("%s", targetLine(opts, tasks))
+		return prov, tasks, nil
+	default:
+		return nil, nil, usageError{fmt.Errorf("unknown transport %q (ssm | direct)", opts.Transport)}
+	}
+}
+
+// targetLine is the first line `tetherd run` prints: the service, and which
+// task or tasks it is attached to.
+//
+// The one-task form is byte-for-byte what it has always been - `tetherd
+// env`, `tetherd doctor` and the AWS e2e script all read it, and a pinned
+// `--task ID` is this form too. Two or more tasks name the primary, because
+// which task serves dial, DNS and the task environment is the difference
+// between "my DNS stopped working" being one task's problem or the whole
+// service's (spec §6.3, docs/design.md §5).
+//
+// tasks must not be empty; every producer is a discovery call that reports
+// zero tasks as an error.
+func targetLine(opts RunOptions, tasks []transport.Task) string {
+	primary := tasks[0]
+	// The age is the primary's: it is the task whose environment the child
+	// is running with, and (oldest first) the one a deploy replaces last.
+	started := ""
+	if !primary.StartedAt.IsZero() {
+		started = fmt.Sprintf("  (started %s ago)", time.Since(primary.StartedAt).Round(time.Minute))
+	}
+	if len(tasks) == 1 {
+		return fmt.Sprintf("%s/%s  task %s%s", opts.Cluster, opts.Service, short(primary.ID), started)
+	}
+	ids := make([]string, 0, len(tasks))
+	ids = append(ids, short(primary.ID)+" primary")
+	for _, t := range tasks[1:] {
+		ids = append(ids, short(t.ID))
+	}
+	return fmt.Sprintf("%s/%s  %d tasks (%s)%s", opts.Cluster, opts.Service, len(tasks), strings.Join(ids, ", "), started)
 }
 
 // dialAgent opens the transport and completes the control handshake. The
@@ -562,6 +632,72 @@ func dialAgent(ctx context.Context, opts RunOptions, d Deps, prov awsProvider, t
 	}
 	return sess, nil
 }
+
+// errEverySessionGone ends the run when the last session was closed rather
+// than broken - the task left the service's task list and the Follower
+// detached from it - because session.Client.Err() is nil in that case and
+// "agent session lost: <nil>" tells a developer nothing. It is the same
+// state SessionSet.DialTCP and Resolve report as errNoPrimary: from here on
+// there is no session to dial through, so the run is over.
+var errEverySessionGone = errors.New("every task tetherd was attached to has gone away")
+
+// sessionLoss decides when `tetherd run` has lost *every* session, which is
+// the only session failure that ends the run.
+//
+// Waiting on one session's Done - what Run did when there was only ever one
+// - would end a run in the middle of a normal rolling deploy, which stops
+// tasks one at a time: losing a secondary is routine and the Follower reaps
+// it. Waiting for SessionSet.Len() to reach zero is not the same thing
+// either, because a session that dies stays in the set until something
+// removes it, and removing it from here is not allowed: SessionSet.Reap
+// belongs to the Follower's goroutine, and calling it from two goroutines
+// can drop a session that a re-attach has already replaced. So this counts
+// the sessions Run opened and watches each one's own Done.
+type sessionLoss struct {
+	mu   sync.Mutex
+	live int
+	ch   chan error
+}
+
+func newSessionLoss() *sessionLoss { return &sessionLoss{ch: make(chan error, 1)} }
+
+// watch counts s as live and, once every watched session has ended, reports
+// why the last one did on the channel lost returns.
+func (l *sessionLoss) watch(s *session.Client) {
+	l.mu.Lock()
+	l.live++
+	// A session arriving after the count had reached zero makes a pending
+	// report stale: the Follower re-attached and the run is not over.
+	// Reachable when a poll's attach races the last session's death.
+	select {
+	case <-l.ch:
+	default:
+	}
+	l.mu.Unlock()
+	go func() {
+		<-s.Done()
+		l.mu.Lock()
+		l.live--
+		last := l.live == 0
+		l.mu.Unlock()
+		if last {
+			select {
+			case l.ch <- s.Err():
+			default:
+			}
+		}
+	}()
+}
+
+// lost fires when every session Run opened has ended. Its value is why the
+// last one ended, which is nil when it was closed rather than broken.
+func (l *sessionLoss) lost() <-chan error { return l.ch }
+
+// followPollInterval is how often `tetherd run` re-reads the service's task
+// list. A var, not a const, only so a test can shorten it: 15 seconds is
+// the production value (see followInterval) and far too long to test
+// against.
+var followPollInterval = followInterval
 
 // Run connects to the agent, installs capture, runs the command and cleans
 // up. It returns the child's exit code.
@@ -596,14 +732,18 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 		onHTTP = steal.Serve
 	}
 
-	// 1. transport, task, remote set
-	prov, task, err := discoverTask(ctx, opts, d, logf)
+	// 1. transport, tasks, remote set
+	prov, tasks, err := discoverTasks(ctx, opts, d, logf)
 	if err != nil {
 		if isUsageError(err) {
 			return 2, err
 		}
 		return 1, err
 	}
+	// The oldest task is the primary: what the remote set is built from
+	// (every task in the service shares its VPC), and what SessionSet
+	// picks for dial, DNS and the task environment.
+	task := tasks[0]
 	region := opts.Region
 	if opts.Transport == "ssm" {
 		region = prov.Region()
@@ -664,13 +804,48 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 		defer hc.Close()
 	}
 
-	// 3. session
-	sess, err := dialAgent(ctx, opts, d, prov, task, logf, st.Incoming, onHTTP)
-	if err != nil {
-		return 1, err
+	// 3. sessions: one per attachable task. The ALB decides which task a
+	// request lands on, so a run attached to one task out of two would
+	// steal roughly half of what the developer asked for and leave the
+	// rest at the deployed application, silently.
+	set := &SessionSet{Logf: logf}
+	defer set.Close()
+	loss := newSessionLoss()
+	var firstDialErr error
+	for _, tk := range tasks {
+		s, derr := dialAgent(ctx, opts, d, prov, tk, logf, st.Incoming, onHTTP)
+		if derr != nil {
+			if firstDialErr == nil {
+				firstDialErr = derr
+			}
+			// Only said out loud when there is another task to carry the
+			// run: with one task the error returned below is the whole
+			// report, and printing it twice is what `tetherd run` has
+			// never done. With several, a developer whose steal is
+			// half-covered has to be told which task is missing.
+			if len(tasks) > 1 {
+				logf("⚠ session   task %s could not be attached: %v", short(tk.ID), derr)
+			}
+			continue
+		}
+		// Watched before it is added: a session that dies in between must
+		// still count, or the run could miss the loss of its last one.
+		loss.watch(s)
+		set.Add(tk, s)
 	}
-	defer sess.Close()
-	w := sess.Welcome()
+	if set.Len() == 0 {
+		// Unchanged: no session at all is fatal, with the failure that
+		// caused it. The guard is for the one way that failure can be
+		// missing - every dial succeeded and the set took none of them,
+		// which needs discovery to have named the same task twice - because
+		// exiting 1 with nothing to read would be worse than a dull
+		// message.
+		if firstDialErr == nil {
+			firstDialErr = errEverySessionGone
+		}
+		return 1, firstDialErr
+	}
+	w := set.Primary().Welcome()
 	if err := checkTargetEnv(w, opts); err != nil {
 		return 1, err
 	}
@@ -697,7 +872,65 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 	// dialed at all).
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cp := &CredProxy{Dial: sess.DialTCP, Logf: logf}
+
+	// Follow the service's task list. A rolling deploy replaces every task
+	// underneath a run, and one that kept only the sessions it opened above
+	// would end up attached to nothing while the ALB routes requests to
+	// tasks nobody is listening on - the same silent miss as attaching to
+	// one task, arriving a few minutes later. Only ssm has a task list to
+	// read: direct's single task is --agent-addr itself.
+	if opts.Transport == "ssm" {
+		f := &Follower{
+			Set:      set,
+			Interval: followPollInterval,
+			List: func(ctx context.Context) ([]transport.Task, error) {
+				// DiscoverAll, never a raw ListTasks: the Follower drops
+				// every attached task the returned list does not contain,
+				// so a successful poll that answered an empty list would
+				// tear down the whole run. DiscoverAll reports zero
+				// eligible tasks as an error instead, which the Follower
+				// treats as "keep what is attached".
+				//
+				// The ctx check is for the shutdown wait below: a poll that
+				// starts as the run ends has nothing to look up.
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				return prov.DiscoverAll(ctx, ecsTarget(opts))
+			},
+			Attach: func(ctx context.Context, tk transport.Task) (*session.Client, error) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				s, err := dialAgent(ctx, opts, d, prov, tk, logf, st.Incoming, onHTTP)
+				if err != nil {
+					return nil, err
+				}
+				// A task that appears mid-run is now one of the sessions
+				// whose loss would end the run - and the one that stops the
+				// run ending when the task it replaced dies.
+				loss.watch(s)
+				return s, nil
+			},
+			Logf: logf,
+		}
+		followed := make(chan struct{})
+		go func() { defer close(followed); f.Run(ctx) }()
+		// The wait is deliberate. Attach runs inside the poll, so Run can
+		// outlive the cancel above by one attach attempt: without the wait,
+		// a session opened by that attempt would be added to the set after
+		// the deferred Close above had emptied it - left open at the agent,
+		// which is how the next `tetherd run` gets refused with
+		// duplicate_user - and a line logged after RunWithDeps returned
+		// would be written to a stderr its caller has moved on from. The
+		// two ctx checks above keep the wait to whatever one dial has
+		// already started, and this defer is registered before the capture
+		// is installed, so it runs after pf and /etc/resolver are already
+		// down: nothing waited for here holds the developer's network.
+		defer func() { cancel(); <-followed }()
+	}
+
+	cp := &CredProxy{Dial: set.DialTCP, Logf: logf}
 	credAddr, err := cp.Start(ctx)
 	if err != nil {
 		return 1, fmt.Errorf("serve the task's credential endpoint on loopback: %w", err)
@@ -821,7 +1054,7 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 			cancel()
 			cap.Close()
 		}()
-		fw := &proxy.Forwarder{Capturer: cap, Dial: sess.DialTCP, Logf: logf}
+		fw := &proxy.Forwarder{Capturer: cap, Dial: set.DialTCP, Logf: logf}
 		go func() {
 			if err := fw.Run(ctx); err != nil && ctx.Err() == nil {
 				logf("✗ capture stopped: %v", err)
@@ -834,7 +1067,7 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 		// forwards each question to the agent (spec §3.4).
 		dnsStatus := "local"
 		if len(opts.RemoteDomains) > 0 {
-			dsrv := &dnsproxy.Server{Resolve: sess.Resolve, Logf: logf}
+			dsrv := &dnsproxy.Server{Resolve: set.Resolve, Logf: logf}
 			daddr, err := dsrv.StartPreferring(ctx, dnsproxy.DefaultPort)
 			if err != nil {
 				return 1, fmt.Errorf("start the DNS resolver: %w", err)
@@ -941,8 +1174,14 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 			return 1, err
 		}
 		return 0, nil
-	case <-sess.Done():
-		logf("✗ agent session lost: %v", sess.Err())
+	// Every session, not any session: a rolling deploy stops tasks one at a
+	// time, and the run has to survive losing a secondary - that is what
+	// v0.3b is for. Losing the last one is as fatal as it always was.
+	case err := <-loss.lost():
+		if err == nil {
+			err = errEverySessionGone
+		}
+		logf("✗ agent session lost: %v", err)
 		cancel()
 		// Not a bare return: Run's defers pull the pf rules, the helper
 		// socket and every /etc/resolver file down, and doing that while
@@ -953,7 +1192,7 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 		// wait: cancel() only asks (SIGINT), and a child that ignores it
 		// would otherwise hold `tetherd run` - and the pf rules - forever.
 		<-waitErr
-		return 1, sess.Err()
+		return 1, err
 	}
 }
 

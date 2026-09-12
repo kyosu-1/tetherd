@@ -33,6 +33,17 @@ import (
 type awsProvider interface {
 	Region() string
 	Discover(ctx context.Context, t ecsprov.Target) (transport.Task, error)
+	// DiscoverAll returns every attachable task, oldest first. `tetherd
+	// run` attaches to all of them, because the ALB chooses which task a
+	// request lands on: a run attached to one of two silently misses half
+	// the traffic it was asked to steal. Discover's single task is still
+	// what `tetherd env` and `tetherd doctor` read.
+	//
+	// It never answers an empty slice with a nil error - zero eligible
+	// tasks is an error carrying the per-task reasons - which is what
+	// makes it safe to use as Follower.List, whose removal loop drops
+	// every attached task the list does not contain.
+	DiscoverAll(ctx context.Context, t ecsprov.Target) ([]transport.Task, error)
 	VPCCIDRs(ctx context.Context, subnetID string) ([]netip.Prefix, error)
 	ServiceCIDRs(ctx context.Context, services []string) ([]netip.Prefix, error)
 	Transport(logf func(string, ...any)) transport.Transport
@@ -196,6 +207,10 @@ func (p *sdkProvider) Region() string { return p.cfg.Region }
 
 func (p *sdkProvider) Discover(ctx context.Context, t ecsprov.Target) (transport.Task, error) {
 	return ecsprov.Discover(ctx, awsecs.NewFromConfig(p.cfg), t)
+}
+
+func (p *sdkProvider) DiscoverAll(ctx context.Context, t ecsprov.Target) ([]transport.Task, error) {
+	return ecsprov.DiscoverAll(ctx, awsecs.NewFromConfig(p.cfg), t)
 }
 
 func (p *sdkProvider) VPCCIDRs(ctx context.Context, subnetID string) ([]netip.Prefix, error) {
