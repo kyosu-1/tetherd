@@ -95,17 +95,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	return second
 }
 
-// ListenAndServe listens on cfg.Control and serves until ctx is done. It
-// serves the control port only; Run is what production starts.
-func (a *Agent) ListenAndServe(ctx context.Context) error {
-	ln, err := net.Listen("tcp", a.cfg.Control)
-	if err != nil {
-		return err
-	}
-	a.logf("control listening on %s (env=%s)", ln.Addr(), a.cfg.Env)
-	return a.Serve(ctx, ln)
-}
-
 // Serve accepts sessions on ln.
 func (a *Agent) Serve(ctx context.Context, ln net.Listener) error {
 	go func() {
