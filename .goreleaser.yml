@@ -1,0 +1,43 @@
+version: 2
+before:
+  hooks:
+    - go mod tidy
+    - make lint
+    - go test -race ./...
+
+builds:
+  - id: tetherd
+    main: ./cmd/tetherd
+    binary: tetherd
+    env: [CGO_ENABLED=0]
+    goos: [darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X github.com/kyosu-1/tetherd/internal/version.Version={{.Version}}
+  - id: tetherd-helper
+    main: ./cmd/tetherd-helper
+    binary: tetherd-helper
+    env: [CGO_ENABLED=0]
+    goos: [darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X github.com/kyosu-1/tetherd/internal/version.Version={{.Version}}
+  - id: tetherd-exec
+    main: ./cmd/tetherd-exec
+    binary: tetherd-exec
+    env: [CGO_ENABLED=0]
+    goos: [darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X github.com/kyosu-1/tetherd/internal/version.Version={{.Version}}
+
+archives:
+  - ids: [tetherd, tetherd-helper, tetherd-exec]
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:"]

@@ -45,3 +45,14 @@ push-images:
 	@test -n "$(ECR_REGISTRY)" || { echo "ECR_REGISTRY is required"; exit 2; }
 	docker buildx build --platform $(PLATFORMS) -f deploy/docker/agent.Dockerfile -t $(ECR_REGISTRY)/tetherd-agent:$(TAG) --push .
 	docker buildx build --platform $(PLATFORMS) -f deploy/docker/sampleapp.Dockerfile -t $(ECR_REGISTRY)/tetherd-sampleapp:$(TAG) --push .
+
+# goreleaser はこのリポジトリの依存ではないので go run で固定版を使う
+# (go run pkg@version は go.mod を変更しない)。
+GORELEASER := go run github.com/goreleaser/goreleaser/v2@v2.18.1
+
+.PHONY: release-check release-dry-run
+release-check:
+	$(GORELEASER) check
+
+release-dry-run:
+	$(GORELEASER) release --snapshot --clean --skip=publish
