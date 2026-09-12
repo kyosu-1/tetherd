@@ -197,7 +197,7 @@ func TestRenderWholeReportOfABrokenMachine(t *testing.T) {
 ✓ attachable task         abc (started 2026-09-12 14:05)
 ✗ pidMode                 the task definition sets pidMode ""
                           → set "pidMode": "task" on the task definition, or run with --no-env
-? task role               the task's credentials reached tetherd (via 127.0.0.1:51234 → the task) but sts:GetCallerIdentity could not confirm whose they are: dial tcp: i/o timeout
+? task role               not checked: the task's credentials reached tetherd (via 127.0.0.1:51234 → the task) but sts:GetCallerIdentity could not confirm whose they are: dial tcp: i/o timeout
                           → check this machine can reach sts.<region>.amazonaws.com; the credentials themselves arrived, so the child would hold the task role whatever STS says
 ⚠ local addresses         en0 10.0.3.14/24 overlaps 10.0.0.0/16
                           → add the overlapping range to local_cidrs in .tetherd.yml

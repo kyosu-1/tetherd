@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 
 	"github.com/kyosu-1/tetherd/internal/agent"
+	"github.com/kyosu-1/tetherd/internal/doctor"
 	"github.com/kyosu-1/tetherd/internal/session"
 	"github.com/kyosu-1/tetherd/internal/transport"
 	ssmtr "github.com/kyosu-1/tetherd/internal/transport/ssm"
@@ -122,7 +123,57 @@ func wantRowSet(t *testing.T, out string) []doctorRow {
 	if got[len(got)-1] != "remote domains" {
 		t.Fatalf("the remote domains row must be printed last: %v", got)
 	}
+	wantUncheckedRowsSaySo(t, rows, out)
+	wantNoStrayLines(t, out)
 	return rows
+}
+
+// wantUncheckedRowsSaySo pins what the ? mark promises: a row that could not
+// be checked says "not checked:" first, and no other row claims to be
+// unchecked. It is asserted on every report the tests render rather than in
+// one place, because the invariant is what makes the new status
+// self-describing - a reader who has seen one ? row knows what the next one
+// means - and because a row that drifted onto the wrong status is exactly the
+// bug doctor.Unknown exists to prevent.
+//
+// The prefix, not Contains: CheckDomains' *failure* arm appends
+// "; not checked: <domains>" to name the names it never got to, which is a
+// ✗ row honestly reporting a gap inside itself, not a row claiming it was
+// not checked.
+func wantUncheckedRowsSaySo(t *testing.T, rows []doctorRow, out string) {
+	t.Helper()
+	for _, r := range rows {
+		said := strings.HasPrefix(r.detail, "not checked:")
+		switch {
+		case r.mark == "?" && !said:
+			t.Errorf("the %q row is ? but does not say what was not checked: %q\n%s", r.name, r.detail, out)
+		case r.mark != "?" && said:
+			t.Errorf("the %q row says it was not checked but is marked %q, not ?: %q\n%s", r.name, r.mark, r.detail, out)
+		}
+	}
+}
+
+// wantNoStrayLines pins that every line of the report is a row or that row's
+// next step. Nothing else may appear, because a detail (or a next step) with
+// a newline in it prints as extra lines in the middle of the table - and
+// parseDoctorRows splits on "\n" before anything can be asserted about it, so
+// those lines vanish from every parsed-row assertion. That is not
+// hypothetical: the one assertion written for it read the parsed row's detail
+// and could never have been true, and dropping the firstLine call it was
+// guarding survived the whole suite.
+func wantNoStrayLines(t *testing.T, out string) {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if mark, _, _ := strings.Cut(line, " "); mark == "✓" || mark == "⚠" || mark == "✗" || mark == "?" {
+			continue
+		}
+		// A next step: two leading spaces, the name column's width of
+		// blanks, then the arrow.
+		if strings.HasPrefix(line, "  ") && strings.Contains(line, "→ ") {
+			continue
+		}
+		t.Errorf("stray line in the report - a detail or next step with a newline in it? %q\n%s", line, out)
+	}
 }
 
 func wantMarks(t *testing.T, rows []doctorRow, want map[string]string) {
@@ -1377,6 +1428,102 @@ func TestDoctorDoesNotFailTheTaskRoleWhenSTSCannotBeAsked(t *testing.T) {
 	}
 }
 
+// TestDoctorRoutesTheTaskRoleClocksToTheirOwnLeg: the row has two legs with
+// two different meanings, and a bound that expires on either arrives as
+// nothing but "context deadline exceeded" - which names neither the leg nor
+// the clock. The sibling rows each have a test for this
+// (TestDoctorRoutesAWSTimeoutsToTheirOwnRow,
+// TestDoctorRoutesAnAgentTimeoutToItsOwnRow); without one here, deleting
+// both names left the whole suite green.
+//
+// The legs are deliberately graded apart. The fetch is the child's own path,
+// so its clock is a failure: nothing came back over the path the child would
+// use. sts:GetCallerIdentity leaves the laptop for sts.<region>.amazonaws.com,
+// so its clock is a ? - the credentials did arrive, and the child can sign
+// with them whatever STS says.
+func TestDoctorRoutesTheTaskRoleClocksToTheirOwnLeg(t *testing.T) {
+	const bound = 500 * time.Millisecond
+
+	t.Run("the credential endpoint", func(t *testing.T) {
+		hang := make(chan struct{})
+		t.Cleanup(func() { close(hang) })
+		dial := credEndpointDialer(t, func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-hang:
+			case <-r.Context().Done():
+			}
+		})
+		ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil, dial)
+		d := healthyDoctorDeps(healthyProvider(ag.addr))
+		d.CallerIdentity = func(context.Context, aws.Credentials, string) (string, error) {
+			t.Error("STS must not be asked about credentials that never arrived")
+			return "", nil
+		}
+		opts := doctorOpts()
+		opts.Timeout = bound
+
+		var out strings.Builder
+		code, err := DoctorRunWithDeps(context.Background(), opts, &out, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := findRow(t, wantRowSet(t, out.String()), "task role")
+		if r.mark != "✗" {
+			t.Fatalf("task role = %q %q, want ✗: nothing came back over the path the child would use", r.mark, r.detail)
+		}
+		// The clock is named, and named as this leg's: "context deadline
+		// exceeded" would leave a developer unable to tell which of the two
+		// calls the row is talking about.
+		if !strings.Contains(r.detail, "the task's credential endpoint") || !strings.Contains(r.detail, "did not answer") {
+			t.Errorf("the detail must name the leg that ran out of time and its bound, got %q", r.detail)
+		}
+		if strings.Contains(r.detail, "context deadline exceeded") {
+			t.Errorf("the raw clock error must not reach the report: %q", r.detail)
+		}
+		if code != 1 {
+			t.Fatalf("code = %d, want 1\n%s", code, out.String())
+		}
+	})
+
+	t.Run("sts", func(t *testing.T) {
+		dial := credEndpointDialer(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Write([]byte(taskCredentials))
+		})
+		ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil, dial)
+		d := healthyDoctorDeps(healthyProvider(ag.addr))
+		d.CallerIdentity = func(ctx context.Context, _ aws.Credentials, _ string) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		opts := doctorOpts()
+		opts.Timeout = bound
+
+		var out strings.Builder
+		code, err := DoctorRunWithDeps(context.Background(), opts, &out, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := findRow(t, wantRowSet(t, out.String()), "task role")
+		if r.mark != "?" {
+			t.Fatalf("task role = %q %q, want ?: the credentials arrived, only their owner is unknown", r.mark, r.detail)
+		}
+		if !strings.Contains(r.detail, "with the task's credentials") || !strings.Contains(r.detail, "did not answer") {
+			t.Errorf("the detail must name the STS call that ran out of time and its bound, got %q", r.detail)
+		}
+		if strings.Contains(r.detail, "context deadline exceeded") {
+			t.Errorf("the raw clock error must not reach the report: %q", r.detail)
+		}
+		// The fact that was established must survive the clock: the child
+		// would hold the task role either way.
+		if !strings.Contains(r.detail, "reached tetherd") {
+			t.Errorf("the row must still say the credentials arrived: %q", r.detail)
+		}
+		if code != 0 {
+			t.Fatalf("code = %d, want 0: an STS that did not answer is not a broken setup\n%s", code, out.String())
+		}
+	})
+}
+
 // TestDoctorChecksWhereAStolenRequestWouldGo: steal is on by default and the
 // agent is on the ALB's data path whether or not anyone is listening here,
 // so a laptop with no server on the local port answers its own stolen
@@ -1487,13 +1634,220 @@ func TestDoctorSaysItCouldNotCheckStealWithoutTheSettings(t *testing.T) {
 	if r.mark != "?" || !strings.Contains(r.detail, "not checked") {
 		t.Fatalf("steal = %q %q, want ? (could not be checked)", r.mark, r.detail)
 	}
-	// One line: errNoStealToken carries run's own multi-line advice, and a
-	// table cannot hold it.
-	if strings.Contains(r.detail, "\n") {
-		t.Errorf("a row's detail must be one line, got %q", r.detail)
-	}
 	if !strings.Contains(r.next, "incoming.local_port") {
 		t.Errorf("the next step must say where the settings come from, got %q", r.next)
+	}
+	// One line, asserted on the raw report and by position.
+	// errNoStealToken carries run's own multi-line advice - three lines, the
+	// last two indented for a terminal - and a table cannot hold it. The
+	// obvious assertion ("the detail has no newline in it") cannot fail,
+	// because parseDoctorRows splits the report on "\n" first and hands back
+	// a detail that was already cut at the first one: it was written, it ran,
+	// and dropping the firstLine call it was guarding changed nothing. What
+	// does catch it is the line that follows the row: it must be this row's
+	// next step, not the rest of the detail.
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	at := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, "? steal") {
+			at = i
+		}
+	}
+	if at < 0 {
+		t.Fatalf("no steal row in the raw report:\n%s", out.String())
+	}
+	if !strings.Contains(lines[at], "no steal token") {
+		t.Errorf("the refusal must be on the row's own line, got %q", lines[at])
+	}
+	if at+1 >= len(lines) || !strings.Contains(lines[at+1], "→ ") {
+		t.Errorf("the line after the steal row must be its next step, not the rest of a multi-line detail: %q\n%s", lines[at+1], out.String())
+	}
+}
+
+// TestDoctorDoesNotCallAClockAnEmptyPort: a connect that never came back is
+// not a port with nothing on it. Every other row in doctor.go routes its
+// clock (isContextError / isCheckTimeout) so that a bound does not arrive
+// dressed as a finding; this row dialed and read any error as "nothing is
+// listening", which is a verdict about a port that may well have a server on
+// it - and this test has one, so the ⚠ would be a lie about a measurement
+// doctor never took.
+//
+// The budget is spent before the row is reached (a blocking LookPath, as in
+// TestDoctorStopsAtTheOverallBudget), which is the reachable shape: the
+// connect's own context is already dead, so nothing is dialed at all.
+func TestDoctorDoesNotCallAClockAnEmptyPort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	d := healthyDoctorDeps(healthyProvider(ag.addr))
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	d.LookPath = func(string) (string, error) {
+		select {
+		case <-time.After(8 * time.Second):
+		case <-release:
+		}
+		return "/opt/homebrew/bin/session-manager-plugin", nil
+	}
+
+	opts := doctorOpts()
+	opts.NoIncoming = false
+	opts.Token = "a-token"
+	opts.LocalPort = port
+	// Generous per check, so only the overall budget can be what ends the
+	// report - the same split TestDoctorStopsAtTheOverallBudget uses.
+	opts.Timeout = 5 * time.Second
+	opts.Budget = 300 * time.Millisecond
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := findRow(t, wantRowSet(t, out.String()), "steal")
+	if r.mark == "⚠" {
+		t.Fatalf("a port with a listener on it was reported as empty: %q %q", r.mark, r.detail)
+	}
+	if r.mark != "?" {
+		t.Fatalf("steal = %q %q, want ? (the clock, not a verdict)", r.mark, r.detail)
+	}
+	for _, never := range []string{"nothing is listening", "502"} {
+		if strings.Contains(r.detail, never) {
+			t.Errorf("a clock must not be reported as a finding about the port: %q", r.detail)
+		}
+	}
+	// It still names the port, so the developer knows which one was not
+	// reached, and the next step is about the clock rather than about
+	// starting a server.
+	if !strings.Contains(r.detail, fmt.Sprint(port)) {
+		t.Errorf("the row must name the port it could not reach: %q", r.detail)
+	}
+	if strings.Contains(r.next, "--no-incoming") {
+		t.Errorf("nothing here says steal is misconfigured: %q", r.next)
+	}
+	// The budget still fails the report - through the row it actually cut
+	// short, not through this one.
+	if code != 1 {
+		t.Fatalf("code = %d, want 1 (the plugin row the budget cut short)\n%s", code, out.String())
+	}
+	plugin := findRow(t, wantRowSet(t, out.String()), "session-manager-plugin")
+	if plugin.mark != "✗" {
+		t.Errorf("session-manager-plugin = %q, want ✗: that is the row the budget cut short", plugin.mark)
+	}
+	// And it must not borrow the ? rows' wording while doing it: a row the
+	// budget cut short fails on purpose, so a detail that reads "not
+	// checked" would say the opposite of the mark beside it.
+	if strings.Contains(plugin.detail, "not checked") {
+		t.Errorf("a ✗ row must not say it was not checked: %q", plugin.detail)
+	}
+}
+
+// TestCheckTimedOutKeepsTheUncheckedWordingForUncheckedRows: "not checked" is
+// what a ? row says, and only a ? row - that is the rule
+// wantUncheckedRowsSaySo asserts across the report. This error's two messages
+// are the wording most at risk of breaking it, because most of what carries
+// them is timedOut, which is a ✗ deliberately (an incomplete report that
+// exited 0 would tell a script the machine is fine), and because one of them
+// used to read "<what> was not checked: tetherd doctor ran out of time".
+func TestCheckTimedOutKeepsTheUncheckedWordingForUncheckedRows(t *testing.T) {
+	spent, cancel := context.WithCancel(context.Background())
+	cancel()
+	budgetGone := checkTimedOut(spent, "the plugin lookup", time.Second)
+	live := checkTimedOut(context.Background(), "the plugin lookup", time.Second)
+
+	for _, e := range []*checkTimeout{budgetGone, live} {
+		if strings.Contains(e.Error(), "not checked") {
+			t.Errorf("a clock that ends in a ✗ row must not say it was not checked: %q", e.Error())
+		}
+		if !strings.Contains(e.Error(), "the plugin lookup") {
+			t.Errorf("the message must name what did not answer: %q", e.Error())
+		}
+	}
+	// Each still says why the wait ended, which is the whole reason this
+	// error exists rather than "context deadline exceeded".
+	if !strings.Contains(budgetGone.Error(), "ran out of time") {
+		t.Errorf("the budget's message must say the report ran out of time: %q", budgetGone.Error())
+	}
+	if !strings.Contains(live.Error(), "within 1s") {
+		t.Errorf("the per-check message must name the bound it exceeded: %q", live.Error())
+	}
+	if budgetGone.Error() == live.Error() {
+		t.Error("the two clocks must read differently: one is this check, the other the whole report")
+	}
+	// The row it becomes: a failure, and one that says what to do.
+	r := timedOut("session-manager-plugin", budgetGone)
+	if r.Status != doctor.Fail {
+		t.Errorf("a check that never answered is a failure, got %v", r.Status)
+	}
+	if strings.HasPrefix(r.Detail, "not checked:") {
+		t.Errorf("wantUncheckedRowsSaySo would reject this row: %q", r.Detail)
+	}
+}
+
+// TestDoctorProbesTheStealPortByConnectingAndSendingNothing pins the two
+// rules the probe is written to: it connects (rather than trying to bind the
+// port, which is a different question and would take the port away from the
+// server the developer is about to start), and it writes nothing (a probe
+// that spoke HTTP would land in the developer's own access log as a request
+// they did not make).
+//
+// Both are invisible in the row: a bind probe would print the same ✓ here,
+// and so would one that sent a GET. The developer's own listener is the only
+// place the difference shows, so this test is that listener.
+func TestDoctorProbesTheStealPortByConnectingAndSendingNothing(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	read := make(chan int, 4)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Whatever the probe sent, if anything. A closed connection
+			// reads 0 bytes and EOF; a probe that wrote a request line
+			// reads more.
+			c.SetReadDeadline(time.Now().Add(2 * time.Second))
+			var buf [1]byte
+			n, _ := c.Read(buf[:])
+			read <- n
+			c.Close()
+		}
+	}()
+
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	opts := doctorOpts()
+	opts.NoIncoming = false
+	opts.Token = "a-token"
+	opts.LocalPort = port
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(healthyProvider(ag.addr)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	}
+	if m := findRow(t, wantRowSet(t, out.String()), "steal").mark; m != "✓" {
+		t.Fatalf("steal = %q, want ✓", m)
+	}
+	select {
+	case n := <-read:
+		if n != 0 {
+			t.Errorf("the probe wrote %d byte(s) to the developer's process; it must send nothing", n)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("nothing ever connected to the local port: the row must be judged by connecting to it, not by trying to bind it")
 	}
 }
 

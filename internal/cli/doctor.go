@@ -618,20 +618,23 @@ func taskRoleRow(ctx context.Context, timeout time.Duration, d Deps, sess *sessi
 // exists precisely to answer that one.
 //
 // A refusal from stealSettings is reported as not checked rather than as a
-// failure, and that is about what reaches these options rather than about
-// the setup: `tetherd doctor` registers none of run's incoming flags, so it
-// does not call applyIncoming (whose changed() guards panic on a command
-// without them) and the token, the port and the header names arrive only
-// from an in-process caller. Until newDoctorCommand applies those keys, a
-// machine with a perfectly good token in ~/.tetherd/config.yml would be told
-// it has none - a failing row on every machine, which is worse than no row.
-// Once they are applied this arm becomes reachable only for settings that
-// really are wrong, and `tetherd run` refuses on them the same way.
+// failure: what is wrong is the settings a run would be given, and doctor
+// cannot tell where a stolen request would go without them. The settings
+// themselves arrive from the config files (newDoctorCommand calls
+// applySharedIncoming and applyIncomingPort), so this arm is reachable only
+// for a value that really is wrong - an incoming.local_port that is not a
+// port number - and `tetherd run` refuses on it the same way. A missing
+// token is not reachable through the CLI at all, because applyConfig's
+// EnsurePersonal mints one into any personal file that lacks it; it is
+// still handled, for an in-process caller and for a file that somehow
+// carries an empty token.
 //
 // The listener is probed by connecting, not by trying to bind: binding is
 // the wrong question (a port can be in use by something that is not
 // listening for this) and would take the port away from the server the
-// developer is about to start. Connecting is what a stolen request does.
+// developer is about to start. Connecting is what a stolen request does,
+// and nothing is written on the connection - a probe that spoke HTTP would
+// land in the developer's own access log as a request they did not make.
 func stealRow(ctx context.Context, timeout time.Duration, opts RunOptions) doctor.Result {
 	st, err := stealSettings(opts)
 	if err != nil {
@@ -647,18 +650,35 @@ func stealRow(ctx context.Context, timeout time.Duration, opts RunOptions) docto
 	}
 	listening := false
 	if st.Incoming.Enabled {
-		addr := fmt.Sprintf("127.0.0.1:%d", st.LocalPort)
-		c, derr := bounded(ctx, timeout, addr,
+		// The same address CheckSteal names and StealServer dials, and it
+		// goes to bounded as the thing that did not answer, so a clock's
+		// message names the port rather than "the local port".
+		dst := fmt.Sprintf("127.0.0.1:%d", st.LocalPort)
+		c, derr := bounded(ctx, timeout, "a connect to "+dst,
 			func(c context.Context) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(c, "tcp", addr)
+				return (&net.Dialer{}).DialContext(c, "tcp", dst)
 			},
 			func(c net.Conn) { c.Close() })
-		if derr == nil {
-			// Nothing is sent: that something accepted is the whole fact,
-			// and a probe that spoke HTTP would land in the developer's own
-			// access log as a request they did not make.
+		switch {
+		case derr == nil:
+			// Nothing is sent: that something accepted is the whole fact.
 			c.Close()
 			listening = true
+		case isCheckTimeout(derr) || isContextError(derr):
+			// A clock, not a measurement. A connect to this machine either
+			// answers or is refused in microseconds, so the only ways here
+			// are the per-check bound, the report's budget having already
+			// run out, or something local dropping the packets - and in
+			// none of them did doctor learn whether anything is listening.
+			// Reporting that as "nothing is listening" is a verdict about a
+			// port that may well have a server on it: the same false green
+			// as the rows that route their clocks, in the other direction.
+			return doctor.Result{
+				Name:   "steal",
+				Status: doctor.Unknown,
+				Detail: "not checked: " + derr.Error(),
+				Next:   "run tetherd doctor again (or with a longer --timeout); a connect to your own machine that neither answers nor is refused means something local is dropping it, not that the port is empty",
+			}
 		}
 	}
 	return doctor.CheckSteal(st.Incoming, st.LocalPort, listening)
@@ -699,9 +719,17 @@ func isCheckTimeout(err error) bool {
 
 // checkTimedOut names what did not answer and why the wait ended. The raw
 // error at hand is only ever "context deadline exceeded", which says neither.
+//
+// Neither message says "not checked", and that is a rule rather than a
+// choice of words: a row whose detail starts with "not checked:" is a `?`
+// row that does not fail the command (doctor.Unknown), and most of what this
+// error ends up in is a `✗` row from timedOut, deliberately - an incomplete
+// report that exited 0 would tell a script the machine is fine. The one
+// place it does reach a `?` row (stealRow's clock arm) adds the prefix
+// itself.
 func checkTimedOut(ctx context.Context, what string, timeout time.Duration) *checkTimeout {
 	if ctx.Err() != nil {
-		return &checkTimeout{msg: what + " was not checked: tetherd doctor ran out of time"}
+		return &checkTimeout{msg: what + " did not answer before tetherd doctor ran out of time"}
 	}
 	return &checkTimeout{msg: fmt.Sprintf("%s did not answer within %s", what, timeout)}
 }

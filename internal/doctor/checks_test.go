@@ -351,6 +351,60 @@ func TestCheckCredentialEndpoint(t *testing.T) {
 	if !strings.Contains(unknown.Detail, "reached tetherd") {
 		t.Errorf("the row must say the credentials arrived: %q", unknown.Detail)
 	}
+	// And it says what it could not check, in the words every ? row uses
+	// (see TestEveryUncheckedRowSaysSoInTheSameWords).
+	if !strings.HasPrefix(unknown.Detail, "not checked:") {
+		t.Errorf("a ? row must say so first: %q", unknown.Detail)
+	}
+}
+
+// TestEveryUncheckedRowSaysSoInTheSameWords: the ? mark is only worth having
+// if it means one thing, and a reader who has seen one ? row should know what
+// the next one is telling them. So the rule is exact - an Unknown result's
+// detail starts with "not checked:", and no other status' does - and it is
+// asserted here for the checks and in internal/cli's wantRowSet for the whole
+// report, because the rows come from both halves.
+//
+// The prefix, not Contains: CheckDomains' failure arm appends
+// "; not checked: <domains>" to name what it never got to, which is a ✗ row
+// honestly reporting a gap inside itself rather than a row that was not
+// checked.
+func TestEveryUncheckedRowSaysSoInTheSameWords(t *testing.T) {
+	for _, r := range []Result{
+		CheckCredentialEndpoint("127.0.0.1:1", "/v2/credentials/x", "", nil, errors.New("i/o timeout")),
+		CheckDomains([]string{"a.internal"}, nil),
+		CheckDomains([]string{"a.internal", "b.internal"}, map[string]DomainProbe{"a.internal": {NotFound: true}}),
+	} {
+		if r.Status != Unknown {
+			t.Fatalf("%q: premise wrong, this is not an unchecked row: %+v", r.Name, r)
+		}
+		if !strings.HasPrefix(r.Detail, "not checked:") {
+			t.Errorf("%q is ? but does not say what was not checked: %q", r.Name, r.Detail)
+		}
+	}
+	const g = 309
+	for _, r := range []Result{
+		CheckHelper("1", nil),
+		CheckHelper("", errors.New("no such file")),
+		CheckExecSetgid("/x", 0o755, g, g, true, nil),
+		CheckIdentity("", errors.New("no credentials")),
+		CheckCredentialEndpoint("", "", "", nil, nil),
+		CheckCredentialEndpoint("127.0.0.1:1", "/v2/credentials/x", "", errors.New("HTTP 502"), nil),
+		CheckCredentialEndpoint("127.0.0.1:1", "/v2/credentials/x", "arn", nil, nil),
+		CheckSteal(proto.Incoming{}, 0, false),
+		CheckSteal(proto.Incoming{Enabled: true, Header: "X-Dev-User", TokenHeader: "X-Dev-Token"}, 8080, false),
+		CheckOverlap([]string{"en0 10.0.3.14/24 overlaps 10.0.0.0/16"}),
+		// The failure arm that names unchecked domains inside a ✗ row: it
+		// must stay legal, and it is why the rule is a prefix.
+		CheckDomains([]string{"a.internal", "b.internal"}, map[string]DomainProbe{"a.internal": {Err: errors.New("session closed")}}),
+	} {
+		if r.Status == Unknown {
+			t.Fatalf("%q: premise wrong, this is an unchecked row: %+v", r.Name, r)
+		}
+		if strings.HasPrefix(r.Detail, "not checked:") {
+			t.Errorf("%q says it was not checked but is %v, not Unknown: %q", r.Name, r.Status, r.Detail)
+		}
+	}
 }
 
 // Steal is on by default and the agent is on the ALB's data path whether or

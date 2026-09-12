@@ -23,11 +23,18 @@ import (
 // from the second, and the same finding (LocalOverlaps') reached them under
 // two marks and two nouns.
 //
-// The marks are also `tetherd run`'s: run prints its warnings as ⚠, so a
-// finding that both commands can make now looks the same in both. Only Fail
-// is counted by Render, so an Unknown row never fails the command - which is
-// the other half of the separation: a row that says nothing must not decide
-// the exit code.
+// ⚠ is `tetherd run`'s mark for a warning, which is what makes the one
+// finding both commands really do print - the overlap between the captured
+// set and this machine's own addresses - read the same in both. That is the
+// whole of the claim: it is not a promise that a fact the two commands
+// share gets the same mark. The task role row answers with ✗ or ? where
+// run's iam line prints ⚠ for the same two facts, deliberately, because run
+// has already decided to start the child and is reporting what it found,
+// while doctor is being asked whether the setup works at all.
+//
+// Only Fail is counted by Render, so an Unknown row never fails the command
+// - which is the other half of the separation: a row that says nothing must
+// not decide the exit code.
 type Status int
 
 const (

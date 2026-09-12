@@ -250,7 +250,12 @@ func CheckCredentialEndpoint(addr, credPath, arn string, credsErr, identityErr e
 	}
 	if identityErr != nil {
 		r.Status = Unknown
-		r.Detail = fmt.Sprintf("the task's credentials reached tetherd (via %s → the task) but sts:GetCallerIdentity could not confirm whose they are: %v", addr, identityErr)
+		// "not checked:" first, because that is what the ? mark promises a
+		// reader across the whole report: every Unknown row says so in the
+		// same words, and no other row does. What was not checked here is
+		// *whose* the credentials are - that they arrived is established,
+		// and the rest of the line says so.
+		r.Detail = fmt.Sprintf("not checked: the task's credentials reached tetherd (via %s → the task) but sts:GetCallerIdentity could not confirm whose they are: %v", addr, identityErr)
 		r.Next = "check this machine can reach sts.<region>.amazonaws.com; the credentials themselves arrived, so the child would hold the task role whatever STS says"
 		return r
 	}
