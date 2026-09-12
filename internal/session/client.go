@@ -30,11 +30,27 @@ type Options struct {
 	MaxMissed    int           // default 3
 	// OnHTTP is called on its own goroutine for each inbound stream whose
 	// header is proto.TypeHTTP, after that header has been read; the
-	// callback then owns the stream, including closing it. nil means this
-	// CLI does not accept steal (`tetherd run --no-incoming`): such a
+	// callback then owns the stream, including closing it and setting any
+	// deadlines it wants (the header timeout is cleared first). nil means
+	// this CLI does not accept steal (`tetherd run --no-incoming`): such a
 	// stream is answered with proto.TypeError and closed, so the agent's
 	// proxy learns why instead of waiting on a stream nobody will read.
+	//
+	// It should not panic - but if it does, the session survives and the
+	// stream is closed, because a panic here would otherwise take down the
+	// whole of `tetherd run`. The header itself is not passed: see
+	// proto.HTTPHeader.
+	//
+	// It must not be the place the CLI decides whether to accept steal at
+	// all. That decision travels to the agent in proto.Hello.Incoming;
+	// refusing here is the backstop for the two disagreeing.
 	OnHTTP func(stream net.Conn)
+	// InboundHeaderTimeout bounds how long an inbound stream may go without
+	// sending its one-line header before the CLI gives up and closes it, so
+	// an agent that opens a stream and then fails before writing cannot
+	// park a goroutine for the life of the session. Default 10s, matching
+	// the bound Resolve puts on its own reply.
+	InboundHeaderTimeout time.Duration
 }
 
 // Client is the CLI side of one session.
@@ -58,6 +74,9 @@ func Dial(ctx context.Context, conn net.Conn, hello proto.Hello, opts Options) (
 	}
 	if opts.MaxMissed == 0 {
 		opts.MaxMissed = 3
+	}
+	if opts.InboundHeaderTimeout == 0 {
+		opts.InboundHeaderTimeout = 10 * time.Second
 	}
 	cfg := yamux.DefaultConfig()
 	cfg.LogOutput = io.Discard
@@ -106,24 +125,28 @@ func Dial(ctx context.Context, conn net.Conn, hello proto.Hello, opts Options) (
 	go c.pingLoop(opts)
 	// The agent may push a stream at any moment from here on (v0.3a steal),
 	// so the accept loop is permanent rather than started on demand.
-	go c.acceptLoop(opts.OnHTTP)
+	go c.acceptLoop(opts.OnHTTP, opts.InboundHeaderTimeout)
 	return c, nil
 }
 
 // acceptLoop serves streams the agent opens. Each one is handled on its own
 // goroutine: a slow steal must not block the next request, and the session's
 // control loop must not be blocked at all.
-func (c *Client) acceptLoop(onHTTP func(net.Conn)) {
+func (c *Client) acceptLoop(onHTTP func(net.Conn), headerTimeout time.Duration) {
 	for {
 		s, err := c.mux.AcceptStream()
 		if err != nil {
 			return // the session is going away; readLoop reports why
 		}
-		go c.serveInbound(s, onHTTP)
+		go c.serveInbound(s, onHTTP, headerTimeout)
 	}
 }
 
-func (c *Client) serveInbound(s net.Conn, onHTTP func(net.Conn)) {
+func (c *Client) serveInbound(s net.Conn, onHTTP func(net.Conn), headerTimeout time.Duration) {
+	// Bounded like every other read in this file: an agent that opens a
+	// stream and then fails before writing its header must not park this
+	// goroutine for the life of the session.
+	s.SetReadDeadline(time.Now().Add(headerTimeout))
 	typ, _, err := proto.ReadHeader(s)
 	if err != nil {
 		s.Close()
@@ -131,7 +154,11 @@ func (c *Client) serveInbound(s net.Conn, onHTTP func(net.Conn)) {
 	}
 	switch {
 	case typ == proto.TypeHTTP && onHTTP != nil:
-		onHTTP(s) // owns s, including closing it
+		// The handler owns the stream from here, including its deadlines: a
+		// stolen websocket or a slow endpoint must not be cut off by the
+		// bound that only ever applied to the header.
+		s.SetReadDeadline(time.Time{})
+		callOnHTTP(s, onHTTP) // onHTTP owns s, including closing it
 	case typ == proto.TypeHTTP:
 		// A distinct code from the unknown-type case below: the agent's
 		// proxy passes the request to the application on CodeNoIncoming,
@@ -150,6 +177,23 @@ func (c *Client) serveInbound(s net.Conn, onHTTP func(net.Conn)) {
 		})
 		s.Close()
 	}
+}
+
+// callOnHTTP runs the CLI's steal handler and survives its panics. The
+// session layer owns this goroutine, so it owns the recover: `tetherd run`
+// is also the DNS proxy, the packet capture, the credential endpoint and the
+// developer's wrapped child process, and none of them should die because a
+// handler panicked over a stream whose bytes a remote party shaped.
+// net/http.Server recovers per connection for exactly this reason. The
+// stream is closed on the way out so the agent's proxy learns the request is
+// not coming back instead of waiting out its own deadline.
+func callOnHTTP(s net.Conn, onHTTP func(net.Conn)) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.Close()
+		}
+	}()
+	onHTTP(s)
 }
 
 // Welcome returns the agent's welcome message.

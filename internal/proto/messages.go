@@ -46,8 +46,22 @@ const (
 	// and the agent's proxy must quietly serve the request from the
 	// application, whereas CodeBadHello on an http stream means the CLI did
 	// not recognise the stream type at all — a bug, or a newer agent
-	// talking to an older CLI. An older CLI that predates this code answers
-	// CodeBadHello, which reads correctly as the second case.
+	// talking to an older CLI.
+	//
+	// A CLI older than this milestone answers NEITHER code: it has no
+	// accept loop at all, so opening the stream and writing the header both
+	// succeed and the reply simply never arrives (measured — see
+	// TestAPreAcceptLoopCLIAnswersAnHTTPStreamWithNothing). Whoever opens an
+	// http stream must therefore bound its own read of the reply; a missing
+	// reply is not an impossible case.
+	//
+	// Nor is a stream-level refusal how the agent should decide whether to
+	// steal in the first place. Hello.Incoming.Enabled already travels
+	// CLI -> agent at handshake time, and a CLI that predates this work
+	// leaves it false by zero value, so that flag is the signal — known
+	// before any request arrives, and without a round trip. Refusing the
+	// stream is the backstop for a CLI whose flag and whose handler
+	// disagree.
 	CodeNoIncoming = "no_incoming"
 )
 
@@ -96,10 +110,15 @@ type DialReply struct {
 	Error string `json:"error,omitempty"`
 }
 
-// HTTPHeader is the first line of an http stream, agent -> CLI. The user is
-// informational: the agent only ever opens the stream toward that user's
-// session, and the CLI has exactly one. It is carried so a stream seen in a
-// packet capture or a log says who it was for.
+// HTTPHeader is the first line of an http stream, agent -> CLI.
+//
+// Put nothing load-bearing in here. The CLI reads the header only to learn
+// the stream type and discards the payload, and session.Options.OnHTTP takes
+// no header argument, so the CLI cannot see User at all today. The agent
+// only ever opens the stream toward that user's session and the CLI has
+// exactly one, so User is redundant by construction; it is carried so that a
+// stream read out of a packet capture says who it was for. Anything the CLI
+// must actually act on needs OnHTTP's signature widened first.
 type HTTPHeader struct {
 	User string `json:"user"`
 }

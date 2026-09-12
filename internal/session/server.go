@@ -20,6 +20,12 @@ import (
 //
 // yamux is symmetric, so either end can open a stream. Until v0.3 only the
 // CLI did (dial, resolve), which is why the CLI's accept loop is new.
+//
+// On error the returned net.Conn is nil (a plain `s == nil` test is safe).
+// The caller must bound its own read of the reply: a CLI older than the
+// accept loop never answers an http stream at all, and a session can go
+// away between the moment the registry hands out this Opener and the moment
+// it is used.
 type Opener interface {
 	OpenStream() (net.Conn, error)
 }
@@ -27,7 +33,19 @@ type Opener interface {
 // muxOpener adapts yamux's concrete return type (*yamux.Stream) to Opener.
 type muxOpener struct{ mux *yamux.Session }
 
-func (m muxOpener) OpenStream() (net.Conn, error) { return m.mux.OpenStream() }
+// OpenStream deliberately does not `return m.mux.OpenStream()`. That
+// compiles - *yamux.Stream is assignable to net.Conn - but on error it
+// returns a non-nil net.Conn wrapping a nil *yamux.Stream, so the caller's
+// `if s != nil { s.Close() }` dereferences nil. That panic would happen
+// inside tetherd-agent, which has no recover, taking down the sidecar and
+// every developer's session on the task.
+func (m muxOpener) OpenStream() (net.Conn, error) {
+	s, err := m.mux.OpenStream()
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
 
 // Handler is implemented by the agent.
 type Handler interface {
