@@ -39,6 +39,26 @@ import (
 type inProcessAgent struct {
 	addr      string
 	proxyAddr string
+	a         *agent.Agent
+}
+
+// waitDetached blocks until the agent has processed the previous session's
+// disconnect.
+//
+// handler.Closed - and so unregister - runs on the agent's own goroutine
+// when it notices the connection is gone. Nothing orders that against
+// RunWithDeps returning on this one, so a test that attaches twice as the
+// same user has to wait in between or the second hello is refused with
+// duplicate_user.
+//
+// This is not a narrow race. Measured: at the instant RunWithDeps returns,
+// the agent still held the previous session in 60 of 60 runs. The window is
+// always open; whether a test loses it depends only on how much work happens
+// before its next hello arrives. That is why this failed in CI and not
+// locally - not a faster machine, just a different amount of slack.
+func (ag *inProcessAgent) waitDetached(t *testing.T) {
+	t.Helper()
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 0 }, "the agent to see the previous session detach")
 }
 
 func startAgentFor(t *testing.T, env map[string]string, envErr error, dial func(context.Context, string) (net.Conn, error)) *inProcessAgent {
@@ -55,7 +75,7 @@ func startAgentFor(t *testing.T, env map[string]string, envErr error, dial func(
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); ln.Close() })
 	go a.Serve(ctx, ln)
-	return &inProcessAgent{addr: ln.Addr().String()}
+	return &inProcessAgent{addr: ln.Addr().String(), a: a}
 }
 
 // startAgentForWithApp is startAgentFor plus the agent's own reverse proxy
@@ -80,7 +100,7 @@ func startAgentForWithApp(t *testing.T, env map[string]string, appAddr string) *
 	t.Cleanup(func() { cancel(); proxy.Close(); ln.Close(); proxyLn.Close() })
 	go a.Serve(ctx, ln)
 	go proxy.Serve(proxyLn)
-	return &inProcessAgent{addr: ln.Addr().String(), proxyAddr: proxyLn.Addr().String()}
+	return &inProcessAgent{addr: ln.Addr().String(), proxyAddr: proxyLn.Addr().String(), a: a}
 }
 
 type fakeEnvReader struct {
@@ -229,6 +249,7 @@ func TestRunEnvErrorIsFatalForSSMAndSkippableWithNoEnv(t *testing.T) {
 
 	opts := ssmOpts("true")
 	opts.NoEnv = true
+	ag.waitDetached(t)
 	if code, err := RunWithDeps(context.Background(), opts, io.Discard, depsFor(p)); code != 0 || err != nil {
 		t.Fatalf("--no-env must run anyway: code=%d err=%v", code, err)
 	}
@@ -1341,6 +1362,7 @@ func TestRunWarnsAboutATaskValueItCannotRewrite(t *testing.T) {
 	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
 	opts.PinCredentialRoute = true
 	var pinned strings.Builder
+	ag.waitDetached(t)
 	if code, err := RunWithDeps(context.Background(), opts, &pinned, d); err != nil || code != 0 {
 		t.Fatalf("code=%d err=%v log=%s", code, err, pinned.String())
 	}
@@ -1689,6 +1711,7 @@ func TestRunDoesNotPinTheRouteUnlessAsked(t *testing.T) {
 	d.DialHelper = func(string) (HelperClient, error) { return hc2, nil }
 	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return cap2 }
 	opts.PinCredentialRoute = true
+	ag.waitDetached(t)
 	if code, err := RunWithDeps(context.Background(), opts, io.Discard, d); err != nil || code != 0 {
 		t.Fatalf("code=%d err=%v", code, err)
 	}
@@ -1755,6 +1778,7 @@ func TestRunCapturesTheEndpointWheneverItPinsTheRoute(t *testing.T) {
 	d.DialHelper = func(string) (HelperClient, error) { return hc2, nil }
 	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return cap2 }
 	opts.PinCredentialRoute = false
+	ag.waitDetached(t)
 	if code, err := RunWithDeps(context.Background(), opts, io.Discard, d); err != nil || code != 0 {
 		t.Fatalf("code=%d err=%v", code, err)
 	}
