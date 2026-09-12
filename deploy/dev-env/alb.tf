@@ -33,7 +33,13 @@ resource "aws_lb_target_group" "app" {
   vpc_id      = aws_vpc.this.id
 
   health_check {
-    path                = "/"
+    # Stays /healthz, the endpoint the app serves for exactly this purpose.
+    # The agent does not special-case the health check: a request carrying no
+    # matching steal headers goes to the app, and the ALB's never carries
+    # them. So the path is the agent's business either way, and a dedicated
+    # endpoint is still worth having - it keeps the health check off the
+    # application's root handler.
+    path                = "/healthz"
     matcher             = "200"
     interval            = 15
     healthy_threshold   = 2
