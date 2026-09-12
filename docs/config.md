@@ -22,7 +22,6 @@ aws:
 target:
   cluster: myapp-dev
   service: api
-  container: app                # 意図して読まれない（効くのは agent 側の TETHERD_APP_CONTAINER）
   env: dev                      # agent の TETHERD_ENV と照合し、違えば接続を拒否する
 env:
   override:                     # タスクの env の上にかぶせる
@@ -46,7 +45,7 @@ incoming:                       # v0.3a で有効。steal（下記）の受け�
 - `version` — 今は `1` のみ。将来フォーマットを変えたときに、古い tetherd が「upgrade してください」と言えるようにするためのもの。未知のキーもエラーにするので、綴り間違いは黙って無視されない
 - `aws.profile` / `aws.region` — SDK の既定チェーンの代わりに使うプロファイルとリージョン。個人設定の同じキーが勝つ
 - `target.cluster` / `target.service` — 接続先の ECS サービス。この 2 つが書いてあれば `tetherd run -- <cmd>` だけで動く
-- `target.container` — **意図して読まれない**（`incoming` は v0.3a/v0.3b で読まれるようになったが、このキーは違う）。env を読むコンテナを決めているのは**タスク定義の agent サイドカーに渡す `TETHERD_APP_CONTAINER`**（既定 `app`）で、CLI 側のこのキーではない。agent は `pidMode: task` で共有した pid 名前空間から、そのコンテナの最古のプロセスの `/proc/<pid>/environ` を読む。つまりアプリのコンテナ名が `web` なら、ここに `web` と書いても何も起きず、agent の環境変数に `TETHERD_APP_CONTAINER=web` を設定する必要がある（設定しないと `task env` が「container "app" is not in the task」で失敗する）。**配線しないことを v0.3b で決めた**: どのコンテナの env を読むかは agent の仕事で、agent には既に `TETHERD_APP_CONTAINER` がある。CLI 側からもう 1 つ名前を渡せば同じ事実が 2 箇所に散り、食い違ったときに黙って間違った env を注入する。キー自体は残す（`.tetherd.yml` は未知のキーをエラーにするので、消すと既にコミットされている設定ファイルが全部パースエラーになる）
+- `target.container` — **書くと起動時にエラーになる**（v0.4 から。それ以前は受け取って黙って捨てていた）。env を読むコンテナを決めているのは**タスク定義の agent サイドカーに渡す `TETHERD_APP_CONTAINER`**（既定 `app`）で、CLI 側のこのキーではない。agent は `pidMode: task` で共有した pid 名前空間から、そのコンテナの最古のプロセスの `/proc/<pid>/environ` を読む。つまりアプリのコンテナ名が `web` なら、`.tetherd.yml` ではなく agent の環境変数に `TETHERD_APP_CONTAINER=web` を設定する（設定しないと `task env` が「container "app" is not in the task」で失敗する）。**配線しないことを v0.3b で決めた**: どのコンテナの env を読むかは agent の仕事で、agent には既に `TETHERD_APP_CONTAINER` がある。CLI 側からもう 1 つ名前を渡せば同じ事実が 2 箇所に散り、食い違ったときに黙って間違った env を注入する。v0.3b はキーを残して無視していたが（消すと未知のキーとしてパースエラーになるため）、**黙って無視するより名指しして落ちるほうが親切**なので、v0.4 はこのキーだけ専用のエラーで拒否する — メッセージが `TETHERD_APP_CONTAINER` を名指しするので、単に「未知のキー」と言われるより次の一手が分かる。既にこのキーを書いている `.tetherd.yml` は 1 行消す必要がある（終了コードは 2）
 - `target.env` — 環境ガード。agent が名乗る `TETHERD_ENV` と一致しなければ接続を拒否する。prod のタスクに誤って繋ぐのを防ぐための最後の砦
 - `env.override` — タスクの env より強い。ローカルのポートだけ変えたいときなど
 - `env.exclude` — タスクの env から落とす名前。tetherd が常に落とすもの（下記）に追加される
