@@ -5,7 +5,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 const shared = `version: 1
@@ -270,5 +274,245 @@ func TestEnsurePersonalOmitsEmptyAWSBlock(t *testing.T) {
 	}
 	if strings.Contains(string(body), "aws:") {
 		t.Errorf("an empty aws block must be omitted: %s", body)
+	}
+}
+
+// --- fallback for filesystems without hard-link support (review item 1) ---
+
+func forceLinkUnsupported(t *testing.T) {
+	t.Helper()
+	orig := linkFile
+	linkFile = func(string, string) error {
+		return &os.LinkError{Op: "link", Err: syscall.ENOTSUP}
+	}
+	t.Cleanup(func() { linkFile = orig })
+}
+
+// TestEnsurePersonalWorksWhenLinkIsUnsupported proves EnsurePersonal still
+// works end to end on a filesystem that rejects hard links (SMB, exFAT,
+// some container bind mounts) - the scenario the Link-only version
+// regressed, where a developer's very first run could never succeed. The
+// error is injected via the linkFile seam rather than an actual such
+// filesystem.
+func TestEnsurePersonalWorksWhenLinkIsUnsupported(t *testing.T) {
+	forceLinkUnsupported(t)
+
+	path := filepath.Join(t.TempDir(), "sub", "config.yml")
+	got, created, err := EnsurePersonal(path, "shota")
+	if err != nil || !created {
+		t.Fatalf("created=%v err=%v", created, err)
+	}
+	if got.User != "shota" || len(got.Token) < 40 {
+		t.Fatalf("personal = %+v", got)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Errorf("the token file must be 0600, got %v", st.Mode().Perm())
+	}
+
+	again, created, err := EnsurePersonal(path, "someone-else")
+	if err != nil || created {
+		t.Fatalf("a second call must not rewrite: created=%v err=%v", created, err)
+	}
+	if again.Token != got.Token || again.User != "shota" {
+		t.Fatalf("the existing file must win: %+v", again)
+	}
+}
+
+func TestPublishUsesFallbackWhenLinkIsUnsupported(t *testing.T) {
+	forceLinkUnsupported(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	won, retry, err := publish(dir, path, []byte("user: a\ntoken: t\n"))
+	if err != nil || !won || retry {
+		t.Fatalf("won=%v retry=%v err=%v", won, retry, err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "user: a\ntoken: t\n" {
+		t.Fatalf("content = %q", body)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want 0600", st.Mode().Perm())
+	}
+}
+
+func TestPublishFallbackReportsRetryOnLossWhenPathAlreadyExists(t *testing.T) {
+	forceLinkUnsupported(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	won, retry, err := publish(dir, path, []byte("new"))
+	if err != nil || won || !retry {
+		t.Fatalf("won=%v retry=%v err=%v, want won=false retry=true err=nil", won, retry, err)
+	}
+}
+
+// TestReadPublishedRetriesUntilTheWinnerFinishesWriting pins the retry the
+// non-atomic fallback needs: a loser that arrives while the winner's write
+// is still in flight (here, an empty file that gains its content a moment
+// later) must not report failure on the first look.
+func TestReadPublishedRetriesUntilTheWinnerFinishesWriting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		body, _ := yaml.Marshal(Personal{User: "winner", Token: "winner-token"})
+		_ = os.WriteFile(path, body, 0o600)
+	}()
+
+	got, err := readPublished(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Token != "winner-token" || got.User != "winner" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+// TestReadPublishedDoesNotRetryOverTheLinkPath pins the other half: over the
+// atomic Link path a loss is only ever reported once the winner's Link has
+// already succeeded, so a single read is enough and retry=false skips the
+// backoff entirely.
+func TestReadPublishedDoesNotRetryOverTheLinkPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readPublished(path, false); err == nil {
+		t.Fatal("without retry, a token-less file must fail on the first read")
+	}
+}
+
+func TestReadPublishedFailsClearlyWhenTheTokenNeverAppears(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := readPublished(path, true)
+	if err == nil || !strings.Contains(err.Error(), "token") {
+		t.Fatalf("must fail clearly when the token never appears: %v", err)
+	}
+}
+
+// TestEnsurePersonalIsRaceSafeOverTheFallbackPath is TestEnsurePersonalIsRaceSafe's
+// counterpart for the non-atomic fallback: run in rounds against fresh
+// paths, since the fallback's race window is narrower and more timing-
+// dependent than the Link path's.
+func TestEnsurePersonalIsRaceSafeOverTheFallbackPath(t *testing.T) {
+	forceLinkUnsupported(t)
+
+	const rounds, n = 20, 16
+	for round := 0; round < rounds; round++ {
+		path := filepath.Join(t.TempDir(), "sub", "config.yml")
+		var wg sync.WaitGroup
+		results := make([]Personal, n)
+		createdFlags := make([]bool, n)
+		errs := make([]error, n)
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				results[i], createdFlags[i], errs[i] = EnsurePersonal(path, "shota")
+			}(i)
+		}
+		wg.Wait()
+
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d goroutine %d: %v", round, i, err)
+			}
+		}
+		createdCount := 0
+		token := results[0].Token
+		if token == "" {
+			t.Fatalf("round %d: the winning token must not be empty", round)
+		}
+		for i := 0; i < n; i++ {
+			if createdFlags[i] {
+				createdCount++
+			}
+			if results[i].Token != token {
+				t.Errorf("round %d goroutine %d got a different token: %q vs %q", round, i, results[i].Token, token)
+			}
+			if results[i].User != "shota" {
+				t.Errorf("round %d goroutine %d got a different user: %q", round, i, results[i].User)
+			}
+		}
+		if createdCount != 1 {
+			t.Errorf("round %d: created=true count = %d, want exactly 1", round, createdCount)
+		}
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Mode().Perm() != 0o600 {
+			t.Errorf("round %d: the token file must be 0600, got %v", round, st.Mode().Perm())
+		}
+	}
+}
+
+// --- backfilling a missing token (review item 3) ---
+
+// TestEnsurePersonalBackfillsAMissingToken covers a hand-created (or
+// otherwise token-less) personal file: v0.3's X-Dev-Token match needs a
+// token on every personal file, so one missing must be minted and written
+// back, keeping every other field.
+func TestEnsurePersonalBackfillsAMissingToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(path, []byte("user: x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, created, err := EnsurePersonal(path, "ignored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created {
+		t.Error("filling in a missing token is not creating the file")
+	}
+	if got.User != "x" || got.Token == "" {
+		t.Fatalf("personal = %+v", got)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "user: x") || !strings.Contains(string(body), got.Token) {
+		t.Fatalf("the file must keep user and gain the token: %s", body)
+	}
+}
+
+// TestEnsurePersonalWithATokenIsByteIdentical is "never overwrite" for the
+// case that already has a token: it must not be touched at all.
+func TestEnsurePersonalWithATokenIsByteIdentical(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	body := []byte("user: x\ntoken: abc\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := EnsurePersonal(path, "ignored"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(body) {
+		t.Fatalf("a file with a token must be untouched: got %q want %q", after, body)
 	}
 }
