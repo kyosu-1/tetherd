@@ -131,18 +131,24 @@ and requires each one that exists to be a directory owned by root that is not
 group- or world-writable. A component that does not exist yet is fine;
 `install` creates the leaf.
 
-**The same check runs on `/Library/LaunchDaemons`.** The plist is the other
-input that decides what launchd starts as root, and a directory whose group
-can write it is enough to replace the file whatever the file's own mode is.
+**The same check runs on `/Library/LaunchDaemons` and on `/var/log`.** The
+plist is the other input that decides what launchd starts as root, and a
+directory whose group can write it is enough to replace the file whatever the
+file's own mode is. `/var/log` is the third path the plist makes root touch:
+`StandardOutPath` and `StandardErrorPath` are opened by launchd **as root**,
+so a `/var/log` a non-root user can write lets that user plant a symlink at
+the log path and choose the file root appends the daemon's output to. All
+three destinations, and every component above each of them.
 
 If any component fails, `install` **writes nothing and runs nothing** - no
 binaries copied, no group created, no `launchctl` run - and the error names
 the component that is wrong *and* the command that fixes it:
 
 ```
-refusing to install: /usr/local is owned by uid 501, not root: a LaunchDaemon
-started from a path a non-root user can change hands that user root. Fix it
-with: sudo chown root:wheel /usr/local && sudo chmod go-w /usr/local
+refusing to install: /usr/local is owned by uid 501, not root: what a root
+LaunchDaemon starts, and what it writes to, is named by paths like this one,
+so a non-root user who can change it gets root. Fix it with: sudo chown
+root:wheel /usr/local && sudo chmod go-w /usr/local
 ```
 
 The realistic way to reach that message is a machine where someone once ran
@@ -159,7 +165,9 @@ failure after the check has already said the path is fine.
 
 Measured on this machine (Apple Silicon, prefix `/opt/homebrew`), all of
 `/usr/local/libexec/tetherd`, `/Library/LaunchDaemons` and `/var/log` are
-`root:wheel 0755` and the check passes.
+`root:wheel 0755` and the check passes. (`/var` is a symlink to
+`private/var`; `OSStatOwner` uses `os.Stat`, which follows it on purpose -
+the target's owner is who can swap what is there.)
 
 `install` also resolves its own path with `filepath.EvalSymlinks` before
 looking for `tetherd-exec` beside itself, because Homebrew puts
@@ -261,9 +269,10 @@ the directory beside it has no `tetherd-exec` in it.
   sets the mode on every directory it creates, and brings its own
   `/usr/local/libexec/tetherd` to `0755` even when it already exists, so a
   re-run repairs a machine installed before this was fixed. Directories it did
-  **not** create - `/usr`, `/usr/local`, `/Library/LaunchDaemons` - are left
-  exactly as you have them; `CheckOwnership` has already established that none
-  of them is group- or world-writable, which is the property that matters.
+  **not** create - `/usr`, `/usr/local`, `/Library/LaunchDaemons`, `/var/log`
+  - are left exactly as you have them; `CheckOwnership` has already
+  established that none of them is group- or world-writable, which is the
+  property that matters.
 
 ## Signing and notarization
 

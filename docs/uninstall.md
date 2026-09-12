@@ -170,7 +170,7 @@ root-owned, setgid `tetherd-exec` — from `hack/e2e-local.sh`'s foreground
 runs, not from `sudo tetherd-helper install` (there is no plist and no copy
 of `tetherd-helper` in that directory, which only `install` would put
 there). Testing "first install" against this machine as-is would mean
-`EnsureGroup`'s creation path, and `os.MkdirAll`'s creation of
+`EnsureGroup`'s creation path, and `mkdirAllMode`'s creation of
 `/usr/local/libexec/tetherd` from nothing, are never actually exercised —
 the very thing `docs/e2e-aws.md` row 33 exists to check.
 

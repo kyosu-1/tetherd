@@ -926,6 +926,43 @@ func TestInstallWritesNothingWhenThePlistDirectoryIsNotRootOwned(t *testing.T) {
 	}
 }
 
+func TestInstallWritesNothingWhenTheLogDirectoryIsNotRootOwned(t *testing.T) {
+	// The third path the plist makes root write to. StandardOutPath and
+	// StandardErrorPath are opened by launchd as root, so a /var/log whose
+	// group or the world can write it lets a non-root user plant a symlink
+	// at the log path and choose the file root appends the daemon's output
+	// to. Only the log directory is wrong here - the binaries' destination
+	// and the plist's are both fine - so this fails unless the check is
+	// applied to all three.
+	p, f := testPaths(t), newFakeSystem()
+	logDir := filepath.Dir(p.LogPath)
+	stat := func(path string) (uint32, fs.FileMode, error) {
+		if path == logDir {
+			return 0, fs.ModeDir | 0o775, nil
+		}
+		return 0, fs.ModeDir | 0o755, nil
+	}
+	_, err := Install(p, stat, f.run, fakeSrcDir(t))
+	if err == nil {
+		t.Fatalf("installed a LaunchDaemon that has root open %s for writing inside %s, which a non-root user can write", p.LogPath, logDir)
+	}
+	if !strings.Contains(err.Error(), logDir) {
+		t.Errorf("error %q does not name %s", err, logDir)
+	}
+	for _, path := range []string{
+		p.PlistPath(),
+		filepath.Join(p.InstallDirPath(), HelperName),
+		filepath.Join(p.InstallDirPath(), ExecName),
+	} {
+		if _, serr := os.Stat(path); !errors.Is(serr, fs.ErrNotExist) {
+			t.Errorf("%s exists; every check has to happen before anything is written", path)
+		}
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("ran %v before refusing", f.calls)
+	}
+}
+
 func TestCheckOwnershipRefusalSaysHowToFixIt(t *testing.T) {
 	// Every other user-facing failure in this project ends with the next
 	// command to run (doctor's Next, VersionError's `brew upgrade`). The

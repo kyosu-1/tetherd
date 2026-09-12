@@ -241,10 +241,10 @@ func CheckOwnership(stat StatOwner, dir string) error {
 			return err
 		}
 		if uid != 0 {
-			return fmt.Errorf("%s is owned by uid %d, not root: a LaunchDaemon started from a path a non-root user can change hands that user root. Fix it with: sudo chown root:wheel %s && sudo chmod go-w %s", p, uid, p, p)
+			return fmt.Errorf("%s is owned by uid %d, not root: what a root LaunchDaemon starts, and what it writes to, is named by paths like this one, so a non-root user who can change it gets root. Fix it with: sudo chown root:wheel %s && sudo chmod go-w %s", p, uid, p, p)
 		}
 		if mode.Perm()&0o022 != 0 {
-			return fmt.Errorf("%s is mode %04o, which its group or the world can write: a LaunchDaemon started from a path a non-root user can change hands that user root. Fix it with: sudo chmod go-w %s", p, mode.Perm(), p)
+			return fmt.Errorf("%s is mode %04o, which its group or the world can write: what a root LaunchDaemon starts, and what it writes to, is named by paths like this one, so a non-root user who can change it gets root. Fix it with: sudo chmod go-w %s", p, mode.Perm(), p)
 		}
 		if !mode.IsDir() {
 			return fmt.Errorf("%s is not a directory (mode %v): every component of the path has to be one. Move or remove it", p, mode)
@@ -291,18 +291,31 @@ func Install(p Paths, stat StatOwner, run func(string, ...string) (string, error
 	var res InstallResult
 	installDir := p.InstallDirPath()
 
-	// First, and before anything is written or any command is run: if
-	// either destination is not root-owned all the way down, refusing is
-	// the only safe answer.
+	// First, and before anything is written or any command is run: if any
+	// destination is not root-owned all the way down, refusing is the only
+	// safe answer.
 	//
-	// Both directories, not just the one the binaries go in. The plist is
-	// the other input that decides what launchd starts as root, and a
-	// directory whose group or the world can write it is enough to replace
-	// the file whatever the file's own mode is - launchd's rule (see
-	// writeFileAtomic's caller below) is about the plist's mode, not its
-	// parent's. /Library/LaunchDaemons is root:wheel 0755 on a stock Mac,
-	// so this normally costs five stat calls and changes nothing.
-	for _, dir := range []string{installDir, p.LaunchDirPath()} {
+	// All three directories the plist makes root touch, not just the one
+	// the binaries go in:
+	//
+	//   - installDir is what launchd starts (ProgramArguments).
+	//   - The plist's own directory decides what launchd reads to know
+	//     that: a directory whose group or the world can write it is
+	//     enough to replace the file whatever the file's own mode is -
+	//     launchd's rule (see writeFileAtomic's caller below) is about the
+	//     plist's mode, not its parent's.
+	//   - filepath.Dir(p.LogPath) is where launchd opens StandardOutPath
+	//     and StandardErrorPath **as root**. The same reasoning: on a
+	//     machine whose /var/log had been chowned or relaxed, a non-root
+	//     user could plant a symlink at the log path and have root append
+	//     the daemon's output to a file of their choosing. It is the third
+	//     root-write destination the plist creates, and docs/install.md
+	//     has always measured it in the same sentence as the other two.
+	//
+	// All three are root:wheel 0755 on a stock Mac (/var -> private/var is
+	// a symlink and OSStatOwner follows it on purpose), so this normally
+	// costs a handful of stat calls and changes nothing.
+	for _, dir := range []string{installDir, p.LaunchDirPath(), filepath.Dir(p.LogPath)} {
 		if err := CheckOwnership(stat, dir); err != nil {
 			return res, fmt.Errorf("refusing to install: %w", err)
 		}
