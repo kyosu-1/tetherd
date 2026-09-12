@@ -73,6 +73,14 @@ aws:
 
 `.tetherd.yml` は**信頼された入力**として扱う。`env.override` は子プロセスの `PATH` や `DYLD_INSERT_LIBRARIES` も設定できるため、悪意のある `.tetherd.yml` を含むリポジトリで `tetherd run` すると任意コード実行になる。ただし `tetherd run -- go run ./cmd/api` はそもそもそのリポジトリのコードを実行するので、これは `env.override` があること自体に内在する性質であり、tetherd が新たに作った穴ではない。信頼していないリポジトリのコードを実行しないこと、という通常の前提がそのまま当てはまる。
 
+## `tetherd env` と `tetherd run` の差
+
+`tetherd env` は「`run` がタスクから注入する変数」を出す。上の除外リストと `env.override` / `env.exclude` は同じように適用されるので、`eval "$(tetherd env --format shell)"` でシェルに取り込んでも `HOME` や `PATH` は自分のものが残る。
+
+ただし AWS の身元に関する変数だけは一致しない。`run` は透過モードで捕捉が張れているときだけ、タスクロールを使わせるために `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` を空ファイルに向け、ローカルの認証情報変数を取り除き、リージョンを補う。`env` は捕捉を張らないので、その判定ができず何もしない。`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` などの 4 変数も、`run` は透過モードで残す（agent 経由で `169.254.170.2` に届く）が、`env` は常に落とす（誰も応答しないため）。
+
+つまり `eval "$(tetherd env)"` した後のシェルでは、AWS の身元は**自分のまま**。タスクロールで何かを実行したいなら `tetherd run -- <cmd>` を使う。
+
 ## リモート集合の組み立て
 
 `tetherd run` が捕捉する宛先は次の式で決まる。

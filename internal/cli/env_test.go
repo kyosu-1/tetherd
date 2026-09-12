@@ -120,6 +120,39 @@ func TestFormatEnvDotenvEscapesNewlines(t *testing.T) {
 	}
 }
 
+// TestFormatEnvDotenvQuotesValuesReadersWouldAlter covers the quiet half of
+// the same problem: dotenv readers commonly treat an unquoted " #" as the
+// start of an inline comment and trim surrounding whitespace, so a value
+// that survives the file intact still comes back changed.
+func TestFormatEnvDotenvQuotesValuesReadersWouldAlter(t *testing.T) {
+	vars := map[string]string{
+		"HASH":     "val#ue",
+		"PADDED":   " padded ",
+		"EMPTY":    "",
+		"TAB":      "a\tb",
+		"ORDINARY": "plain",
+	}
+	var b strings.Builder
+	if err := FormatEnv(&b, vars, nil, "dotenv", true); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	for _, want := range []string{
+		`HASH="val#ue"`,
+		`PADDED=" padded "`,
+		`EMPTY=""`,
+		"ORDINARY=plain",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dotenv must contain %s:\n%s", want, out)
+		}
+	}
+	// A tab is neither trimmed nor comment-starting, so it stays bare.
+	if !strings.Contains(out, "TAB=a\tb\n") {
+		t.Errorf("a tab needs no quoting: %q", out)
+	}
+}
+
 func TestEnvRunPrintsTheTaskEnvironment(t *testing.T) {
 	ag := startAgentFor(t, map[string]string{"PORT": "8080", "API_KEY": "s3cret"}, nil, nil)
 	p := &fakeProvider{
@@ -241,13 +274,13 @@ func TestEnvRunFailsClosedWhenSecretNamesFails(t *testing.T) {
 // every Go child's TLS on real Fargate in v0.2a.
 func TestEnvRunFiltersAndOverridesLikeRunWould(t *testing.T) {
 	ag := startAgentFor(t, map[string]string{
-		"HOME":          "/home/nonroot",
-		"PATH":          "/usr/local/sbin:/usr/local/bin",
-		"SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
+		"HOME":                                   "/home/nonroot",
+		"PATH":                                   "/usr/local/sbin:/usr/local/bin",
+		"SSL_CERT_FILE":                          "/etc/ssl/certs/ca-certificates.crt",
 		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x",
 		"ECS_CONTAINER_METADATA_URI_V4":          "http://169.254.170.2/v4/x",
-		"PORT":    "8080",
-		"DROP_ME": "x",
+		"PORT":                                   "8080",
+		"DROP_ME":                                "x",
 	}, nil, nil)
 	p := &fakeProvider{
 		region:    "r",

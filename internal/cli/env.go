@@ -194,8 +194,23 @@ func shellQuote(v string) string {
 // readers (Docker's --env-file, python-dotenv, godotenv) expect back; a
 // value that does not need it is left bare so the common case stays
 // readable.
+// needsDotenvQuotes reports whether a value would be read back differently
+// than it was written. Newlines and quotes are the obvious cases - an
+// unquoted newline splits the assignment in two, and a value containing
+// "\nFOO=bar" forges one. The rest are quieter: readers commonly treat an
+// unquoted " #" as the start of an inline comment and trim surrounding
+// whitespace, so " val#ue " would come back as "val". An empty value is
+// quoted too, so the line reads as a deliberate empty string rather than
+// looking truncated.
+func needsDotenvQuotes(v string) bool {
+	if v == "" || strings.ContainsAny(v, "\n\r\"#") {
+		return true
+	}
+	return strings.TrimSpace(v) != v
+}
+
 func dotenvQuote(v string) string {
-	if !strings.ContainsAny(v, "\n\r\"") {
+	if !needsDotenvQuotes(v) {
 		return v
 	}
 	var b strings.Builder
