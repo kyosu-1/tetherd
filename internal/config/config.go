@@ -40,7 +40,18 @@ type AWS struct {
 type Target struct {
 	Cluster string `yaml:"cluster"`
 	Service string `yaml:"service"`
-	Env     string `yaml:"env"`
+	// AgentContainer is the name of the tetherd-agent sidecar, for a
+	// deployment that calls it something else. Unlike the refused
+	// `container` above, this one the CLI genuinely acts on: discovery
+	// rejects a task that has no container by this name, and doctor's
+	// target group row reads that container's TETHERD_PROXY out of the
+	// task definition - so a renamed sidecar is a name the CLI has to be
+	// told, not one it could learn from the agent.
+	//
+	// Empty means "the default", which is applied once, downstream
+	// (ecs.DefaultAgentContainer). This package holds no defaults.
+	AgentContainer string `yaml:"agent_container"`
+	Env            string `yaml:"env"`
 }
 
 // Env tunes what reaches the child.

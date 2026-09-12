@@ -112,6 +112,7 @@ func applyConfig(cmd *cobra.Command, opts *RunOptions) (config.Config, error) {
 	// worse, would give no signal at all if a later flag landed under a
 	// different spelling than guessed here. Guard each one, through
 	// changed(), the day its flag actually exists.
+	opts.AgentContainer = cfg.Shared.Target.AgentContainer
 	opts.LocalCIDRs = cfg.Shared.Network.LocalCIDRs
 	opts.RemoteServices = cfg.Shared.Network.RemoteServices
 	opts.RemoteDomains = cfg.Shared.Network.RemoteDomains

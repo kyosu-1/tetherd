@@ -670,3 +670,47 @@ func TestApplyIncomingPortRefusesACommandWithTheFlag(t *testing.T) {
 	var opts RunOptions
 	applyIncomingPort(newRunCommand(), config.Config{}, &opts)
 }
+
+// target.agent_container had a default (ecs.DefaultAgentContainer) and no
+// way to set it, so a team that renamed the sidecar could not attach at
+// all: discovery rejects every task that has no container by that name.
+//
+// The assertion goes all the way to the provider Target rather than
+// stopping at RunOptions, because the field being carried and the field
+// being *used* are different claims - ecsTarget is the only place a Target
+// is built, so it is the only place the name can be dropped. An omitted key
+// must stay empty here, not be defaulted: the default belongs downstream,
+// once, in internal/provider/ecs.
+func TestApplyConfigCarriesAgentContainerIntoTheDiscoveryTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, want string
+	}{
+		{"renamed", "version: 1\ntarget:\n  cluster: c\n  service: s\n  agent_container: sidecar\n", "sidecar"},
+		{"omitted", "version: 1\ntarget:\n  cluster: c\n  service: s\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p := filepath.Join(dir, ".tetherd.yml")
+			if err := os.WriteFile(p, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("HOME", dir)
+
+			var captured RunOptions
+			runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+			t.Cleanup(func() { runFn = defaultRun })
+
+			root := NewRootCommand()
+			root.SetArgs([]string{"run", "--config", p, "--", "true"})
+			if err := root.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if captured.AgentContainer != tc.want {
+				t.Errorf("RunOptions.AgentContainer = %q, want %q", captured.AgentContainer, tc.want)
+			}
+			if got := ecsTarget(captured).AgentContainer; got != tc.want {
+				t.Errorf("the name must reach discovery: ecsTarget().AgentContainer = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

@@ -237,3 +237,46 @@ func TestDiscoverAllWithNoEligibleTaskReportsEveryReason(t *testing.T) {
 		t.Fatalf("reasons = %v, want the ECS Exec explanation", nr.Reasons)
 	}
 }
+
+// Target.AgentContainer had a default and, until v0.4, no configuration
+// path to set it - so this pins the other half of exposing it as
+// target.agent_container: a task whose sidecar is named something else is
+// eligible when the Target says so, and the default name is then *not* what
+// is looked for. Without the second half of this test a Target that ignored
+// the field entirely and always used the default would still pass the
+// first.
+func TestDiscoverHonoursARenamedAgentContainer(t *testing.T) {
+	now := time.Now()
+	renamed := func(id string) types.Task {
+		tk := task(id, now, true, "RUNNING", false)
+		tk.Containers = append(tk.Containers, types.Container{
+			Name:      aws.String("sidecar"),
+			RuntimeId: aws.String(id + "-rt"),
+			ManagedAgents: []types.ManagedAgent{{
+				Name:       types.ManagedAgentNameExecuteCommandAgent,
+				LastStatus: aws.String("RUNNING"),
+			}},
+		})
+		return tk
+	}
+	f := &fakeECS{arns: []string{"a"}, tasks: []types.Task{renamed("a")}}
+	got, err := Discover(context.Background(), f, Target{Cluster: "c", Service: "api", AgentContainer: "sidecar"})
+	if err != nil {
+		t.Fatalf("a task whose sidecar is named %q must be eligible when the target says so: %v", "sidecar", err)
+	}
+	if got.RuntimeID != "a-rt" {
+		t.Errorf("RuntimeID = %q, want the renamed container's (%q)", got.RuntimeID, "a-rt")
+	}
+
+	// The same task, with the field left empty, must be rejected by name:
+	// the default is DefaultAgentContainer and this task has no such
+	// container.
+	f2 := &fakeECS{arns: []string{"a"}, tasks: []types.Task{renamed("a")}}
+	_, err = Discover(context.Background(), f2, Target{Cluster: "c", Service: "api"})
+	if err == nil {
+		t.Fatal("with no agent_container set, a task without a container named tetherd-agent must be rejected")
+	}
+	if !strings.Contains(err.Error(), DefaultAgentContainer) {
+		t.Errorf("the reason must name the container it looked for: %v", err)
+	}
+}

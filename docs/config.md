@@ -22,6 +22,7 @@ aws:
 target:
   cluster: myapp-dev
   service: api
+  agent_container: tetherd-agent # サイドカーの名前を変えている場合だけ（既定 tetherd-agent）
   env: dev                      # agent の TETHERD_ENV と照合し、違えば接続を拒否する
 env:
   override:                     # タスクの env の上にかぶせる
@@ -46,6 +47,7 @@ incoming:                       # v0.3a で有効。steal（下記）の受け�
 - `aws.profile` / `aws.region` — SDK の既定チェーンの代わりに使うプロファイルとリージョン。個人設定の同じキーが勝つ
 - `target.cluster` / `target.service` — 接続先の ECS サービス。この 2 つが書いてあれば `tetherd run -- <cmd>` だけで動く
 - `target.container` — **書くと起動時にエラーになる**（v0.4 から。それ以前は受け取って黙って捨てていた）。env を読むコンテナを決めているのは**タスク定義の agent サイドカーに渡す `TETHERD_APP_CONTAINER`**（既定 `app`）で、CLI 側のこのキーではない。agent は `pidMode: task` で共有した pid 名前空間から、そのコンテナの最古のプロセスの `/proc/<pid>/environ` を読む。つまりアプリのコンテナ名が `web` なら、`.tetherd.yml` ではなく agent の環境変数に `TETHERD_APP_CONTAINER=web` を設定する（設定しないと `task env` が「container "app" is not in the task」で失敗する）。**配線しないことを v0.3b で決めた**: どのコンテナの env を読むかは agent の仕事で、agent には既に `TETHERD_APP_CONTAINER` がある。CLI 側からもう 1 つ名前を渡せば同じ事実が 2 箇所に散り、食い違ったときに黙って間違った env を注入する。v0.3b はキーを残して無視していたが（消すと未知のキーとしてパースエラーになるため）、**黙って無視するより名指しして落ちるほうが親切**なので、v0.4 はこのキーだけ専用のエラーで拒否する — メッセージが `TETHERD_APP_CONTAINER` を名指しするので、単に「未知のキー」と言われるより次の一手が分かる。既にこのキーを書いている `.tetherd.yml` は 1 行消す必要がある（終了コードは 2）
+- `target.agent_container` — agent サイドカーのコンテナ名。既定は `tetherd-agent` で、**改名していないなら書く必要はない**。CLI はこの名前でタスク内のコンテナを探し、無いタスクは「attach できない」として弾く（実測の文面は `no attachable task:` に続けて `task a1b2c3d4: no container named "tetherd-agent" in the task` の行が並ぶ）ので、タスク定義でサイドカーを別名にしているチームはここに書かないと 1 タスクも見つからない。`tetherd doctor` の target group の行も、この名前のコンテナの `TETHERD_PROXY` をタスク定義から読む。`target.container` と違い**これは CLI が実際に使う値**（agent 側から教わる手段が無い名前なので、CLI に渡す必要がある）。フラグは無い — 改名はデプロイの性質で、そのサービスに繋ぐ全員で同じなので、コミットする側のファイルに書くのが正しい
 - `target.env` — 環境ガード。agent が名乗る `TETHERD_ENV` と一致しなければ接続を拒否する。prod のタスクに誤って繋ぐのを防ぐための最後の砦
 - `env.override` — タスクの env より強い。ローカルのポートだけ変えたいときなど
 - `env.exclude` — タスクの env から落とす名前。tetherd が常に落とすもの（下記）に追加される
