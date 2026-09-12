@@ -298,6 +298,8 @@ tetherd token rotate
 - `doctor` の検査項目（各項目に「次に何をするか」を付ける）:
   helper が応答しバージョンが一致 / `tetherd` グループと setgid `tetherd-exec` / session-manager-plugin の有無 / AWS 認証 / サービスの `enableExecuteCommand` / タスクの agent コンテナと ExecuteCommandAgent / タスク定義の `pidMode: task` / ターゲットグループが HTTP1 / ECS・EC2 の読み取り権限 / VPC CIDR とローカル IF の重なり / `remote_domains` が agent 側で解けるか / `remote_cidrs` に `0.0.0.0/0` が無いか
 
+  v0.2b で実装したのは 8 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査は v0.3** — developer policy に `elasticloadbalancing:DescribeTargetGroups` を足す必要があり、検証環境が動いている間は Terraform を再適用しない方針のため。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
+
 ### 6.6 出力
 
 design.md §5 のとおり。`network` 行は `transparent (pf rdr, gid tetherd) · remote: 10.0.0.0/16, 169.254.170.0/24 · DNS: local (+ myapp.internal via VPC)` のように、何がリモートかを 1 行で示す。
@@ -482,6 +484,7 @@ design.md §10 に加えて:
 - helper は `admin` グループのユーザーからのみ受け付け、操作は 5 つに固定。コマンド起動の操作は無い
 - setgid `tetherd` の権限は pf に捕まることだけ
 - `:9900` は無認証だが lo にしか bind せず、信頼境界は「タスク内」。design.md に明記する
+- `.tetherd.yml` は**信頼された入力**として扱う。`env.override` は子プロセスの `PATH` や `DYLD_INSERT_LIBRARIES` も設定できるので、悪意ある `.tetherd.yml` を含むリポジトリで `tetherd run` すれば任意コード実行になる。ただし `tetherd run -- go run ./cmd/api` はそもそもそのリポジトリのコードを実行するので、これは `env.override` があること自体に内在する性質であり tetherd が新たに作った経路ではない。「信頼していないリポジトリのコードを実行しない」という通常の前提がそのまま当てはまる
 - ローカルアプリは共有 dev DB に書く。ローカルブランチの auto-migrate が dev DB を変えうることを README で注意する
 - セッション中は `tetherd-exec` が誰でも実行可能（mode `2755`、setgid `tetherd`）なので、同じマシンの他のローカルユーザーも gid `tetherd` でコマンドを起動しトンネルに到達できる。シングルユーザーのラップトップでは許容するが、その前提であることを明記する
 - セッション中、ラップトップ上の SSM ローカルフォワードのポート（`127.0.0.1:9900`）は無認証で agent に届く経路になる: 同じマシンの他のローカルプロセスがそのポートに直接繋いで `welcome.app_env` を読んだり、VPC 内へ dial したりできる。lo にしか bind しないので同一マシンには閉じるが、それ自体が信頼境界。`hello` にユーザー単位のトークンを載せる（v0.3）までこの経路が開いていることを明記する
@@ -535,6 +538,20 @@ design.md §10 に加えて:
 1. `ssm:StartSession` のターゲットに agent コンテナの runtimeId を使うと `TargetNotConnected`。distroless の agent コンテナでは ECS Exec の SSM エージェントが接続できていないのに、`DescribeTasks` は `RUNNING` と報告する。awsvpc は netns を共有するので、同じタスクの別コンテナ経由で転送すれば `127.0.0.1:9900` に届く
 2. 開発者の `~/.aws/config` の `default` プロファイルがコンテナクレデンシャルより先に評価され、タスクロールを覆い隠す
 3. distroless イメージの `SSL_CERT_FILE`（コンテナ内のパス）が注入され、macOS 側の子プロセスの TLS が全部壊れる
+
+### v0.2b（設定ファイル・DNS・`env`・`doctor`）
+
+検証手順は `docs/e2e-aws.md`（20 行）。helper（sudo）が要らない行と要る行を分けてあり、結果は実施後にここに記録する。
+
+| 行 | 検証 | 結果 |
+|---|---|---|
+| 0 | `.tetherd.yml` だけでフラグ無しに動く | 未実施 |
+| 6 | `remote_domains` で Cloud Map の名前が解け、`/etc/resolver` が run 中だけ存在する | 未実施（helper 必須） |
+| 11-13 | `tetherd env` のマスク・`--reveal`・stdout と stderr の分離 | 未実施 |
+| 14-15 | `tetherd doctor` の 8 項目と「1 つ失敗しても続ける」 | 未実施 |
+| 16 | `remote_services: [s3]` の prefix list がページングされて数百件入る | 未実施（helper 必須） |
+| 17-18 | `local_cidrs` の分割引き算と、全部消したときのエラー | 未実施（helper 必須） |
+| 19 | 存在しない名前が NXDOMAIN として即座に返る | 未実施（helper 必須） |
 
 ---
 
