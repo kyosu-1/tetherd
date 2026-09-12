@@ -129,7 +129,7 @@ CLI が `127.0.0.1:<redirect_port>` で accept したら、helper に `natlook{p
 - 接続時に peer credential（`LOCAL_PEERCRED`）を取り、uid が **`admin` グループのメンバー**であることを要求（`resolver.set` はマシン全体の名前解決に影響するため）
 - 1 接続 = 1 セッション。`pf.apply` は接続ごとに 1 回。接続が切れたら（CLI の異常終了含む）helper がそのセッションの pf ルール・resolver ファイル・host route を消す（消す順は resolver → route → pf）
 - 同時セッションは 1 つ。2 つ目の `pf.apply` は `busy{pid, command, since}` で拒否
-- 最初に `version` を交換。プロトコルバージョン不一致なら CLI が `brew upgrade tetherd && sudo tetherd-helper install`（その後 `sudo launchctl kickstart -k system/dev.tetherd.helper`）を案内する。helper は `/Library/LaunchDaemons/dev.tetherd.helper.plist` で launchd が持つので brew の service ではなく、`brew services restart tetherd` では再起動できない（§7）
+- 最初に `version` を交換。プロトコルバージョン不一致なら CLI が `brew upgrade tetherd && sudo tetherd-helper install`（その後 `sudo launchctl kickstart -k system/dev.tetherd.helper`）を案内する。helper は `/Library/LaunchDaemons/dev.tetherd.helper.plist` で launchd が持つので brew の service ではなく、`brew services restart tetherd` では再起動できない（§8）
 
 | 操作 | 引数 | 内容 |
 |---|---|---|
@@ -412,18 +412,22 @@ design.md §8 のとおり yamux + JSON Lines。ストリーム 0 が制御。
 ## 8. 配布とインストール
 
 ```
-brew install kyosu-1/tetherd/tetherd
+brew install kyosu-1/tap/tetherd
 sudo tetherd-helper install        # sudo はこの 1 回
 tetherd doctor
 ```
 
-- tap `kyosu-1/homebrew-tetherd`。GoReleaser がタグ push で GitHub Release（darwin arm64 / amd64）、GHCR の agent と sampleapp イメージ、tap の formula 更新を行う
-- formula は 3 バイナリを prefix に置くだけ。`service` ブロックは使わない（launchd の登録は helper 自身が行う）
-- brew はインストール時に root の処理を実行できないので、root が要る初期化は `sudo tetherd-helper install` が行う: グループ `tetherd` の作成、`tetherd-exec` の `/usr/local/libexec/tetherd/` へのコピー（`root:tetherd`、`2755`）、`/Library/LaunchDaemons/dev.tetherd.helper.plist` の生成と `launchctl bootstrap`。`brew upgrade tetherd` の後は `sudo tetherd-helper install` を再実行する（冪等。`doctor` がバージョン不一致を検出して案内する）
-- **helper は常駐しない。** plist の `Sockets` で launchd が `/var/run/tetherd.sock` を保持し、最初の接続で helper を root で起動する（ソケットアクティベーション。`launch_activate_socket()` は cgo を使わず `purego` で呼ぶ）。helper は接続が無くなって 30 秒でアイドル終了する。`KeepAlive: {SuccessfulExit: false}` で、クラッシュ時だけ launchd が再起動し、起動時の掃除で残留ルールが消える
+- tap `kyosu-1/homebrew-tap`（`brew install kyosu-1/tap/tetherd`）。GoReleaser がタグ push で GitHub Release（darwin arm64 / amd64）、GHCR の agent と sampleapp イメージ、tap の cask 更新を行う
+- **formula ではなく cask。** 3 バイナリを prefix に置くだけなのは変わらない（v0.4 実測: cask DSL の `binary` スタンザ 3 本）。cask にした理由は署名していないこと: Homebrew は cask のダウンロードを必ず quarantine するので、`postflight` で `xattr -dr com.apple.quarantine` を外す必要があり、formula にはその口が無い。`service` ブロックは使わない（launchd の登録は helper 自身が行う）。cask の `uninstall launchctl:` / `delete:` は `brew uninstall` が daemon を止めるための保険で、アンインストールの本体ではない（下記）
+- brew はインストール時に root の処理を実行できないので、root が要る初期化は `sudo tetherd-helper install` が行う: グループ `tetherd` の作成、`tetherd-exec` の `/usr/local/libexec/tetherd/` へのコピー（`root:tetherd`、`2755`）、**`tetherd-helper` 自身の同じディレクトリへのコピー**（v0.4 で追加。plist が指すのは Homebrew の prefix ではなくこのコピー。理由は `tetherd-exec` と同じで「Homebrew の prefix はユーザが書ける」、しかも launchd が root で起動するのはこちらなのでより強く効く）、`/Library/LaunchDaemons/dev.tetherd.helper.plist` の生成と `launchctl bootstrap`。**`install` は転送先パスの各構成要素（`/`, `/usr`, `/usr/local`, `/usr/local/libexec`, `/usr/local/libexec/tetherd`）が root 所有かつ group/world 書き込み不可であることを先に確かめ、違えば何も書かずに失敗する**（v0.4。Homebrew がどのディレクトリを書き込み可能にするかを当てにしない）。`brew upgrade tetherd` の後は `sudo tetherd-helper install` を再実行する（冪等。`doctor` がバージョン不一致を検出して案内する）
+- **v0.4 の helper は常駐する（`RunAtLoad: true`、`Sockets` なし）。** 以下のソケットアクティベーションが本来の設計で、まだ実装が無い。
+  - 本来の設計: plist の `Sockets` で launchd が `/var/run/tetherd.sock` を保持し、最初の接続で helper を root で起動する（ソケットアクティベーション。`launch_activate_socket()` は cgo を使わず `purego` で呼ぶ）。helper は接続が無くなって 30 秒でアイドル終了する
+  - v0.4 でそうしなかった理由: `purego` は新しい依存であり、v0.4 の計画は「依存を増やさない」を制約にしている。加えて継承した fd を `helper.Server` に渡す経路とアイドル終了のライフサイクルが要る。常駐なら `helper.Server` に変更が 1 行も要らない。**`Sockets` が無い plist では `RunAtLoad` 以外に helper を起動するものが無い**ので、常駐は選択ではなく帰結
+  - `KeepAlive: {SuccessfulExit: false}` は常駐でも同じ形を使う（クラッシュ時だけ launchd が再起動し、起動時の掃除で残留ルールが消える）。素の `KeepAlive: true` にはしない: `launchctl bootout` の直後に上がってきてしまい `install` が入れ替えられなくなるうえ、`cmd/tetherd-helper` がグループや setgid ラッパーの失敗で終了コード 1 で落ちる経路を無限に再試行してログを埋める。`ThrottleInterval` は既定値に頼らず明示する
+  - 常駐しているあいだ helper は listen しているだけで、pf も `/etc/resolver` も触らない（`run` が来るまで何も起きない）。とはいえ「使っていないのに常駐している」ことは README に明記する
 - helper は起動のたびに残留アンカーと resolver ファイルを掃除してから listen する
 - 署名・公証は v1 ではしない。GitHub Releases からの直接ダウンロードは非サポートと明記
-- アンインストール: `sudo tetherd-helper uninstall`（`launchctl bootout`、plist、グループ、`/usr/local/libexec/tetherd` の削除）→ `brew uninstall tetherd`
+- アンインストール: `sudo tetherd-helper uninstall`（`launchctl bootout`、plist、グループ、`/usr/local/libexec/tetherd` の削除。この 4 つを 1 コマンドで行い、途中が失敗しても残りを試す）→ `brew uninstall --cask tetherd`。**グループを消すのは仕様どおり**で、消さないと初回インストールの検証ができない（`EnsureGroup` が既存の gid を返してグループ作成の経路を通らない）
 - Ventura 以降の「バックグラウンド項目が追加されました」で無効化されたら `doctor` が案内。毎年の macOS メジャーリリースで動作確認
 
 ---
@@ -685,6 +689,14 @@ v0.4 でやること 3 つ（どれも独立）: (1) `aws-sdk-go-v2/service/elas
 | 30 | `token rotate` の直後は走行中のセッションが古いトークンのまま steal し続ける | 未実施 |
 
 ---
+
+### v0.4（配布とインストール）
+
+**§8 を実装に合わせて 4 点直した**（このセクションの本文に反映済み）: tap 名と `brew install` の行、formula → cask、`install` が `tetherd-helper` 自身もコピーして転送先パスの所有者を検査すること、そして **helper が v0.4 では常駐すること**（`RunAtLoad: true`。ソケットアクティベーションは `purego` という新しい依存が要るので次に送った。**黙って乖離させず、spec 側に書いた**）。
+
+設計と実測の詳細は `docs/install.md`（cask 全文、root 所有ディレクトリに入れる理由、`KeepAlive` の判断、quarantine と署名の扱い、ラベルが Go と cask の 2 箇所にあること）。
+
+**検証は実機のインストールが必要なので `docs/e2e-aws.md` の v0.4 の行で行う**（`brew install` からの初回インストール、`EvalSymlinks`、`launchctl print`、`doctor`、冪等な再実行、`brew uninstall --cask`）。単体テストで確かめられるのは plist の内容・所有者検査・`install`/`uninstall` の冪等性と launchctl の呼び出し順までで、**launchd が実際にこの plist を受け付けて helper を起動することは実機でしか分からない**。
 
 ---
 

@@ -41,3 +41,52 @@ changelog:
   sort: asc
   filters:
     exclude: ["^docs:", "^test:"]
+
+# homebrew_casks, not homebrew_formulae: a formula cannot strip the quarantine
+# attribute Homebrew puts on what it downloads (Library/Homebrew/cask/
+# download.rb quarantines every cask download), and these binaries are neither
+# signed nor notarized. A cask can, in a postflight hook.
+homebrew_casks:
+  - repository:
+      owner: kyosu-1
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/kyosu-1/tetherd
+    description: mirrord-like local development environment for ECS Fargate
+    # spec §8: the package puts three binaries in the prefix and nothing else.
+    # tetherd-exec on PATH is harmless - the setgid copy that pf matches is
+    # the one `tetherd-helper install` writes into a root-owned directory -
+    # and shipping the same three keeps the package and the spec in step.
+    # `binaries` (a list); the singular `binary` is deprecated.
+    binaries:
+      - tetherd
+      - tetherd-helper
+      - tetherd-exec
+    # Not optional: without the plugin the SSM transport cannot open a
+    # session, so tetherd can do nothing at all.
+    dependencies:
+      - formula: session-manager-plugin
+    hooks:
+      post:
+        install: |
+          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", staged_path]
+    # These two paths are the one duplication the design cannot remove: a cask
+    # is configuration and cannot read helper.DaemonLabel or
+    # helper.ExecInstallDir. internal/helper's TestCaskAgreesWithTheGoConstants
+    # fails if they drift, because a stale path here means `brew uninstall`
+    # leaves the daemon running.
+    uninstall:
+      # A list: `launchctl` is []string in goreleaser's cask schema,
+      # and a bare scalar is rejected by `goreleaser check`.
+      launchctl:
+        - dev.tetherd.helper
+      delete:
+        - /Library/LaunchDaemons/dev.tetherd.helper.plist
+        - /usr/local/libexec/tetherd
+    caveats: |
+      tetherd needs a root helper for pf, /etc/resolver and the tetherd group:
+
+        sudo tetherd-helper install
+
+      Run that again after every upgrade - it reinstalls both binaries into a
+      root-owned directory and restarts the daemon.
