@@ -133,8 +133,11 @@ func (c *Client) serveInbound(s net.Conn, onHTTP func(net.Conn)) {
 	case typ == proto.TypeHTTP && onHTTP != nil:
 		onHTTP(s) // owns s, including closing it
 	case typ == proto.TypeHTTP:
+		// A distinct code from the unknown-type case below: the agent's
+		// proxy passes the request to the application on CodeNoIncoming,
+		// and treats CodeBadHello on an http stream as a real fault.
 		proto.NewEncoder(s).Encode(proto.TypeError, proto.Error{
-			Code:    proto.CodeBadHello,
+			Code:    proto.CodeNoIncoming,
 			Message: "this session is not accepting incoming requests (--no-incoming)",
 		})
 		s.Close()

@@ -14,6 +14,15 @@ const Version = "1"
 // "unknown stream type ...") on that stream instead of the type-specific
 // reply. Anything that opens a stream must handle that TypeError shape as
 // well as its own reply type — see Client.Resolve for the pattern.
+//
+// Error codes are additive the same way, and for the same reason a refusal
+// carries both a code and a message: a peer that does not know a code still
+// reads a usable Message, so the code is an optimisation for routing (the
+// agent's L7 proxy deciding whether to pass the request to the application
+// or to report a bug) and never the only thing that makes a refusal
+// intelligible. Compare the code first and fall back to the message, never
+// the other way round — a rule that parses the other side's wording is a
+// rule both sides' tests will agree with and the wire will not.
 const (
 	TypeHello   = "hello"
 	TypeWelcome = "welcome"
@@ -31,6 +40,15 @@ const (
 	CodeDuplicateUser   = "duplicate_user"
 	CodeVersionMismatch = "version_mismatch"
 	CodeBadHello        = "bad_hello"
+	// CodeNoIncoming refuses an http stream because that CLI is not
+	// accepting incoming requests (`tetherd run --no-incoming`). It is a
+	// distinct code from CodeBadHello on purpose: this refusal is expected
+	// and the agent's proxy must quietly serve the request from the
+	// application, whereas CodeBadHello on an http stream means the CLI did
+	// not recognise the stream type at all — a bug, or a newer agent
+	// talking to an older CLI. An older CLI that predates this code answers
+	// CodeBadHello, which reads correctly as the second case.
+	CodeNoIncoming = "no_incoming"
 )
 
 // Incoming tells the agent whether and how to steal requests for this user.

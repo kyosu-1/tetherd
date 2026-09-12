@@ -696,7 +696,9 @@ func TestAgentCanOpenAnHTTPStreamToTheCLI(t *testing.T) {
 // `tetherd run --no-incoming` leaves OnHTTP nil. An http stream pushed at
 // such a CLI must be answered with an error that says why, so the agent's
 // proxy can return a real status instead of hanging on a stream nobody will
-// ever read.
+// ever read - and with CodeNoIncoming, not CodeBadHello, so the proxy can
+// tell "expected, serve it from the application" from "the CLI did not know
+// the stream type" without parsing the other side's wording.
 func TestAnHTTPStreamIsRefusedWhenTheCLIDoesNotAcceptSteal(t *testing.T) {
 	cc, sc := pair(t)
 	h := &fakeHandler{closed: make(chan struct{})}
@@ -726,6 +728,9 @@ func TestAnHTTPStreamIsRefusedWhenTheCLIDoesNotAcceptSteal(t *testing.T) {
 	var e proto.Error
 	if err := proto.Unmarshal(raw, &e); err != nil {
 		t.Fatal(err)
+	}
+	if e.Code != proto.CodeNoIncoming {
+		t.Errorf("code = %q, want %q: the proxy routes on the code, not on the wording", e.Code, proto.CodeNoIncoming)
 	}
 	if !strings.Contains(e.Message, "incoming") {
 		t.Errorf("the refusal must say the CLI is not accepting incoming requests: %q", e.Message)
@@ -765,6 +770,9 @@ func TestAnUnknownInboundStreamTypeIsRefusedAndDoesNotKillTheSession(t *testing.
 	var e proto.Error
 	if err := proto.Unmarshal(raw, &e); err != nil {
 		t.Fatal(err)
+	}
+	if e.Code != proto.CodeBadHello {
+		t.Errorf("code = %q, want %q: an unrecognised stream type is a fault, not a --no-incoming refusal", e.Code, proto.CodeBadHello)
 	}
 	if !strings.Contains(e.Message, "mirror") {
 		t.Errorf("the refusal must name the type it did not know: %q", e.Message)
