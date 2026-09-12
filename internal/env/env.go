@@ -44,15 +44,22 @@ var AWSContainerVars = []string{
 	"ECS_AGENT_URI",
 }
 
-// LocalAWSCredentialVars are the developer's own AWS credential/profile
-// variables. Every AWS SDK credential chain ranks these above container
-// credentials, so when the task exposes AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
-// they must be stripped from the local environment before the task env is
-// layered on top, or the child silently keeps running as the developer's
-// identity instead of the task role.
+// LocalAWSCredentialVars are the developer's own credentials in the
+// environment. Every one of these is resolved before the container
+// credentials in the SDK chain, so they have to go for the task role to
+// apply: static keys and a named profile, env web identity
+// (AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN, checked before the container
+// provider in aws-sdk-go-v2), a locally set container endpoint
+// (AWS_CONTAINER_CREDENTIALS_FULL_URI takes precedence over the relative
+// one), and the legacy aliases still honoured by boto and the Java v1 SDK.
 var LocalAWSCredentialVars = []string{
-	"AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_ACCESS_KEY_ID",
-	"AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_CREDENTIAL_EXPIRATION",
+	"AWS_PROFILE", "AWS_DEFAULT_PROFILE",
+	"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+	"AWS_CREDENTIAL_EXPIRATION",
+	"AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME",
+	"AWS_CONTAINER_CREDENTIALS_FULL_URI",
+	"AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+	"AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_SECURITY_TOKEN",
 }
 
 // Options tune Merge.

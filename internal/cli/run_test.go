@@ -231,7 +231,7 @@ func TestRunRequiresCommand(t *testing.T) {
 }
 
 func TestTaskRoleEnv(t *testing.T) {
-	got := taskRoleEnv("ap-northeast-1", "/tmp/empty")
+	got := taskRoleEnv(nil, "ap-northeast-1", "/tmp/empty")
 	want := map[string]string{
 		"AWS_CONFIG_FILE":             "/tmp/empty",
 		"AWS_SHARED_CREDENTIALS_FILE": "/tmp/empty",
@@ -247,9 +247,52 @@ func TestTaskRoleEnv(t *testing.T) {
 		}
 	}
 	// Without a region only the shared-config pair is set.
-	noRegion := taskRoleEnv("", "/tmp/empty")
+	noRegion := taskRoleEnv(nil, "", "/tmp/empty")
 	if len(noRegion) != 2 || noRegion["AWS_CONFIG_FILE"] != "/tmp/empty" {
 		t.Fatalf("no-region case = %v", noRegion)
+	}
+	// The task's own region wins over the CLI-resolved one.
+	taskRegion := taskRoleEnv(map[string]string{"AWS_REGION": "us-east-1"}, "ap-northeast-1", "/tmp/empty")
+	if taskRegion["AWS_REGION"] != "us-east-1" || taskRegion["AWS_DEFAULT_REGION"] != "us-east-1" {
+		t.Fatalf("the task's own region must win: %v", taskRegion)
+	}
+}
+
+func TestTaskRoleReachable(t *testing.T) {
+	withURI := map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}
+	vpcOnly := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}
+	withCreds := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16"), netip.MustParsePrefix("169.254.170.0/24")}
+
+	if taskRoleReachable(withURI, vpcOnly) {
+		t.Error("the credential endpoint is not captured, so the task role is not reachable")
+	}
+	if !taskRoleReachable(withURI, withCreds) {
+		t.Error("the credential endpoint is captured, so the task role is reachable")
+	}
+	if taskRoleReachable(map[string]string{}, withCreds) {
+		t.Error("without the URI there is no task role to use")
+	}
+	// A wider range that contains the endpoint counts.
+	if !taskRoleReachable(withURI, []netip.Prefix{netip.MustParsePrefix("169.254.0.0/16")}) {
+		t.Error("a range containing 169.254.170.0/24 must count as captured")
+	}
+}
+
+func TestTaskRoleEnvPrefersTheTaskRegion(t *testing.T) {
+	got := taskRoleEnv(map[string]string{"AWS_REGION": "us-east-1"}, "ap-northeast-1", "/tmp/empty")
+	if got["AWS_REGION"] != "us-east-1" || got["AWS_DEFAULT_REGION"] != "us-east-1" {
+		t.Fatalf("the task's own region must win: %v", got)
+	}
+	got = taskRoleEnv(nil, "ap-northeast-1", "/tmp/empty")
+	if got["AWS_REGION"] != "ap-northeast-1" {
+		t.Fatalf("without a task region the CLI's region is used: %v", got)
+	}
+	got = taskRoleEnv(nil, "", "/tmp/empty")
+	if _, ok := got["AWS_REGION"]; ok {
+		t.Fatalf("with no region at all nothing is injected: %v", got)
+	}
+	if got["AWS_CONFIG_FILE"] != "/tmp/empty" {
+		t.Fatalf("the shared-config pair is always set: %v", got)
 	}
 }
 
@@ -279,7 +322,7 @@ func TestTaskRoleEnvOverridesLocalSharedConfig(t *testing.T) {
 	task := map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}
 	out := env.Merge(local, task, env.Options{
 		StripLocal: env.LocalAWSCredentialVars,
-		Override:   taskRoleEnv("ap-northeast-1", "/tmp/empty"),
+		Override:   taskRoleEnv(nil, "ap-northeast-1", "/tmp/empty"),
 	})
 	got := map[string]string{}
 	for _, kv := range out {

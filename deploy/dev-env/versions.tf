@@ -10,10 +10,13 @@ terraform {
   # writes (Terraform >= 1.10), no DynamoDB table needed. The backend does
   # not understand `aws login` sessions, so credentials come from the
   # environment: eval "$(aws configure export-credentials --profile personal --format env)"
+  # The bucket name is fixed to this repo's own AWS account (738925651667);
+  # a fork or a different account needs its own bucket here.
   backend "s3" {
     bucket       = "tetherd-tfstate-738925651667"
     key          = "dev-env/terraform.tfstate"
     region       = "ap-northeast-1"
+    encrypt      = true
     use_lockfile = true
   }
 }

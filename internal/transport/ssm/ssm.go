@@ -61,15 +61,6 @@ func SessionTargets(task transport.Task) []string {
 	return out
 }
 
-// SessionTarget formats the first candidate (kept for callers that only
-// need the primary target).
-func SessionTarget(task transport.Task) string {
-	if ts := SessionTargets(task); len(ts) > 0 {
-		return ts[0]
-	}
-	return ""
-}
-
 // isTargetNotConnected reports whether SSM refused because that
 // container's ECS Exec agent has no control channel.
 func isTargetNotConnected(err error) bool {
@@ -108,6 +99,10 @@ func (t *Transport) Dial(ctx context.Context, task transport.Task) (net.Conn, er
 	if _, err := exec.LookPath(plugin); err != nil {
 		return nil, fmt.Errorf("session-manager-plugin not found (%v); install it: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html", err)
 	}
+	// The port is reserved once and reused for every candidate: the
+	// StartSession input carries it, so it must exist before the first
+	// call. Nothing else binds it in between, and a candidate that fails
+	// never starts a plugin.
 	port, err := freePort()
 	if err != nil {
 		return nil, err
@@ -131,8 +126,9 @@ func (t *Transport) Dial(ctx context.Context, task transport.Task) (net.Conn, er
 		if !isTargetNotConnected(err) {
 			return nil, fmt.Errorf("ssm:StartSession for %s: %w", target, err)
 		}
-		t.logf("ssm target %s is not connected; trying the next container in the task", target)
-		if i == len(targets)-1 {
+		if i < len(targets)-1 {
+			t.logf("ssm target %s is not connected; trying the next container in the task", target)
+		} else {
 			return nil, fmt.Errorf("no container in task %s has a connected ECS Exec agent (tried %s): %w", task.ID, strings.Join(targets, ", "), err)
 		}
 	}

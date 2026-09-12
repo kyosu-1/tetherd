@@ -153,3 +153,29 @@ func TestAWSContainerVarsCoverEveryLinkLocalEndpoint(t *testing.T) {
 		}
 	}
 }
+
+// Every name that outranks the container credentials has to be stripped, or
+// a developer with a web identity or a locally set container endpoint keeps
+// their own identity while tetherd claims the task role applies.
+func TestLocalAWSCredentialVarsCoverTheChain(t *testing.T) {
+	for _, name := range []string{
+		"AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SESSION_TOKEN",
+		"AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN",
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+		"AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_SECURITY_TOKEN",
+	} {
+		if !Excluded(name, LocalAWSCredentialVars) {
+			t.Errorf("%s must be in LocalAWSCredentialVars", name)
+		}
+	}
+	// Stripping them leaves the task's own credential URI alone.
+	out := toMap(Merge([]string{"AWS_ROLE_ARN=arn:aws:iam::1:role/dev", "PORT=3000"},
+		map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"},
+		Options{StripLocal: LocalAWSCredentialVars}))
+	if _, ok := out["AWS_ROLE_ARN"]; ok {
+		t.Error("AWS_ROLE_ARN must be stripped from the local env")
+	}
+	if out["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "/v2/credentials/x" || out["PORT"] != "3000" {
+		t.Errorf("the task's URI and unrelated locals must survive: %v", out)
+	}
+}

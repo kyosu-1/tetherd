@@ -123,6 +123,26 @@ func checkTargetEnv(w proto.Welcome, opts RunOptions) error {
 	return nil
 }
 
+// taskRoleReachable reports whether the child can reach the task-role
+// credential endpoint: the task must advertise it and 169.254.170.0/24 must
+// be in the captured set. Only the ssm transport adds that range
+// automatically; with --transport direct the operator has to pass
+// --remote-cidr 169.254.170.0/24 for the child's SDK to get there. Without
+// this check tetherd would strip the developer's own credentials and hide
+// ~/.aws in favour of an endpoint the child cannot reach, leaving it with no
+// identity at all while printing a green iam line.
+func taskRoleReachable(taskEnv map[string]string, cidrs []netip.Prefix) bool {
+	if taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] == "" {
+		return false
+	}
+	for _, p := range cidrs {
+		if p.Overlaps(ecsprov.TaskRoleCIDR) {
+			return true
+		}
+	}
+	return false
+}
+
 // taskRoleEnv returns the variables that make the task role the child's
 // only AWS identity. Stripping the developer's static keys is not enough:
 // every SDK resolves the shared config profile *before* the container
@@ -132,12 +152,17 @@ func checkTargetEnv(w proto.Welcome, opts RunOptions) error {
 // where the child's `aws sts get-caller-identity` reported an expired
 // login session while the same command with the shared config hidden
 // returned the task role. Pointing both shared-config variables at an
-// empty file removes that layer; the region has to be supplied explicitly
-// because it usually comes from the same config.
-func taskRoleEnv(region, emptyFile string) map[string]string {
+// empty file removes that layer.
+// The region has to be supplied explicitly because it usually comes from the
+// same shared config we are hiding; the task's own value wins when it has
+// one, so an app that pins a region keeps it.
+func taskRoleEnv(taskEnv map[string]string, region, emptyFile string) map[string]string {
 	out := map[string]string{
 		"AWS_CONFIG_FILE":             emptyFile,
 		"AWS_SHARED_CREDENTIALS_FILE": emptyFile,
+	}
+	if r := taskEnv["AWS_REGION"]; r != "" {
+		region = r
 	}
 	if region != "" {
 		out["AWS_REGION"] = region
@@ -224,8 +249,10 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 		return 2, fmt.Errorf("unknown transport %q (ssm | direct)", opts.Transport)
 	}
 
-	// 2. helper + exec shim, before the SSM session: a busy/missing helper
-	// must not cost a StartSession call.
+	// 2. helper and the setgid shim, before the SSM session: a helper that
+	// is not running, or a missing tetherd-exec, should not cost a
+	// StartSession round trip. A *busy* helper is only discovered when the
+	// pf rules are applied (step 4), which needs the session's VPC CIDRs.
 	var hc *helper.Client
 	if !opts.NoNetwork {
 		if _, err := os.Stat(opts.ExecPath); err != nil {
@@ -263,6 +290,7 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var overrideEnv map[string]string // set in step 5 when the task role is usable
+	var taskRoleOK bool               // set in step 5 once the task role is confirmed reachable and verified
 	if !opts.NoNetwork {
 		if ifs, err := net.InterfaceAddrs(); err == nil {
 			for _, o := range LocalOverlaps(cidrs, ifs) {
@@ -290,15 +318,19 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 			}
 		}()
 		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s", joinPrefixes(cidrs))
+		if taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "" && !taskRoleReachable(taskEnv, cidrs) {
+			logf("⚠ iam      the task advertises a role but %s is not captured; the child keeps your own AWS credentials (add --remote-cidr %s to use the task role)", ecsprov.TaskRoleCIDR, ecsprov.TaskRoleCIDR)
+		}
 
 		// 5. task role: fetch credentials the way the child's SDK will.
-		if uri := taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]; uri != "" {
+		if taskRoleReachable(taskEnv, cidrs) {
+			uri := taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]
 			emptyCfg, cleanupCfg, err := emptyAWSConfigFile()
 			if err != nil {
 				logf("⚠ iam      could not hide the shared AWS config (%v); the child may resolve your own credentials instead of the task role", err)
 			} else {
 				defer cleanupCfg()
-				overrideEnv = taskRoleEnv(region, emptyCfg)
+				overrideEnv = taskRoleEnv(taskEnv, region, emptyCfg)
 			}
 
 			ictx, icancel := context.WithTimeout(ctx, 15*time.Second)
@@ -312,6 +344,7 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 				logf("⚠ iam      %v", err)
 			} else {
 				logf("✓ iam      %s  (via 169.254.170.2)", arn)
+				taskRoleOK = true
 				if overrideEnv != nil {
 					logf("           the task role is the child's only AWS identity (your shared AWS config is hidden from it)")
 				}
@@ -328,7 +361,7 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 	}
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
 	mergeOpts := env.Options{DropAWSContainer: opts.NoNetwork}
-	if !opts.NoNetwork && taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "" {
+	if !opts.NoNetwork && taskRoleReachable(taskEnv, cidrs) {
 		mergeOpts.StripLocal = env.LocalAWSCredentialVars
 		mergeOpts.Override = overrideEnv
 		var found []string
@@ -338,7 +371,11 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 			}
 		}
 		if len(found) > 0 {
-			logf("✓ env      local AWS credentials (%s) removed so the task role applies", strings.Join(found, ", "))
+			if taskRoleOK {
+				logf("✓ env      local AWS credentials (%s) removed so the task role applies", strings.Join(found, ", "))
+			} else {
+				logf("⚠ env      local AWS credentials (%s) removed, but the task role could not be verified; the child may have no AWS identity (use --no-env or --no-network to keep your own)", strings.Join(found, ", "))
+			}
 		}
 	}
 	child.Env = env.Merge(os.Environ(), taskEnv, mergeOpts)

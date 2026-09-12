@@ -71,7 +71,7 @@ func newRunCommand() *cobra.Command {
 	f.StringVar(&opts.Profile, "profile", "", "AWS profile (default: SDK default chain)")
 	f.StringVar(&opts.Region, "region", "", "AWS region (default: from the profile)")
 	f.StringVar(&opts.Cluster, "cluster", "", "ECS cluster of the dev service")
-	f.StringVar(&opts.Service, "service", "", "ECS service to attach to")
+	f.StringVarP(&opts.Service, "service", "s", "", "ECS service to attach to")
 	f.StringVar(&opts.TaskID, "task", "", "attach to this task ID instead of the oldest running one")
 	f.StringVar(&opts.TargetEnv, "env", "dev", "expected TETHERD_ENV of the agent; refuse to attach otherwise")
 	f.StringVar(&opts.AgentAddr, "agent-addr", "", "agent control address for --transport direct (host:port)")

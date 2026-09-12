@@ -104,13 +104,6 @@ func echoServer(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-func TestSessionTarget(t *testing.T) {
-	got := SessionTarget(transport.Task{Cluster: "tetherd-dev", ID: "3f9c", RuntimeID: "3f9c-rt"})
-	if got != "ecs:tetherd-dev_3f9c_3f9c-rt" {
-		t.Fatalf("got %q", got)
-	}
-}
-
 func TestDialThroughPlugin(t *testing.T) {
 	exe, _ := os.Executable()
 	t.Setenv("TETHERD_FAKE_PLUGIN", "1")

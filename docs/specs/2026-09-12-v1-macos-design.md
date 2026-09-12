@@ -278,6 +278,8 @@ Ctrl-C は端末がプロセスグループ全体に SIGINT を送るので、CL
 
 透過モードでタスクの env が `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` を持つときは、それだけでは子プロセスがタスクロールにならない。どの SDK も**共有設定プロファイルをコンテナクレデンシャルより先に**評価するので、開発者の `~/.aws/config` の `default` プロファイルが認証ソース（SSO、login session、`credential_process` など）を持っていると、そちらが勝つ（実機で確認: 子プロセスの `aws sts get-caller-identity` が「session has expired」を返し、共有設定を隠すと即座にタスクロールを返した）。そこで tetherd は静的キーと `AWS_PROFILE` を除去するだけでなく、`AWS_CONFIG_FILE` と `AWS_SHARED_CREDENTIALS_FILE` をセッション用の空ファイルに向け、`AWS_REGION` / `AWS_DEFAULT_REGION` をタスクのリージョンで明示する。`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` は残すので、認証情報の自動更新は SDK 任せのまま。共有設定を隠すことは `✓ iam` の次の行に明示する。
 
+`--no-network` では tetherd は認証情報に一切触らない（開発者自身の身元のまま）。タスクの `AWS_REGION` は注入されるが、`169.254.170.2` を指す 4 つの変数は落とす。セッションの中で自分のプロファイルを使いたい場合は `--no-env`（タスクの env を注入しない）か `--no-network`（捕捉しない）を使う。
+
 ### 6.5 コマンド
 
 ```
