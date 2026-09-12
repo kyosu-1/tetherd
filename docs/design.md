@@ -265,7 +265,7 @@ utun に `route-to` してユーザー空間スタックで終端する案は、
 - 入れるのは root の LaunchDaemon 1 つ（Network Extension でも kext でもない）
 - 配布は Homebrew tap `kyosu-1/homebrew-tap`（GoReleaser の `homebrew_casks.repository.name` と一致）。`brew install kyosu-1/tap/tetherd && sudo tetherd-helper install`。sudo はこの 1 回だけで、グループ作成、`tetherd-exec` の配置、LaunchDaemon の plist 生成と登録を行う
 - **本来の設計ではヘルパーは常駐しない**（v0.4 実測: ソケットアクティベーションは未実装で、`RunAtLoad: true` で常駐する。spec §8 の Ruling S）。launchd がソケットを保持し、最初の接続で root プロセスを起動するソケットアクティベーション。接続が無くなれば終了し、クラッシュ時だけ launchd が再起動して起動時の掃除で残留ルールを消す。プロセスの寿命がセッションに一致する
-- brew 経由のバイナリには quarantine 属性が付かないので署名・公証は v1 ではしない。GitHub Releases からの直接ダウンロードは Developer ID を取ってから
+- 署名・公証は v1 ではしない。Homebrew は cask のダウンロードを**必ず** quarantine する（`$(brew --repository)/Library/Homebrew/cask/download.rb` の `quarantine` が `Quarantine.cask!` を呼ぶ）ので、属性は cask の `postflight` の `xattr -dr com.apple.quarantine` で外す。formula にはその口が無く、これが formula ではなく cask を選んだ理由（spec §8、`docs/install.md`）。GitHub Releases から手で落としたバイナリは属性が付いたままなので、その使い方はサポートしない。Developer ID を取ったら署名・公証してこの後始末を無くす
 - 依存 API は pf（Lion 以降、Apple 自身が使用、`pfctl` は現行 OS に健在）、`DIOCNATLOOK`、`setregid` の 3 つ。いずれも廃止の兆しは無い
 - pf の唯一の罠は `/etc/pf.conf` にアンカー参照を書くと OS 更新で消えること。そこで **ディスクには触らず**、既定の `/etc/pf.conf` がすでに持つワイルドカード参照 `rdr-anchor "com.apple/*"` / `anchor "com.apple/*"` に乗る子アンカー `com.apple/900.tetherd` にルールをロードする。メインルールセットには一切手を入れない。`pfctl -E` / `-X` の参照カウントで有効化する（`/etc/pf.conf` のコメントに書かれている作法）
 - Ventura 以降は LaunchDaemon 追加時に「バックグラウンド項目が追加されました」と通知が出てユーザーが無効化できるので、`doctor` がヘルパー無応答を検出して「システム設定 → 一般 → ログイン項目」を案内する

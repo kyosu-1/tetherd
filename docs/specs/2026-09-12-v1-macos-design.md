@@ -46,7 +46,7 @@
 | UDP / IPv6 | rdr 方式ではフロー単位の元宛先が取れない | netstack 導入時 |
 | WebSocket / gRPC の steal | agent は upgrade を app にそのまま通す | — |
 | Linux / Cloud Run | design.md §13 のとおり | Capturer / Transport の実装追加 |
-| Developer ID 署名・公証 | brew 経由なら quarantine が付かない | Developer ID 取得後 |
+| Developer ID 署名・公証 | cask の `postflight` が quarantine を外す（brew でも属性は必ず付く。§8） | Developer ID 取得後 |
 | 同一マシンでの複数セッション | gid `tetherd` を共有すると pf が区別できない | セッションごとの gid |
 
 ---
