@@ -273,15 +273,59 @@ func TestSessionSetLogsThatDialAndDNSMoved(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("removing the primary logged %d lines (%q), want exactly one saying dial and DNS moved", len(lines), lines)
 	}
-	line := lines[0]
-	for _, want := range []string{short(oldID), short(newID), "went away", "dial and DNS"} {
+	wantPromotionLine(t, lines[0], oldID, newID)
+}
+
+// wantPromotionLine asserts line is the status line a developer reads when
+// dial and DNS move: it names the task that went away and then the task
+// they moved to, in that order, both in the short form run's other status
+// lines use.
+//
+// The order is checked, not just the presence of both ids. With the
+// arguments swapped the line reads "task <survivor> went away; dial and DNS
+// now go through task <the dead one>" - it names the live task as gone and
+// the dead one as the route, which is precisely the misinformation this
+// line exists to avoid, and every token is still present.
+func wantPromotionLine(t *testing.T, line, wentAway, promoted string) {
+	t.Helper()
+	for _, want := range []string{short(wentAway), short(promoted), "went away", "dial and DNS"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("promotion line %q does not mention %q", line, want)
 		}
 	}
-	if strings.Contains(line, oldID) || strings.Contains(line, newID) {
+	if i, j := strings.Index(line, short(wentAway)), strings.Index(line, short(promoted)); i > j {
+		t.Errorf("promotion line %q names %s before %s: the task that went away comes first, then the task dial and DNS moved to",
+			line, short(promoted), short(wentAway))
+	}
+	if strings.Contains(line, wentAway) || strings.Contains(line, promoted) {
 		t.Errorf("promotion line %q prints a full task id, want the short form the other status lines use", line)
 	}
+}
+
+func TestSessionSetLogsThatDialAndDNSMovedWhenReaping(t *testing.T) {
+	// Reap does its own logging, rather than routing through Remove: a
+	// developer whose primary task died has to be told where dial and DNS
+	// went whether the CLI noticed through the task list (Remove) or
+	// through the session ending (Reap).
+	a1 := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	a2 := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	const oldID, newID = "0f3ac8b1d2e4f5a6", "77aa11bb22cc33dd"
+
+	var lines []string
+	set := &SessionSet{Logf: func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}}
+	dead := dialInto(t, a1, "tester")
+	set.Add(task(oldID, 1000), dead)
+	set.Add(task(newID, 2000), dialInto(t, a2, "tester"))
+
+	dead.Close() // the primary's task went away
+	waitFor(t, func() bool { return len(set.Reap()) > 0 }, "Reap to see the primary's session end")
+
+	if len(lines) != 1 {
+		t.Fatalf("reaping the primary logged %d lines (%q), want exactly one saying dial and DNS moved", len(lines), lines)
+	}
+	wantPromotionLine(t, lines[0], oldID, newID)
 }
 
 func TestSessionSetSaysNothingWhenNoPromotionHappens(t *testing.T) {
@@ -327,14 +371,79 @@ func TestSessionSetRemoveDetachesFromTheAgent(t *testing.T) {
 	stays := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
 	set := &SessionSet{Logf: func(string, ...any) {}}
 	set.Add(task("older", 1000), dialInto(t, gone, "tester"))
-	set.Add(task("newer", 2000), dialInto(t, stays, "tester"))
+	survivor := dialInto(t, stays, "tester")
+	set.Add(task("newer", 2000), survivor)
 	waitFor(t, func() bool { return len(gone.a.Sessions()) == 1 }, "the agent to register the session")
 
 	set.Remove("older")
 
 	waitFor(t, func() bool { return len(gone.a.Sessions()) == 0 }, "the removed session's agent to see the detach")
-	if n := len(stays.a.Sessions()); n != 1 {
-		t.Fatalf("the surviving task's agent has %d sessions, want 1: Remove closed a session it was not asked to", n)
+	// The survivor is checked through its own Done, which the client closes
+	// synchronously in finish, and not through stays.a.Sessions(): the
+	// agent's unregister runs on the agent's goroutine when it notices the
+	// connection is gone, so a session count of 1 here says nothing about
+	// whether this session is still open (measured on this branch: the
+	// agent still held the previous session in 60 of 60 runs at the instant
+	// the client returned - see inProcessAgent.waitDetached).
+	select {
+	case <-survivor.Done():
+		t.Fatal("Remove closed a session it was not asked to close")
+	default:
+	}
+}
+
+func TestSessionSetAddRefusesATaskItAlreadyHas(t *testing.T) {
+	// One task means one session. Measured on the first round of this file,
+	// where Add appended unconditionally: two entries for one id made
+	// Remove drop both and close only the last, leaving a session open at
+	// the agent - which keeps this developer registered on a task the CLI
+	// has stopped using and gets the next `tetherd run` refused with
+	// duplicate_user. Add returned true for the duplicate as well, while
+	// the primary was still the first session.
+	//
+	// The refused session is closed here rather than handed back, because
+	// Add's bool cannot tell a caller "refused" from "attached, but not the
+	// primary": leaving it to the caller would leak exactly the session
+	// this refusal exists to prevent.
+	held := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	refused := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	set := &SessionSet{Logf: func(string, ...any) {}}
+
+	first := dialInto(t, held, "tester")
+	if !set.Add(task("dup", 1000), first) {
+		t.Fatal("the first session added must be the primary")
+	}
+	second := dialInto(t, refused, "tester")
+	if set.Add(task("dup", 2000), second) {
+		t.Fatal("Add reported a duplicate task as the primary")
+	}
+
+	if set.Len() != 1 {
+		t.Fatalf("Len = %d after a duplicate Add, want 1: one task holds one session", set.Len())
+	}
+	if set.Primary() != first {
+		t.Fatal("the duplicate displaced the primary")
+	}
+	select {
+	case <-second.Done():
+	default:
+		t.Fatal("Add refused the duplicate but left its session open; nothing else will ever close it")
+	}
+	select {
+	case <-first.Done():
+		t.Fatal("Add closed the session the set already held")
+	default:
+	}
+	waitFor(t, func() bool { return len(refused.a.Sessions()) == 0 }, "the refused session's agent to see the detach")
+
+	// And the one session the set does hold is still the one Remove closes.
+	if !set.Remove("dup") {
+		t.Fatal("Remove returned false for the attached task")
+	}
+	select {
+	case <-first.Done():
+	default:
+		t.Fatal("Remove did not close the session the set held")
 	}
 }
 
@@ -382,6 +491,66 @@ func TestSessionSetReapNamesWhatItDropped(t *testing.T) {
 	}
 	if got := set.TaskIDs(); len(got) != 1 || got[0] != "older" {
 		t.Fatalf("TaskIDs = %v, want the live session untouched", got)
+	}
+}
+
+func TestSessionSetReapActsOnlyOnWhatItSawUnderTheLock(t *testing.T) {
+	// Reap decides, compacts and promotes in one critical section. The
+	// shape it replaced - collect the dead task ids, release the lock, then
+	// Remove them one by one - acted on a name rather than on a session: a
+	// task that is removed and attached again in between hands the same id
+	// back to a live session, and removing it by id then tears that session
+	// down behind the forwarder, ending the run outright if it was the last
+	// one. Measured on the first round of this file: Remove("X"),
+	// Add(task("X",3000), fresh), Remove("X") closes fresh. In the run the
+	// interleave is the follower's poll goroutine re-attaching a task while
+	// a reap is in flight.
+	//
+	// It is made deterministic here through Logf, which is called with the
+	// lock released precisely so that a callback may do anything: this one
+	// removes and re-attaches the second dead task while a reap that has
+	// already seen it is still returning. That doubles as the test that
+	// re-entering the set from Logf does not deadlock.
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	set := &SessionSet{}
+	d1 := dialInto(t, ag, "d1")
+	d2 := dialInto(t, ag, "d2")
+	survivor := dialInto(t, ag, "survivor")
+	fresh := dialInto(t, ag, "fresh")
+	set.Add(task("dead-primary", 1000), d1)
+	set.Add(task("dead-second", 2000), d2)
+	set.Add(task("survivor", 3000), survivor)
+
+	var hooked, removeSaid bool
+	set.Logf = func(string, ...any) {
+		if hooked {
+			return
+		}
+		hooked = true
+		removeSaid = set.Remove("dead-second")
+		set.Add(task("dead-second", 2500), fresh)
+	}
+
+	d1.Close() // both tasks went away; Close closes Done synchronously
+	d2.Close()
+	dropped := set.Reap()
+
+	if !hooked {
+		t.Fatal("reaping the primary logged nothing, so this test proved nothing")
+	}
+	if removeSaid {
+		t.Fatal("Remove(dead-second) from inside Logf returned true: Reap logged before it had compacted, so it was still holding a session it had already decided to drop")
+	}
+	if len(dropped) != 2 || dropped[0] != "dead-primary" || dropped[1] != "dead-second" {
+		t.Fatalf("Reap = %v, want both dead tasks, oldest first", dropped)
+	}
+	select {
+	case <-fresh.Done():
+		t.Fatal("Reap closed the session that took a dropped task's id after the lock was released")
+	default:
+	}
+	if !set.Has("dead-second") || set.Primary() != fresh {
+		t.Fatalf("TaskIDs = %v, want the re-attached task held and primary, being older than the survivor", set.TaskIDs())
 	}
 }
 

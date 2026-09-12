@@ -37,6 +37,13 @@ type attached struct {
 // deploy is what this is for. Promotion does not re-read the environment -
 // the child process already has it and cannot be told again.
 type SessionSet struct {
+	// Logf reports promotions. It is called with the set's lock released
+	// and from whichever goroutine removed or reaped the session - the
+	// follower's poll goroutine today, and the run goroutine if anything
+	// there ever removes one - so it may be called concurrently and has to
+	// be safe for that; run's own logf is an unguarded Fprintf, so a
+	// caller that shares that writer needs its own mutex. Calling back
+	// into the set from it is allowed and does not deadlock.
 	Logf func(string, ...any)
 
 	mu      sync.Mutex
@@ -50,12 +57,33 @@ func (s *SessionSet) logf(format string, args ...any) {
 }
 
 // Add attaches sess for task and reports whether it is now the primary.
+//
+// A task the set already holds is refused: sess is closed and Add returns
+// false. One task means one session, because Remove and Close each close
+// the session they find for a task - a second entry for the same id would
+// leave one session open at the agent, which keeps this developer
+// registered on a task the CLI has stopped using and gets the next
+// `tetherd run` refused with duplicate_user. The caller does not have to
+// tell a refusal from "attached, but not the primary": either way it owes
+// the set nothing, because the set closed what it would not take.
+//
+// Callers still gate on Has: a refusal costs an attach round trip, and
+// with two goroutines attaching it is the loser of the race that gets
+// refused, not the caller that was wrong.
 func (s *SessionSet) Add(task transport.Task, sess *session.Client) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	for _, e := range s.entries {
+		if e.task.ID == task.ID {
+			s.mu.Unlock()
+			sess.Close()
+			return false
+		}
+	}
 	s.entries = append(s.entries, attached{task: task, sess: sess})
 	s.sortLocked()
-	return s.entries[0].task.ID == task.ID
+	primary := s.entries[0].task.ID == task.ID
+	s.mu.Unlock()
+	return primary
 }
 
 // sortLocked puts the oldest task first. It is the same order DiscoverAll
@@ -67,35 +95,69 @@ func (s *SessionSet) sortLocked() {
 	})
 }
 
-// Remove closes and forgets taskID's session, promoting a new primary if it
-// was the primary. It reports whether such a session existed.
-func (s *SessionSet) Remove(taskID string) bool {
-	s.mu.Lock()
-	var removed *attached
+// dropLocked forgets every entry drop reports true for and returns them,
+// along with the ids of the task that was the primary and the task promoted
+// in its place - both empty when the primary did not change.
+//
+// Deciding *and* compacting in one critical section is the point of this
+// helper. Collecting task ids under the lock and then removing them by id
+// afterwards acts on a name rather than on a session: a task that is
+// removed and attached again in between (the follower re-attaching while
+// this goroutine reaps) hands the same id back to a live session, and
+// removing it then tears that session down behind the forwarder - and ends
+// the run outright if it was the last one.
+//
+// The caller closes the returned sessions and logs after releasing the
+// lock: Close writes bye to the wire, and Logf belongs to whoever built the
+// set.
+func (s *SessionSet) dropLocked(drop func(attached) bool) (removed []attached, wentAway, promoted string) {
+	was := ""
+	if len(s.entries) > 0 {
+		was = s.entries[0].task.ID
+	}
 	kept := s.entries[:0]
-	wasPrimary := len(s.entries) > 0 && s.entries[0].task.ID == taskID
 	for _, e := range s.entries {
-		if e.task.ID == taskID {
-			e := e
-			removed = &e
+		if drop(e) {
+			removed = append(removed, e)
 			continue
 		}
 		kept = append(kept, e)
 	}
-	s.entries = kept
-	promoted := ""
-	if wasPrimary && len(s.entries) > 0 {
-		promoted = s.entries[0].task.ID
+	// Clear the tail the filter leaves behind, so a session this set no
+	// longer holds is not still reachable from the backing array.
+	for i := len(kept); i < len(s.entries); i++ {
+		s.entries[i] = attached{}
 	}
+	s.entries = kept
+	if len(s.entries) > 0 && s.entries[0].task.ID != was {
+		return removed, was, s.entries[0].task.ID
+	}
+	return removed, "", ""
+}
+
+// promoted announces where dial and DNS went. Remove and Reap both call it
+// after releasing the lock.
+func (s *SessionSet) promoted(wentAway, to string) {
+	if to == "" {
+		return
+	}
+	s.logf("↻ session   task %s went away; dial and DNS now go through task %s", short(wentAway), short(to))
+}
+
+// Remove closes and forgets taskID's session, promoting a new primary if it
+// was the primary. It reports whether such a session existed.
+func (s *SessionSet) Remove(taskID string) bool {
+	s.mu.Lock()
+	removed, wentAway, to := s.dropLocked(func(e attached) bool { return e.task.ID == taskID })
 	s.mu.Unlock()
 
-	if removed == nil {
+	if len(removed) == 0 {
 		return false
 	}
-	removed.sess.Close()
-	if promoted != "" {
-		s.logf("↻ session   task %s went away; dial and DNS now go through task %s", short(taskID), short(promoted))
+	for _, e := range removed {
+		e.sess.Close()
 	}
+	s.promoted(wentAway, to)
 	return true
 }
 
@@ -153,23 +215,32 @@ func (s *SessionSet) Resolve(ctx context.Context, name string) ([]string, int, e
 	return p.Resolve(ctx, name)
 }
 
-// Reap drops sessions whose Done channel has fired and returns their task
-// ids. A secondary dying is normal - the task was replaced - so it is
-// reaped and logged rather than ending the run.
+// Reap drops the sessions whose Done channel has fired and returns the task
+// ids it dropped - only those: a session another caller dropped first is
+// not named here, so a caller may log from this. A secondary dying is
+// normal - the task was replaced - so it is reaped and logged rather than
+// ending the run.
 func (s *SessionSet) Reap() []string {
 	s.mu.Lock()
-	var dead []string
-	for _, e := range s.entries {
+	removed, wentAway, to := s.dropLocked(func(e attached) bool {
 		select {
 		case <-e.sess.Done():
-			dead = append(dead, e.task.ID)
+			return true
 		default:
+			return false
 		}
-	}
+	})
 	s.mu.Unlock()
-	for _, id := range dead {
-		s.Remove(id)
+
+	if len(removed) == 0 {
+		return nil
 	}
+	dead := make([]string, 0, len(removed))
+	for _, e := range removed {
+		e.sess.Close() // already finished; this reclaims the mux
+		dead = append(dead, e.task.ID)
+	}
+	s.promoted(wentAway, to)
 	return dead
 }
 
