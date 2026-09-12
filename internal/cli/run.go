@@ -12,14 +12,8 @@ import (
 	"strings"
 	"time"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
-	awsecs "github.com/aws/aws-sdk-go-v2/service/ecs"
-	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
-
 	"github.com/kyosu-1/tetherd/internal/awsid"
 	"github.com/kyosu-1/tetherd/internal/capture"
-	"github.com/kyosu-1/tetherd/internal/capture/pfrdr"
 	"github.com/kyosu-1/tetherd/internal/env"
 	"github.com/kyosu-1/tetherd/internal/helper"
 	"github.com/kyosu-1/tetherd/internal/proto"
@@ -28,7 +22,6 @@ import (
 	"github.com/kyosu-1/tetherd/internal/session"
 	"github.com/kyosu-1/tetherd/internal/transport"
 	"github.com/kyosu-1/tetherd/internal/transport/direct"
-	ssmtr "github.com/kyosu-1/tetherd/internal/transport/ssm"
 )
 
 // RunOptions are the flags of `tetherd run`.
@@ -189,6 +182,12 @@ func emptyAWSConfigFile() (string, func(), error) {
 // Run connects to the agent, installs capture, runs the command and cleans
 // up. It returns the child's exit code.
 func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
+	return RunWithDeps(ctx, opts, stderr, Deps{})
+}
+
+// RunWithDeps is Run with substitutable collaborators (see Deps).
+func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps) (int, error) {
+	d = d.withDefaults()
 	logf := func(format string, args ...any) { fmt.Fprintf(stderr, "tetherd  "+format+"\n", args...) }
 	if len(opts.Command) == 0 {
 		return 2, errors.New("no command given")
@@ -216,19 +215,12 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 		if opts.Cluster == "" || opts.Service == "" {
 			return 2, errors.New("--transport ssm needs --cluster and --service")
 		}
-		var loadOpts []func(*awsconfig.LoadOptions) error
-		if opts.Profile != "" {
-			loadOpts = append(loadOpts, awsconfig.WithSharedConfigProfile(opts.Profile))
-		}
-		if opts.Region != "" {
-			loadOpts = append(loadOpts, awsconfig.WithRegion(opts.Region))
-		}
-		awscfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
+		prov, err := d.NewAWSProvider(ctx, opts)
 		if err != nil {
 			return 1, fmt.Errorf("aws config: %w", err)
 		}
-		region = awscfg.Region
-		task, err = ecsprov.Discover(ctx, awsecs.NewFromConfig(awscfg), ecsprov.Target{Cluster: opts.Cluster, Service: opts.Service, TaskID: opts.TaskID})
+		region = prov.Region()
+		task, err = prov.Discover(ctx, ecsprov.Target{Cluster: opts.Cluster, Service: opts.Service, TaskID: opts.TaskID})
 		if err != nil {
 			return 1, err
 		}
@@ -238,13 +230,13 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 			logf("%s/%s  task %s  (started %s ago)", opts.Cluster, opts.Service, short(task.ID), time.Since(task.StartedAt).Round(time.Minute))
 		}
 		if !opts.NoNetwork {
-			vpc, err := ecsprov.VPCCIDRs(ctx, awsec2.NewFromConfig(awscfg), task.SubnetID)
+			vpc, err := prov.VPCCIDRs(ctx, task.SubnetID)
 			if err != nil {
 				return 1, err
 			}
 			cidrs = append(append(vpc, ecsprov.TaskRoleCIDR), extra...)
 		}
-		tr = &ssmtr.Transport{API: awsssm.NewFromConfig(awscfg), Region: awscfg.Region, Profile: opts.Profile, Logf: logf}
+		tr = prov.Transport(logf)
 	default:
 		return 2, fmt.Errorf("unknown transport %q (ssm | direct)", opts.Transport)
 	}
@@ -253,12 +245,12 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 	// is not running, or a missing tetherd-exec, should not cost a
 	// StartSession round trip. A *busy* helper is only discovered when the
 	// pf rules are applied (step 4), which needs the session's VPC CIDRs.
-	var hc *helper.Client
+	var hc HelperClient
 	if !opts.NoNetwork {
 		if _, err := os.Stat(opts.ExecPath); err != nil {
 			return 1, fmt.Errorf("%s not found; is tetherd-helper running? (%w)", opts.ExecPath, err)
 		}
-		hc, err = helper.Dial(opts.HelperSocket)
+		hc, err = d.DialHelper(opts.HelperSocket)
 		if err != nil {
 			return 1, err
 		}
@@ -297,8 +289,7 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 				logf("⚠ remote CIDR overlaps this machine's network: %s (that part of the LAN is routed through the agent for the child)", o)
 			}
 		}
-		cap := pfrdr.New(hc)
-		cap.Logf = logf
+		cap := d.NewCapturer(hc, logf)
 		if err := cap.Start(ctx, capture.Spec{RemoteCIDRs: cidrs}); err != nil {
 			var busy *helper.BusyError
 			if errors.As(err, &busy) {
