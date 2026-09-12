@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -271,6 +272,50 @@ func TestResolveThroughSession(t *testing.T) {
 	}
 	if h.resolved != "api.myapp.internal" {
 		t.Fatalf("the agent saw %q", h.resolved)
+	}
+}
+
+// TestResolveNotFoundThroughSession pins the two hops of the not_found
+// plumbing that live in this package: serveStream must set
+// ResolveReply.NotFound when the handler's error satisfies
+// errors.Is(err, ErrNameNotFound), and Client.Resolve must in turn wrap
+// ErrNameNotFound (via %w) into the error it returns whenever the reply
+// says NotFound - not just echo the error text. dnsproxy answers NXDOMAIN
+// based on errors.Is alone, so a text-only propagation would silently
+// break it.
+func TestResolveNotFoundThroughSession(t *testing.T) {
+	cc, sc := pair(t)
+	h := &fakeHandler{closed: make(chan struct{}), resolveErr: fmt.Errorf("lookup nope.internal: %w", ErrNameNotFound)}
+	go Serve(context.Background(), sc, h, ServeOptions{})
+	c, err := Dial(context.Background(), cc, proto.Hello{Version: proto.Version, User: "shota"}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, _, err = c.Resolve(context.Background(), "nope.internal")
+	if !errors.Is(err, ErrNameNotFound) {
+		t.Fatalf("err = %v, want it to satisfy errors.Is(err, ErrNameNotFound)", err)
+	}
+}
+
+// TestResolveOtherFailuresAreNotErrNameNotFound guards the other direction:
+// an ordinary resolve error (no ErrNameNotFound anywhere in its chain) must
+// not come back satisfying errors.Is(err, ErrNameNotFound) - otherwise
+// every transient failure would read as NXDOMAIN instead of SERVFAIL.
+func TestResolveOtherFailuresAreNotErrNameNotFound(t *testing.T) {
+	cc, sc := pair(t)
+	h := &fakeHandler{closed: make(chan struct{}), resolveErr: errors.New("agent's resolv.conf is broken")}
+	go Serve(context.Background(), sc, h, ServeOptions{})
+	c, err := Dial(context.Background(), cc, proto.Hello{Version: proto.Version, User: "shota"}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	_, _, err = c.Resolve(context.Background(), "nope.internal")
+	if errors.Is(err, ErrNameNotFound) {
+		t.Fatalf("an ordinary failure must not satisfy errors.Is(err, ErrNameNotFound): %v", err)
 	}
 }
 

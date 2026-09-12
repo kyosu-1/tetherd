@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/miekg/dns"
 
 	"github.com/kyosu-1/tetherd/internal/agent"
 	"github.com/kyosu-1/tetherd/internal/capture"
@@ -441,19 +445,128 @@ func TestRunWarnsWhenTheCredentialEndpointIsNotCaptured(t *testing.T) {
 }
 
 // TestRunPointsRemoteDomainsAtTheAgent pins the wiring in Run's transparent
-// branch: network.remote_domains must start a loopback DNS resolver, point
-// it at the agent's own Resolve, and hand the helper the domains and the
-// port it actually bound so /etc/resolver gets written - and the status
-// line must say what is routed there, since that line is the only thing an
-// operator sees this happened at all.
+// branch end to end: network.remote_domains must start a loopback DNS
+// resolver, hand the helper the domains and the port it actually bound, and
+// wire that resolver's Resolve to the real session (so it reaches this
+// in-process agent) - not just record the right-looking fields. A stub
+// asserting only hcFake.domains and hcFake.port would still pass with the
+// port hardcoded wrong or Resolve replaced by something that always
+// errors; querying the resolver at the exact port resolver.set was told
+// about is what makes either of those failures visible. ResolverClear
+// being called at teardown is also pinned here, alongside the status line.
 func TestRunPointsRemoteDomainsAtTheAgent(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agent.New(agent.Config{Env: "dev", TaskARN: "arn:test", AppContainer: "app"}, nil)
+	a.SetEnvReader(fakeEnvReader{env: map[string]string{"A": "1"}, arn: "arn:test"})
+	a.SetResolver(func(_ context.Context, name string) ([]net.IPAddr, error) {
+		if name == "api.myapp.internal" {
+			return []net.IPAddr{{IP: net.ParseIP("10.0.11.229")}}, nil
+		}
+		return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+	})
+	actx, acancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { acancel(); ln.Close() })
+	go a.Serve(actx, ln)
+
+	p := &fakeProvider{
+		region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ln.Addr().String(),
+	}
+	portKnown := make(chan struct{})
+	hcFake := &fakeHelperClient{}
+	hcFake.onResolverSet = func() { close(portKnown) }
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return hcFake, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+
+	// The real setgid tetherd-exec would run opts.Command; this stand-in
+	// just sleeps so the resolver stays up long enough for the query below
+	// - what actually runs is irrelevant to what this test pins (the same
+	// convention TestRunTaskRoleOverrideBeatsConfigEnvOverride uses).
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-exec.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.ExecPath = script
+	opts.RemoteDomains = []string{"api.myapp.internal"}
+	var out strings.Builder
+	runDone := make(chan struct{})
+	var code int
+	var runErr error
+	go func() {
+		code, runErr = RunWithDeps(context.Background(), opts, &out, d)
+		close(runDone)
+	}()
+
+	select {
+	case <-portKnown:
+	case <-time.After(5 * time.Second):
+		t.Fatal("resolver.set was never called")
+	}
+	if hcFake.port == 0 {
+		t.Fatalf("resolver.set was called with port 0")
+	}
+
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn("api.myapp.internal"), dns.TypeA)
+	c := &dns.Client{Net: "udp", Timeout: 5 * time.Second}
+	resp, _, err := c.Exchange(m, fmt.Sprintf("127.0.0.1:%d", hcFake.port))
+	if err != nil {
+		t.Fatalf("querying the resolver at the recorded port %d: %v", hcFake.port, err)
+	}
+	if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 1 {
+		t.Fatalf("rcode=%d answer=%v", resp.Rcode, resp.Answer)
+	}
+	rec, ok := resp.Answer[0].(*dns.A)
+	if !ok || rec.A.String() != "10.0.11.229" {
+		t.Fatalf("answer = %v, want 10.0.11.229", resp.Answer[0])
+	}
+
+	select {
+	case <-runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("RunWithDeps never returned")
+	}
+	if runErr != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, runErr, out.String())
+	}
+	if len(hcFake.domains) != 1 || hcFake.domains[0] != "api.myapp.internal" {
+		t.Fatalf("resolver.set was called with %v", hcFake.domains)
+	}
+	if !strings.Contains(out.String(), "api.myapp.internal via the VPC resolver") {
+		t.Errorf("the status line must say what is routed: %s", out.String())
+	}
+	if !hcFake.cleared {
+		t.Fatalf("hc.ResolverClear() must be called during teardown")
+	}
+}
+
+// TestRunClearsTheResolverEvenWhenResolverSetPartiallyFails pins the fix
+// for the worst outcome this task could produce: hc.ResolverClear() must
+// run even when hc.ResolverSet itself fails (e.g. it writes
+// myapp.internal's file fine and then errors on corp.internal, which some
+// other tool already manages). Registering the clear defer only after a
+// successful ResolverSet would leave myapp.internal's file pointed at
+// 127.0.0.1:<port> with nothing listening there anymore, forever, until
+// someone deletes it by hand.
+func TestRunClearsTheResolverEvenWhenResolverSetPartiallyFails(t *testing.T) {
 	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
 	p := &fakeProvider{
 		region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
 		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
 		agentAddr: ag.addr,
 	}
-	hcFake := &fakeHelperClient{}
+	hcFake := &fakeHelperClient{
+		resolverSetErr: errors.New("resolver.set: /etc/resolver/corp.internal exists and is not managed by tetherd"),
+	}
 	d := depsFor(p)
 	d.DialHelper = func(string) (HelperClient, error) { return hcFake, nil }
 	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
@@ -461,16 +574,13 @@ func TestRunPointsRemoteDomainsAtTheAgent(t *testing.T) {
 	opts := ssmOpts("true")
 	opts.NoNetwork = false
 	opts.ExecPath = "/usr/bin/true"
-	opts.RemoteDomains = []string{"myapp.internal"}
-	var out strings.Builder
-	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
-		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	opts.RemoteDomains = []string{"myapp.internal", "corp.internal"}
+	code, err := RunWithDeps(context.Background(), opts, io.Discard, d)
+	if code != 1 || err == nil {
+		t.Fatalf("code=%d err=%v, want Run to report the resolver.set failure", code, err)
 	}
-	if len(hcFake.domains) != 1 || hcFake.domains[0] != "myapp.internal" {
-		t.Fatalf("resolver.set was called with %v", hcFake.domains)
-	}
-	if !strings.Contains(out.String(), "myapp.internal via the VPC resolver") {
-		t.Errorf("the status line must say what is routed: %s", out.String())
+	if !hcFake.cleared {
+		t.Fatalf("hc.ResolverClear() must run even when resolver.set fails partway through")
 	}
 }
 
@@ -505,6 +615,16 @@ func TestRunNoNetworkSkipsTheResolverEvenWithRemoteDomains(t *testing.T) {
 
 type fakeHelperClient struct {
 	domains []string
+	port    int
+	cleared bool
+	// resolverSetErr, when set, is what ResolverSet returns - after still
+	// recording domains/port, the way the real helper records some
+	// domains as written before failing on a later one.
+	resolverSetErr error
+	// onResolverSet, when set, runs synchronously inside ResolverSet right
+	// after recording domains/port, so a test can learn the port without
+	// polling.
+	onResolverSet func()
 }
 
 func (f *fakeHelperClient) PfApply(helper.PfSpec) error { return nil }
@@ -512,12 +632,19 @@ func (f *fakeHelperClient) PfClear() error              { return nil }
 func (f *fakeHelperClient) NatLook(string, netip.AddrPort, netip.AddrPort) (netip.AddrPort, error) {
 	return netip.MustParseAddrPort("10.0.0.1:5432"), nil
 }
-func (f *fakeHelperClient) ResolverSet(domains []string, _ int) error {
+func (f *fakeHelperClient) ResolverSet(domains []string, port int) error {
 	f.domains = domains
+	f.port = port
+	if f.onResolverSet != nil {
+		f.onResolverSet()
+	}
+	return f.resolverSetErr
+}
+func (f *fakeHelperClient) ResolverClear() error {
+	f.cleared = true
 	return nil
 }
-func (f *fakeHelperClient) ResolverClear() error { return nil }
-func (f *fakeHelperClient) Close() error         { return nil }
+func (f *fakeHelperClient) Close() error { return nil }
 
 type fakeCapturer struct {
 	// spec is what Run asked to capture: capture.Spec is the whole contract

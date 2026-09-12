@@ -129,6 +129,22 @@ func TestResolveReplyErrorWireFormat(t *testing.T) {
 	}
 }
 
+// TestResolveReplyNotFoundWireFormat pins the additive not_found field: an
+// agent built before it existed omits it, which an older CLI (and the
+// json:",omitempty" tag) both treat as false, so this stays backward
+// compatible in both directions.
+func TestResolveReplyNotFoundWireFormat(t *testing.T) {
+	var buf bytes.Buffer
+	r := ResolveReply{Error: "no such host", NotFound: true}
+	if err := NewEncoder(&buf).Encode(TypeResolve, r); err != nil {
+		t.Fatal(err)
+	}
+	want := `{"error":"no such host","not_found":true,"ok":false,"type":"resolve"}` + "\n"
+	if got := buf.String(); got != want {
+		t.Fatalf("ResolveReply (not found) wire format changed:\n got  %q\n want %q", got, want)
+	}
+}
+
 func TestEncodeConcurrent(t *testing.T) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)

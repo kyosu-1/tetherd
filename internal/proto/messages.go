@@ -90,4 +90,12 @@ type ResolveReply struct {
 	Addrs []string `json:"addrs,omitempty"`
 	TTL   int      `json:"ttl,omitempty"`
 	Error string   `json:"error,omitempty"`
+	// NotFound distinguishes "the name does not exist" (or resolved to no
+	// usable IPv4 address) from every other resolve failure - a network
+	// glitch, a misconfigured resolv.conf. dnsproxy uses it to answer
+	// NXDOMAIN instead of SERVFAIL, so a mistyped hostname reads as "host
+	// not found" instead of a retried timeout. Additive: an older agent
+	// never sets it, which degrades to today's SERVFAIL - still correct,
+	// just less specific.
+	NotFound bool `json:"not_found,omitempty"`
 }

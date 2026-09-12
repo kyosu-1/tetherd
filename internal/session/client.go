@@ -175,6 +175,9 @@ func (c *Client) Resolve(ctx context.Context, name string) ([]string, int, error
 			if msg == "" {
 				msg = "agent did not say why"
 			}
+			if reply.NotFound {
+				return nil, 0, fmt.Errorf("resolve %s via agent: %s: %w", name, msg, ErrNameNotFound)
+			}
 			return nil, 0, fmt.Errorf("resolve %s via agent: %s", name, msg)
 		}
 		return reply.Addrs, reply.TTL, nil

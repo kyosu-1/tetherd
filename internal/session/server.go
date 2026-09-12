@@ -166,7 +166,7 @@ func serveStream(ctx context.Context, s net.Conn, h Handler, resolveTimeout time
 		addrs, ttl, err := h.Resolve(rctx, hd.Name)
 		cancel()
 		if err != nil {
-			enc.Encode(proto.TypeResolve, proto.ResolveReply{Error: err.Error()})
+			enc.Encode(proto.TypeResolve, proto.ResolveReply{Error: err.Error(), NotFound: errors.Is(err, ErrNameNotFound)})
 			return
 		}
 		enc.Encode(proto.TypeResolve, proto.ResolveReply{OK: true, Addrs: addrs, TTL: ttl})

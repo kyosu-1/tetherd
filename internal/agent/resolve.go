@@ -2,8 +2,11 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+
+	"github.com/kyosu-1/tetherd/internal/session"
 )
 
 // resolveTTL is what the CLI's resolver reports to its callers. Go's
@@ -39,6 +42,14 @@ func (h *handler) Resolve(ctx context.Context, name string) ([]string, int, erro
 	}
 	ips, err := lookup(ctx, name)
 	if err != nil {
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+			// The OS resolver itself says the name does not exist (as
+			// opposed to a timeout, a server failure, or anything else
+			// transient) - wrap the shared sentinel so dnsproxy, two hops
+			// away over the wire, can answer NXDOMAIN instead of SERVFAIL.
+			return nil, 0, fmt.Errorf("%s: %w", name, session.ErrNameNotFound)
+		}
 		return nil, 0, err
 	}
 	seen := make(map[string]bool, len(ips))
@@ -59,7 +70,7 @@ func (h *handler) Resolve(ctx context.Context, name string) ([]string, int, erro
 		}
 	}
 	if len(out) == 0 {
-		return nil, 0, fmt.Errorf("%s resolved to no IPv4 address (IPv6-only answers are not usable through tetherd)", name)
+		return nil, 0, fmt.Errorf("%s resolved to no IPv4 address (IPv6-only answers are not usable through tetherd): %w", name, session.ErrNameNotFound)
 	}
 	return out, resolveTTL, nil
 }

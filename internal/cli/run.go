@@ -481,10 +481,18 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 				return 1, fmt.Errorf("start the DNS resolver: %w", err)
 			}
 			defer dsrv.Close()
+			// Registered before ResolverSet is even called, not after it
+			// succeeds: ResolverSet writes one /etc/resolver/<domain> file
+			// per domain and can fail partway through (e.g. a later
+			// domain already has a file some other tool manages), and
+			// ResolverClear only ever removes files tetherd itself wrote -
+			// so running it unconditionally on any exit from this point on
+			// is always safe, and is what stops a partial failure from
+			// leaving a domain pointed at a resolver that just exited.
+			defer hc.ResolverClear()
 			if err := hc.ResolverSet(opts.RemoteDomains, int(daddr.Port())); err != nil {
 				return 1, fmt.Errorf("point %s at the agent: %w", strings.Join(opts.RemoteDomains, ", "), err)
 			}
-			defer hc.ResolverClear()
 			dnsStatus = fmt.Sprintf("local (+ %s via the VPC resolver on 127.0.0.1:%d)", strings.Join(opts.RemoteDomains, ", "), daddr.Port())
 		}
 		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s · DNS: %s", joinPrefixes(cidrs), dnsStatus)
