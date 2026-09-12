@@ -23,7 +23,7 @@ RUN="./bin/tetherd run --profile personal --cluster tetherd-dev --service api"
 | 6 | `$RUN -- curl -s http://api.myapp.internal:8081/` | 失敗（v0.2a では DNS は解けない） | `remote_domains` は v0.2b。`$RUN -- curl -s http://<task private IP>:8081/` は `from 10.0.x.x`（agent の IP）で通る |
 | 7 | `$RUN --env prod -- true` | `refusing to attach: agent reports TETHERD_ENV="dev", expected "prod"` で exit 1 | 環境ガード |
 | 8 | 2 つ目のターミナルで `$RUN -- sleep 60` を動かしたまま 1 つ目で `$RUN -- true` | `another tetherd session is active` で exit 1 | 1 台 1 セッション |
-| 9 | 2 の実行中に `aws ecs stop-task --profile personal --cluster tetherd-dev --task <id>` | `✗ agent session lost` が出て psql が終了、exit 1、`pfctl -a com.apple/900.tetherd -sr` が空 | セッション断の片付け |
+| 9 | 実行中にトランスポートを落とす: `kill $(pgrep -n -f session-manager-plugin)` | `✗ agent session lost: … control stream closed: EOF` が即座に出て子プロセスが終了、exit 1、`sudo pfctl -a com.apple/900.tetherd -sr` が空 | セッション断の検出と片付け。`aws ecs stop-task` ではタスクが `DEACTIVATING`（ALB のデレジストレーション待ち、既定 300 秒）の間コンテナが動き続けるため、セッションはすぐには切れない。検出経路を試すならトランスポートを殺すほうが速く確実 |
 | 10 | 別ターミナルで、実行中に `lsof -nP -iTCP -sTCP:LISTEN \| grep session-manager` | `127.0.0.1:<port>` だけが LISTEN（外部 IF には無い） | plugin のローカルフォワードは `127.0.0.1` にしか bind しない。無認証だが同一マシンに閉じることの確認（spec §11） |
 
 所要時間の目安: `StartSession` → `welcome` まで 2〜4 秒、psql の接続確立 +50〜100 ms。

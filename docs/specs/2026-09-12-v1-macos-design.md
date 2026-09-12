@@ -509,7 +509,32 @@ design.md §10 に加えて:
 | 2 | `DIOCNATLOOK`（84 バイト、`0xC0544417`）が元の宛先を正しく返した |
 | 3 | `DIOCCHANGERULE` は不要。既定 `/etc/pf.conf` の `com.apple/*` に子アンカー `com.apple/900.tetherd` で乗り、セッションごとの `pfctl -E`/`-X` と `-F rules/nat/Tables` で終了後のアンカーは空 |
 | 4 | 未検証（`remote_domains` を使う v0.2 で） |
-| 5, 6 | v0.2a の docs/e2e-aws.md で検証（結果は実行後に追記） |
+| 5 | **通った**。`pidMode: task` + agent への `SYS_PTRACE` + ECS Exec（ssm-agent 注入）は同じタスク定義で共存し、agent が app コンテナの `/proc/<pid>/environ` から 19 個の env を読めた。Secrets Manager 由来の `DB_PASSWORD`（24 文字）と SSM Parameter Store 由来の `FEATURE_FLAG` が解決済みの値で入っていた |
+| 6 | **通った**。`ssm:StartSession` + `AWS-StartPortForwardingSession` で `127.0.0.1:9900` に届く。ただしターゲットは **agent コンテナの runtimeId では駄目**だった（§6.1 参照）。所要時間は `StartSession` から `welcome` まで 2〜4 秒、確立後のフロー 1 本あたりの往復は RDS のクエリで体感できないレベル |
+
+### AWS 検証結果（2026-09-12、`deploy/dev-env` + `docs/e2e-aws.md`）
+
+実機の Fargate タスク（ap-northeast-1、ARM64、`pidMode: task`）に対して macOS 26.6.2 から実行。
+
+| 検証 | 結果 |
+|---|---|
+| env 注入 | ✅ タスクの env 19 個。`DB_PASSWORD`（Secrets Manager）と `FEATURE_FLAG`（Parameter Store）が解決済みで届く。`PATH` などはローカルのまま |
+| VPC 内への透過アクセス | ✅ ローカルの Go プロセスが `DB_HOST` の RDS に接続して `SELECT now()` を返した（pf rdr → `DIOCNATLOOK` → SSM → agent → RDS） |
+| タスクのプライベート IP への到達 | ✅ `curl http://10.0.11.229:8081/` が通り、タスク側は `from 10.0.11.229`（自分の ENI）と認識した |
+| タスクロール | ✅ 子プロセスの `aws sts get-caller-identity` が `assumed-role/tetherd-dev-api-task/…`。ただし §6.4 の対策（共有設定を隠す）が必要だった |
+| VPC 外の AWS サービス | ✅ `aws s3 ls` がタスクロールで成功（署名ベースなのでラップトップの回線から出る） |
+| gid のスコープ | ✅ `go run` がビルドして起動したバイナリも gid `tetherd`（309）。孫・ひ孫まで継承される |
+| 環境ガード | ✅ `--env prod` で dev のタスクに繋ごうとすると `refusing to attach: agent reports TETHERD_ENV="dev", expected "prod"` で exit 1 |
+| 1 台 1 セッション | ✅ 2 つ目の `run` が `another tetherd session is active (pid …, since …)` で exit 1 |
+| セッション断 | ✅ トランスポートを殺すと即座に `✗ agent session lost: control stream closed: EOF`、子プロセスを停止して exit 1 |
+
+実機でしか出なかった問題（すべて修正済み。詳細は §6.1、§6.4）:
+
+1. `ssm:StartSession` のターゲットに agent コンテナの runtimeId を使うと `TargetNotConnected`。distroless の agent コンテナでは ECS Exec の SSM エージェントが接続できていないのに、`DescribeTasks` は `RUNNING` と報告する。awsvpc は netns を共有するので、同じタスクの別コンテナ経由で転送すれば `127.0.0.1:9900` に届く
+2. 開発者の `~/.aws/config` の `default` プロファイルがコンテナクレデンシャルより先に評価され、タスクロールを覆い隠す
+3. distroless イメージの `SSL_CERT_FILE`（コンテナ内のパス）が注入され、macOS 側の子プロセスの TLS が全部壊れる
+
+---
 
 ---
 
