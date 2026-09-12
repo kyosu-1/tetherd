@@ -276,6 +276,11 @@ func TestTaskRoleReachable(t *testing.T) {
 	if !taskRoleReachable(withURI, []netip.Prefix{netip.MustParsePrefix("169.254.0.0/16")}) {
 		t.Error("a range containing 169.254.170.0/24 must count as captured")
 	}
+	// A sub-range that overlaps the /24 but misses 169.254.170.2 does not:
+	// the child would still have nowhere to fetch credentials from.
+	if taskRoleReachable(withURI, []netip.Prefix{netip.MustParsePrefix("169.254.170.16/28")}) {
+		t.Error("a range that does not cover 169.254.170.2 must not count as captured")
+	}
 }
 
 func TestTaskRoleEnvPrefersTheTaskRegion(t *testing.T) {

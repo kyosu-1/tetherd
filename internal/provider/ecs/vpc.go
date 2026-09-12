@@ -20,6 +20,12 @@ type EC2API interface {
 // (169.254.170.2). It is always routed through the agent (spec §4.1).
 var TaskRoleCIDR = netip.MustParsePrefix("169.254.170.0/24")
 
+// TaskRoleAddr is the address inside TaskRoleCIDR that those endpoints
+// actually answer on. Checking that a captured range contains this address
+// is stricter than checking that it overlaps TaskRoleCIDR: a range like
+// 169.254.170.16/28 overlaps the /24 without covering the endpoint.
+var TaskRoleAddr = netip.MustParseAddr("169.254.170.2")
+
 // VPCCIDRs returns every associated IPv4 CIDR of the VPC that subnetID
 // belongs to (primary and secondary blocks).
 func VPCCIDRs(ctx context.Context, api EC2API, subnetID string) ([]netip.Prefix, error) {

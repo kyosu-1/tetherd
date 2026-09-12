@@ -124,8 +124,8 @@ func checkTargetEnv(w proto.Welcome, opts RunOptions) error {
 }
 
 // taskRoleReachable reports whether the child can reach the task-role
-// credential endpoint: the task must advertise it and 169.254.170.0/24 must
-// be in the captured set. Only the ssm transport adds that range
+// credential endpoint: the task must advertise it and a captured range must
+// cover 169.254.170.2. Only the ssm transport adds that range
 // automatically; with --transport direct the operator has to pass
 // --remote-cidr 169.254.170.0/24 for the child's SDK to get there. Without
 // this check tetherd would strip the developer's own credentials and hide
@@ -136,7 +136,7 @@ func taskRoleReachable(taskEnv map[string]string, cidrs []netip.Prefix) bool {
 		return false
 	}
 	for _, p := range cidrs {
-		if p.Overlaps(ecsprov.TaskRoleCIDR) {
+		if p.Contains(ecsprov.TaskRoleAddr) {
 			return true
 		}
 	}
