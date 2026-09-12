@@ -109,6 +109,7 @@ func applyConfig(cmd *cobra.Command, opts *RunOptions) error {
 	opts.LocalCIDRs = cfg.Shared.Network.LocalCIDRs
 	opts.RemoteServices = cfg.Shared.Network.RemoteServices
 	opts.RemoteDomains = cfg.Shared.Network.RemoteDomains
+	opts.PinCredentialRoute = cfg.Shared.Network.PinCredentialRoute
 	opts.EnvOverride = cfg.Shared.Env.Override
 	opts.EnvExclude = cfg.Shared.Env.Exclude
 

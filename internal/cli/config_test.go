@@ -37,6 +37,44 @@ func TestApplyConfigFillsUnsetFlagsOnly(t *testing.T) {
 	}
 }
 
+// TestApplyConfigCarriesPinCredentialRoute: the machine-wide route pin has
+// no flag on purpose (it is rarely wanted and affects every process on the
+// Mac), so .tetherd.yml is the only way to ask for it - and it has to be
+// off when the file does not mention it.
+func TestApplyConfigCarriesPinCredentialRoute(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"asked for", "version: 1\nnetwork:\n  pin_credential_route: true\n", true},
+		{"not mentioned", "version: 1\nnetwork:\n  remote_cidrs: [10.9.0.0/16]\n", false},
+		{"explicitly off", "version: 1\nnetwork:\n  pin_credential_route: false\n", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, ".tetherd.yml")
+			if err := os.WriteFile(path, []byte(c.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("HOME", dir)
+
+			var captured RunOptions
+			runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+			t.Cleanup(func() { runFn = defaultRun })
+
+			root := NewRootCommand()
+			root.SetArgs([]string{"run", "--config", path, "--", "true"})
+			if err := root.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if captured.PinCredentialRoute != c.want {
+				t.Fatalf("PinCredentialRoute = %v, want %v", captured.PinCredentialRoute, c.want)
+			}
+		})
+	}
+}
+
 // TestApplyConfigExplicitMissingConfigErrors pins item 1: --config naming a
 // file that does not exist must fail loudly (the run would otherwise fall
 // through to "defaults" and die complaining about --cluster instead of

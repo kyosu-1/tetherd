@@ -53,6 +53,14 @@ type RunOptions struct {
 	EnvOverride    map[string]string
 	EnvExclude     []string
 	ConfigPath     string // the .tetherd.yml read; shown in the status line
+
+	// PinCredentialRoute is network.pin_credential_route (default false):
+	// pin a machine-wide host route to 169.254.170.2 and capture it, for a
+	// tool inside the child's tree that hardcodes the address instead of
+	// reading the environment. tetherd itself needs neither - it serves the
+	// endpoint on loopback (credproxy.go) - and the route reaches every
+	// process on the Mac, which is why it is opt-in and has no flag.
+	PinCredentialRoute bool
 }
 
 // ParseRemoteCIDRs parses IPv4 prefixes. source names where the values came
@@ -137,29 +145,22 @@ func checkTargetEnv(w proto.Welcome, opts RunOptions) error {
 	return nil
 }
 
-// taskRoleReachable reports whether the child can reach the task-role
-// credential endpoint: the task must advertise it and a captured range must
-// cover 169.254.170.2. Only the ssm transport adds that range
-// automatically; with --transport direct the operator has to pass
-// --remote-cidr 169.254.170.0/24 for the child's SDK to get there. Without
-// this check tetherd would strip the developer's own credentials and hide
-// ~/.aws in favour of an endpoint the child cannot reach, leaving it with no
-// identity at all while printing a green iam line.
-func taskRoleReachable(taskEnv map[string]string, cidrs []netip.Prefix) bool {
-	return taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "" && capturesTaskRole(cidrs)
-}
-
-// capturesTaskRole reports whether pf's rdr rule will cover the credential
-// endpoint, which is the precondition for pinning its host route to lo0:
-// the route is only an improvement while something on lo0 picks the
-// connection up.
-func capturesTaskRole(cidrs []netip.Prefix) bool {
-	for _, p := range cidrs {
-		if p.Contains(ecsprov.TaskRoleAddr) {
-			return true
-		}
+// credentialRouteFloor is the part of the remote set network.local_cidrs can
+// never subtract, and it exists only for network.pin_credential_route: a
+// pinned host route to 169.254.170.2 sends that address to lo0, where
+// nothing answers unless pf's rdr rule covers it too. The pin and the
+// capture are therefore one decision.
+//
+// Nothing else needs the range any more. Until v0.3a the credential
+// endpoint was a floor unconditionally, because losing it cost the child its
+// AWS identity; the child is now pointed at a loopback port instead
+// (credproxy.go), so by default the captured set is exactly what the
+// operator asked for.
+func credentialRouteFloor(opts RunOptions) []netip.Prefix {
+	if !opts.PinCredentialRoute {
+		return nil
 	}
-	return false
+	return []netip.Prefix{ecsprov.TaskRoleCIDR}
 }
 
 // busySessionError is what a developer sees when another `tetherd run` holds
@@ -169,8 +170,11 @@ func busySessionError(busy *helper.BusyError) error {
 	return fmt.Errorf("%w\n        Stop the other `tetherd run` first (one session per machine in v1)", busy)
 }
 
-// taskRoleEnv returns the variables that make the task role the child's
-// only AWS identity. Stripping the developer's static keys is not enough:
+// taskRoleEnv returns the variables that keep the task role the child's only
+// AWS identity, alongside the endpoint variables
+// RewriteContainerEndpoints rewrites.
+//
+// Stripping the developer's static keys is not enough:
 // every SDK resolves the shared config profile *before* the container
 // credentials, so a `default` profile with any credential source (SSO, a
 // login session, credential_process) silently wins over
@@ -197,6 +201,18 @@ func taskRoleEnv(taskEnv map[string]string, region, emptyFile string) map[string
 	return out
 }
 
+// dialAddrPort is a dial func that ignores the address asked for and
+// connects to addr instead. It is how the ✓ iam probe takes the child's own
+// path: awsid builds the request for http://169.254.170.2<path>, and the
+// loopback proxy is what turns that into a session dial - so a probe that
+// succeeds proves the listener the child was pointed at works, not just the
+// session underneath it.
+func dialAddrPort(addr netip.AddrPort) func(context.Context, string) (net.Conn, error) {
+	return func(ctx context.Context, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr.String())
+	}
+}
+
 // emptyAWSConfigFile creates a readable empty file to point the shared-config
 // variables at, and a cleanup that removes it.
 func emptyAWSConfigFile() (string, func(), error) {
@@ -219,6 +235,14 @@ func emptyAWSConfigFile() (string, func(), error) {
 // failure two round trips later), so this is caught and named at the source
 // instead.
 var errLocalCIDRsExcludeEverything = errors.New("network.local_cidrs excludes the entire remote set; nothing would be captured")
+
+// errNoRemoteCIDRs is the same failure with nothing to blame local_cidrs
+// for: the remote set was already empty before any subtraction. Reachable
+// since v0.3a, when the credential endpoint stopped being an unconditional
+// floor - an IPv6-only VPC (whose IPv4 prefixes are none) now lands here
+// instead of quietly capturing 169.254.170.0/24 and nothing else. Naming
+// local_cidrs for it would send the operator to a key they never set.
+var errNoRemoteCIDRs = errors.New("no IPv4 ranges to capture; tetherd v1 captures IPv4 only (check the task's VPC, --remote-cidr and network.remote_services)")
 
 // subtractOne removes e from p, returning the pieces of p left afterwards:
 // nothing (e covers p entirely), p unchanged (no overlap), or - when e is
@@ -280,19 +304,23 @@ func Subtract(all []netip.Prefix, exclude []netip.Prefix) []netip.Prefix {
 // applyLocalCIDRs subtracts local (already-parsed network.local_cidrs
 // prefixes) from cidrs, then adds back floor - prefixes local_cidrs can
 // never remove because they are required infrastructure, not part of the
-// operator-tunable remote set (ssm's TaskRoleCIDR; direct has none).
+// operator-tunable remote set (see credentialRouteFloor: only
+// network.pin_credential_route has one).
 //
 // Emptiness is judged before the floor goes back on. Judging it after would
-// make the check unreachable under ssm, where the floor is never empty, and
-// the failure it exists to catch is a quiet one: `network.local_cidrs:
-// [10.0.0.0/8]` written to mean a home LAN, against a 10.0.0.0/16 VPC,
-// removes the whole VPC. The run then starts normally, prints a green
-// network line, and every connection to the VPC leaves over the laptop's
-// own route to time out somewhere else.
-// Both returns are usageErrors, so Run exits 2 rather than 1: this is a
-// value in .tetherd.yml that is wrong, in the same class as an unparseable
-// prefix, and nothing about retrying it can change the answer.
+// make the check unreachable whenever there is a floor, and the failure it
+// exists to catch is a quiet one: `network.local_cidrs: [10.0.0.0/8]`
+// written to mean a home LAN, against a 10.0.0.0/16 VPC, removes the whole
+// VPC. The run then starts normally, prints a green network line, and every
+// connection to the VPC leaves over the laptop's own route to time out
+// somewhere else.
+// Every return is a usageError, so Run exits 2 rather than 1: this is a
+// value in .tetherd.yml (or a target) that is wrong, in the same class as an
+// unparseable prefix, and nothing about retrying it can change the answer.
 func applyLocalCIDRs(cidrs, local, floor []netip.Prefix) ([]netip.Prefix, error) {
+	if len(cidrs) == 0 && len(floor) == 0 {
+		return nil, usageError{errNoRemoteCIDRs}
+	}
 	kept := Subtract(cidrs, local)
 	if len(cidrs) > 0 && len(kept) == 0 {
 		return nil, usageError{errLocalCIDRsExcludeEverything}
@@ -306,7 +334,8 @@ func applyLocalCIDRs(cidrs, local, floor []netip.Prefix) ([]netip.Prefix, error)
 
 // remoteSet is everything that goes to the task: the VPC, the configured
 // extras and any gateway-endpoint service ranges, minus the ranges the
-// laptop must keep for itself (spec §4.1), plus the credential endpoint.
+// laptop must keep for itself (spec §4.1), plus the credential endpoint when
+// network.pin_credential_route asks for it.
 func remoteSet(ctx context.Context, opts RunOptions, prov awsProvider, task transport.Task, logf func(string, ...any)) ([]netip.Prefix, error) {
 	extra, err := ParseRemoteCIDRs("--remote-cidr", opts.RemoteCIDRs)
 	if err != nil {
@@ -334,10 +363,11 @@ func remoteSet(ctx context.Context, opts RunOptions, prov awsProvider, task tran
 		cidrs = append(cidrs, svc...)
 		logf("           remote_services %s → %d prefixes", strings.Join(opts.RemoteServices, ", "), len(svc))
 	}
-	// TaskRoleCIDR is passed as floor, not appended before the subtraction:
-	// an overly broad local_cidrs entry ("169.254.0.0/16", or even
-	// "0.0.0.0/0") must never drop the credential endpoint.
-	return applyLocalCIDRs(cidrs, local, []netip.Prefix{ecsprov.TaskRoleCIDR})
+	// The floor (empty unless the route pin was asked for) is passed as
+	// floor, not appended before the subtraction: an overly broad
+	// local_cidrs entry ("169.254.0.0/16", or even "0.0.0.0/0") must never
+	// drop the address a pinned route depends on.
+	return applyLocalCIDRs(cidrs, local, credentialRouteFloor(opts))
 }
 
 // ecsTarget is the discovery target the flags and the config describe.
@@ -508,7 +538,11 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 			if err != nil {
 				return exitFor(err), err
 			}
-			cidrs, err = applyLocalCIDRs(cidrs, local, nil)
+			// The same floor ssm's remoteSet applies: asking for the
+			// machine-wide route pin is asking for that address to be
+			// redirected, whichever transport is in use - and direct's
+			// remote set is otherwise exactly what the operator typed.
+			cidrs, err = applyLocalCIDRs(cidrs, local, credentialRouteFloor(opts))
 			if err != nil {
 				return exitFor(err), err
 			}
@@ -561,25 +595,77 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 	}
 	logf("%s", envStatus)
 
-	// 4. capture (helper + pf)
+	// 4. the task's credential and metadata endpoint, on loopback. Before
+	// the capture on purpose: it needs no pf rule and no root, only the
+	// session, so it works under --no-network too - and the child is
+	// pointed at it by environment variable rather than by capturing
+	// 169.254.170.2 (credproxy.go says why that address is no longer
+	// dialed at all).
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	var overrideEnv map[string]string // set in step 5 when the task role is usable
-	var taskRoleOK bool               // set in step 5 once the task role is confirmed reachable and verified
+	cp := &CredProxy{Dial: sess.DialTCP, Logf: logf}
+	credAddr, err := cp.Start(ctx)
+	if err != nil {
+		return 1, fmt.Errorf("serve the task's credential endpoint on loopback: %w", err)
+	}
+	defer cp.Close()
+	// overrideEnv is what the child gets on top of the task's own
+	// environment: the rewritten endpoints, plus (when there is a task role
+	// to protect) the shared-config hiding taskRoleEnv does.
+	overrideEnv := RewriteContainerEndpoints(taskEnv, credAddr)
+	credPath := ContainerCredentialsPath(taskEnv)
+	var taskRoleOK bool // set below once the task role is actually verified
+	var sharedCfgHidden bool
+	if len(overrideEnv) > 0 {
+		logf("✓ endpoint %s → the task's credential and metadata endpoint (the child is pointed here; 169.254.170.2 is never dialed)", credAddr)
+	}
+	if credPath != "" {
+		emptyCfg, cleanupCfg, err := emptyAWSConfigFile()
+		if err != nil {
+			logf("⚠ iam      could not hide the shared AWS config (%v); the child may resolve your own credentials instead of the task role", err)
+		} else {
+			defer cleanupCfg()
+			maps.Copy(overrideEnv, taskRoleEnv(taskEnv, region, emptyCfg))
+			sharedCfgHidden = true
+		}
+
+		// The probe takes the child's own path - loopback, then the
+		// session - so a broken listener is found here rather than by the
+		// child's first SDK call.
+		ictx, icancel := context.WithTimeout(ctx, 15*time.Second)
+		creds, err := awsid.FetchContainerCredentials(ictx, dialAddrPort(credAddr), credPath)
+		var arn string
+		if err == nil {
+			arn, err = awsid.CallerIdentity(ictx, creds, region)
+		}
+		icancel()
+		if err != nil {
+			logf("⚠ iam      %v", err)
+		} else {
+			logf("✓ iam      %s  (via %s → the task)", arn, credAddr)
+			taskRoleOK = true
+			if sharedCfgHidden {
+				logf("           the task role is the child's only AWS identity (your shared AWS config is hidden from it)")
+			}
+		}
+	}
+
+	// 5. capture (helper + pf)
 	if !opts.NoNetwork {
 		if ifs, err := net.InterfaceAddrs(); err == nil {
 			for _, o := range LocalOverlaps(cidrs, ifs) {
 				logf("⚠ remote CIDR overlaps this machine's network: %s (that part of the LAN is routed through the agent for the child)", o)
 			}
 		}
-		// The credential endpoint needs a route before pf can help: see
-		// internal/helper/route.go for why. Only when the remote set
-		// actually covers it - pinning an address the rdr rule does not
-		// catch would send it to lo0 where nothing answers, turning an
-		// immediate error into a hang. This is also the first call that
-		// claims the machine-wide session, so it is where a second
-		// `tetherd run` now learns it is busy.
-		if capturesTaskRole(cidrs) {
+		// Opt-in escape hatch: a tool inside the child's tree that
+		// hardcodes 169.254.170.2 instead of reading the environment.
+		// tetherd's own path does not need it, and the route it installs is
+		// machine-wide - every process on the Mac reaches the dev task's
+		// credentials while it is pinned - so it is off by default
+		// (spec §11). credentialRouteFloor put the address in cidrs, so
+		// pf's rdr rule is there to catch what the route sends to lo0; see
+		// internal/helper/route.go for why the route is needed at all.
+		if opts.PinCredentialRoute {
 			if err := hc.RouteSet([]netip.Addr{ecsprov.TaskRoleAddr}); err != nil {
 				var busy *helper.BusyError
 				if errors.As(err, &busy) {
@@ -639,41 +725,13 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 		// surfaces cannot drift again - and so neither prints the whole
 		// managed prefix list on one line.
 		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s · DNS: %s", doctor.FormatPrefixes(cidrs), dnsStatus)
-		if taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "" && !taskRoleReachable(taskEnv, cidrs) {
-			logf("⚠ iam      the task advertises a role but %s is not captured; the child keeps your own AWS credentials (with --transport direct, pass --remote-cidr %s and make sure network.local_cidrs does not exclude it)", ecsprov.TaskRoleCIDR, ecsprov.TaskRoleCIDR)
-		}
-
-		// 5. task role: fetch credentials the way the child's SDK will.
-		if taskRoleReachable(taskEnv, cidrs) {
-			uri := taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]
-			emptyCfg, cleanupCfg, err := emptyAWSConfigFile()
-			if err != nil {
-				logf("⚠ iam      could not hide the shared AWS config (%v); the child may resolve your own credentials instead of the task role", err)
-			} else {
-				defer cleanupCfg()
-				overrideEnv = taskRoleEnv(taskEnv, region, emptyCfg)
-			}
-
-			ictx, icancel := context.WithTimeout(ctx, 15*time.Second)
-			creds, err := awsid.FetchContainerCredentials(ictx, sess.DialTCP, uri)
-			var arn string
-			if err == nil {
-				arn, err = awsid.CallerIdentity(ictx, creds, region)
-			}
-			icancel()
-			if err != nil {
-				logf("⚠ iam      %v", err)
-			} else {
-				logf("✓ iam      %s  (via 169.254.170.2)", arn)
-				taskRoleOK = true
-				if overrideEnv != nil {
-					logf("           the task role is the child's only AWS identity (your shared AWS config is hidden from it)")
-				}
-			}
-		}
 	}
 
-	// 6. child
+	// 6. child. The rewritten endpoints reach it through override, so they
+	// beat both the task's own values and anything env.override in
+	// .tetherd.yml names - a committed AWS_CONTAINER_CREDENTIALS_FULL_URI
+	// must not be able to point the child somewhere else while the status
+	// line claims the task role.
 	var child *exec.Cmd
 	if opts.NoNetwork {
 		child = exec.CommandContext(ctx, opts.Command[0], opts.Command[1:]...)
@@ -689,7 +747,12 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 		override[k] = v
 	}
 	mergeOpts := env.Options{DropAWSContainer: opts.NoNetwork, Exclude: opts.EnvExclude, Override: override}
-	if !opts.NoNetwork && taskRoleReachable(taskEnv, cidrs) {
+	// Only when there is a task role to put in their place: every name in
+	// LocalAWSCredentialVars resolves before the container credentials in
+	// the SDK chain, so one surviving means the task role never applies -
+	// but removing them from a child that has no task role to fall back on
+	// leaves it with no AWS identity at all.
+	if credPath != "" {
 		mergeOpts.StripLocal = env.LocalAWSCredentialVars
 		var found []string
 		for _, name := range env.LocalAWSCredentialVars {
@@ -701,7 +764,11 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 			if taskRoleOK {
 				logf("✓ env      local AWS credentials (%s) removed so the task role applies", strings.Join(found, ", "))
 			} else {
-				logf("⚠ env      local AWS credentials (%s) removed, but the task role could not be verified; the child may have no AWS identity (use --no-env or --no-network to keep your own)", strings.Join(found, ", "))
+				// --no-env, not --no-network: the credential endpoint is
+				// served over the session, which --no-network keeps, so it
+				// is the task's *environment* that has to go for the child
+				// to resolve the developer's own identity again.
+				logf("⚠ env      local AWS credentials (%s) removed, but the task role could not be verified; the child may have no AWS identity (use --no-env to keep your own)", strings.Join(found, ", "))
 			}
 		}
 	}

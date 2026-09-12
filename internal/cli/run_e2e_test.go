@@ -219,10 +219,16 @@ func TestRunBuildsTheRemoteSet(t *testing.T) {
 	for _, p := range cap.spec.RemoteCIDRs {
 		got[p.String()] = true
 	}
-	for _, want := range []string{"10.0.0.0/16", "169.254.170.0/24", "10.9.0.0/16"} {
+	for _, want := range []string{"10.0.0.0/16", "10.9.0.0/16"} {
 		if !got[want] {
 			t.Errorf("%s missing from the captured set: %v", want, cap.spec.RemoteCIDRs)
 		}
+	}
+	// 169.254.170.0/24 is deliberately absent: the credential endpoint is
+	// served on loopback now, so capturing it machine-wide buys nothing and
+	// takes the address away from anything local that owns it.
+	if got["169.254.170.0/24"] {
+		t.Errorf("the credential endpoint must not be captured by default: %v", cap.spec.RemoteCIDRs)
 	}
 }
 
@@ -326,8 +332,12 @@ func TestRunVerifiesTheTaskRoleThroughTheAgent(t *testing.T) {
 	if !strings.Contains(out.String(), "iam") {
 		t.Fatalf("no iam line at all: %s", out.String())
 	}
-	if strings.Contains(out.String(), "the task advertises a role but") {
-		t.Errorf("169.254.170.0/24 is captured, so the not-captured warning must not fire: %s", out.String())
+	// The probe has to travel the child's own path: through the loopback
+	// port, over the session, to the endpoint. A probe that dialed the
+	// session directly would pass this test with the loopback listener
+	// broken, and the child would then be the one to find out.
+	if !strings.Contains(out.String(), "127.0.0.1:") {
+		t.Errorf("the iam line must name the loopback port the child is pointed at: %s", out.String())
 	}
 }
 
@@ -492,13 +502,25 @@ func TestRunStripsLocalAWSCredentialsFromTheChild(t *testing.T) {
 	// A sanity check on the harness itself: if the dump were empty or the
 	// script never ran, every assertion below would pass for the wrong
 	// reason.
-	if len(childEnv) == 0 || childEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] == "" {
+	if len(childEnv) == 0 || childEnv["AWS_CONTAINER_CREDENTIALS_FULL_URI"] == "" {
 		t.Fatalf("the child's environment was not captured (%d vars): %s", len(childEnv), out.String())
 	}
 	for _, name := range env.LocalAWSCredentialVars {
-		if got, ok := childEnv[name]; ok {
-			t.Errorf("%s reached the child as %q: the child would sign with the developer's own identity while the status line claims the task role", name, got)
+		got, ok := childEnv[name]
+		if !ok {
+			continue
 		}
+		// AWS_CONTAINER_CREDENTIALS_FULL_URI is the one name in the list
+		// tetherd sets itself: the developer's value has to go and be
+		// replaced by the loopback port this run serves, not merely be
+		// absent.
+		if name == "AWS_CONTAINER_CREDENTIALS_FULL_URI" {
+			if !strings.HasPrefix(got, "http://127.0.0.1:") {
+				t.Errorf("%s = %q, want the loopback port tetherd serves", name, got)
+			}
+			continue
+		}
+		t.Errorf("%s reached the child as %q: the child would sign with the developer's own identity while the status line claims the task role", name, got)
 	}
 	if !strings.Contains(out.String(), "local AWS credentials") {
 		t.Errorf("removing them silently is not enough; the run must say so: %s", out.String())
@@ -550,14 +572,26 @@ func writeChildScript(t *testing.T, body string) string {
 
 func waitForFile(t *testing.T, path string) {
 	t.Helper()
+	waitFor(t, func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}, path+" to appear")
+}
+
+// waitFor polls cond until it holds, and fails naming what never happened.
+// Polling, not sleeping: the thing being waited for (a file the child wrote,
+// a listener that shut down) happens in another process or goroutine, and a
+// fixed sleep is either a flake or a wasted second.
+func waitFor(t *testing.T, cond func() bool, what string) {
+	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
+		if cond() {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("%s never appeared", path)
+	t.Fatalf("timed out waiting for %s", what)
 }
 
 // runInBackground starts Run and returns a channel carrying its result, so a
@@ -845,21 +879,258 @@ func TestRunDirectRejectsLocalCIDRsExcludingEverything(t *testing.T) {
 	}
 }
 
-func TestRunWarnsWhenTheCredentialEndpointIsNotCaptured(t *testing.T) {
-	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil, nil)
-	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", Addr: ag.addr}, agentAddr: ag.addr}
-	d := depsFor(p)
-	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
-	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+// TestRunGivesTheChildTheTaskRoleWithoutCapturingTheEndpoint replaces the
+// "the task advertises a role but 169.254.170.0/24 is not captured" warning
+// this used to assert. Nothing has to be captured any more: the endpoint is
+// served on loopback and the child is pointed at it by environment
+// variable, so a remote set the operator chose by hand (--transport direct
+// with one --remote-cidr) still gets the task role.
+func TestRunGivesTheChildTheTaskRoleWithoutCapturingTheEndpoint(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil,
+		endpointReturning(t, http.StatusServiceUnavailable, "no credentials for you"))
+	cap := newFakeCapturer()
+	d := Deps{
+		DialHelper:  func(string) (HelperClient, error) { return &fakeHelperClient{}, nil },
+		NewCapturer: func(HelperClient, func(string, ...any)) Capturer { return cap },
+	}
 
+	dir := t.TempDir()
+	dump := filepath.Join(dir, "env-dump")
+	script := filepath.Join(dir, "fake-exec.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nenv > "+dump+"\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	opts := RunOptions{
 		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
-		RemoteCIDRs: []string{"10.0.0.0/16"}, ExecPath: "/usr/bin/true", Command: []string{"true"},
+		RemoteCIDRs: []string{"10.0.0.0/16"}, ExecPath: script, Command: []string{"true"},
 	}
 	var out strings.Builder
-	RunWithDeps(context.Background(), opts, &out, d)
-	if !strings.Contains(out.String(), "the task advertises a role but") {
-		t.Fatalf("the warning must fire when 169.254.170.0/24 is not captured: %s", out.String())
+	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if addrIn(cap.spec.RemoteCIDRs, "169.254.170.2") {
+		t.Fatalf("the premise is wrong: %v already covers the endpoint", cap.spec.RemoteCIDRs)
+	}
+	childEnv := map[string]string{}
+	for _, line := range strings.Split(strings.TrimRight(readFile(t, dump), "\n"), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			childEnv[k] = v
+		}
+	}
+	if !strings.HasPrefix(childEnv["AWS_CONTAINER_CREDENTIALS_FULL_URI"], "http://127.0.0.1:") {
+		t.Fatalf("the child must still get the task role: %v", childEnv["AWS_CONTAINER_CREDENTIALS_FULL_URI"])
+	}
+	if strings.Contains(out.String(), "not captured") {
+		t.Errorf("nothing has to be captured for the task role any more: %s", out.String())
+	}
+}
+
+// TestRunPointsTheChildAtTheLoopbackCredentialProxy: the task's environment
+// names 169.254.170.2, which only exists inside the task. The child must be
+// handed the loopback port tetherd serves instead, with the relative form
+// cleared so nothing falls back to the address nothing routes.
+//
+// The endpoint answers 503 on purpose (as in
+// TestRunVerifiesTheTaskRoleThroughTheAgent): serving usable credentials
+// would send Run's own probe on to sts.<region>.amazonaws.com, and leaving
+// the endpoint unserved would make the agent dial the real 169.254.170.2.
+func TestRunPointsTheChildAtTheLoopbackCredentialProxy(t *testing.T) {
+	dial := endpointReturning(t, http.StatusServiceUnavailable, "no credentials for you")
+	ag := startAgentFor(t, map[string]string{
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/abc",
+		"ECS_CONTAINER_METADATA_URI_V4":          "http://169.254.170.2/v4/task",
+	}, nil, dial)
+	p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+	// The child's exit status carries the assertion: a loopback FULL_URI,
+	// no mention of the endpoint's address, and the relative form cleared.
+	opts := ssmOpts("sh", "-c", `case "$AWS_CONTAINER_CREDENTIALS_FULL_URI" in http://127.0.0.1:*/v2/credentials/abc) ;; *) exit 11;; esac
+		[ -z "$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" ] || exit 12
+		case "$ECS_CONTAINER_METADATA_URI_V4" in *169.254*) exit 13;; esac
+		case "$ECS_CONTAINER_METADATA_URI_V4" in http://127.0.0.1:*/v4/task) ;; *) exit 14;; esac`)
+	var out strings.Builder
+	code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p))
+	if err != nil || code != 0 {
+		t.Fatalf("the child rejected its environment: code=%d err=%v log=%s", code, err, out.String())
+	}
+	if !strings.Contains(out.String(), "127.0.0.1:") {
+		t.Errorf("the iam line must say where the child was pointed: %s", out.String())
+	}
+}
+
+// TestRunProbesTheTaskRoleThroughTheLoopbackProxy pins which path the ✓ iam
+// probe takes. It has to be the child's own - loopback, then the session -
+// so that a broken listener is found by tetherd before the child's first
+// SDK call, and so the "via 127.0.0.1:<port>" the line prints is not a
+// claim about a path nothing tried.
+//
+// The session's dial fails on purpose, and the two paths fail differently: a
+// probe through the proxy gets the proxy's own 502 and leaves the
+// ErrorHandler's "through the agent" line behind, while a probe that dialed
+// the session directly would report the dial error itself and log nothing
+// from credproxy.go.
+func TestRunProbesTheTaskRoleThroughTheLoopbackProxy(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil,
+		func(context.Context, string) (net.Conn, error) {
+			return nil, errors.New("the task has no route to that address")
+		})
+	p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+	var out strings.Builder
+	code, err := RunWithDeps(context.Background(), ssmOpts("true"), &out, depsFor(p))
+	if err != nil || code != 0 {
+		t.Fatalf("a failed probe must not fail the run: code=%d err=%v log=%s", code, err, out.String())
+	}
+	if !strings.Contains(out.String(), "through the agent") {
+		t.Errorf("the probe must travel the loopback proxy (its ErrorHandler names the transport): %s", out.String())
+	}
+	if !strings.Contains(out.String(), "HTTP 502") {
+		t.Errorf("and the probe must see the proxy's answer, not the raw dial error: %s", out.String())
+	}
+}
+
+// TestRunServesTheTaskEndpointToTheChildOverLoopback is the other half: the
+// value in the child's environment has to be a live endpoint, not just a
+// well-formed URL. The child parks after dumping its environment so this
+// test can use that exact URL while the run is still up, and what comes back
+// has to be the task's own answer relayed through the session - a 503 from
+// the endpoint, not a 502 from the proxy.
+//
+// A unit test cannot cover this: the listener, the session's DialTCP and the
+// environment the child actually receives are wired together inside Run.
+func TestRunServesTheTaskEndpointToTheChildOverLoopback(t *testing.T) {
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v2/credentials/") {
+			http.Error(w, "no credentials for you", http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprintf(w, `{"Cluster":"relayed","Path":%q}`, r.URL.Path)
+	})}
+	cl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	go srv.Serve(cl)
+
+	ag := startAgentFor(t, map[string]string{
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/abc",
+		"ECS_CONTAINER_METADATA_URI_V4":          "http://169.254.170.2/v4/task",
+	}, nil, func(ctx context.Context, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", cl.Addr().String())
+	})
+	p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+
+	dir := t.TempDir()
+	dump, release := filepath.Join(dir, "env-dump"), filepath.Join(dir, "release")
+	script := filepath.Join(dir, "child.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nenv > "+dump+".tmp\nmv "+dump+".tmp "+dump+
+		"\nwhile [ ! -f "+release+" ]; do sleep 0.02; done\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	done := runInBackground(ssmOpts("/bin/sh", script), &out, depsFor(p))
+	t.Cleanup(func() { os.WriteFile(release, []byte("go"), 0o644) })
+	waitForFile(t, dump)
+	childEnv := map[string]string{}
+	for _, line := range strings.Split(strings.TrimRight(readFile(t, dump), "\n"), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			childEnv[k] = v
+		}
+	}
+
+	full := childEnv["AWS_CONTAINER_CREDENTIALS_FULL_URI"]
+	if !strings.HasPrefix(full, "http://127.0.0.1:") {
+		t.Fatalf("AWS_CONTAINER_CREDENTIALS_FULL_URI = %q: %s", full, out.String())
+	}
+	// The credential path: the task's own 503 has to arrive, which proves
+	// the request travelled endpoint-ward rather than failing at the proxy.
+	resp, err := http.Get(full)
+	if err != nil {
+		t.Fatalf("the child's credential URL is not served: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), "no credentials for you") {
+		t.Fatalf("status=%d body=%q, want the task's own answer relayed", resp.StatusCode, body)
+	}
+	// The metadata path goes through the same port, and its path survives.
+	resp, err = http.Get(childEnv["ECS_CONTAINER_METADATA_URI_V4"])
+	if err != nil {
+		t.Fatalf("the child's metadata URL is not served: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(body), `"Path":"/v4/task"`) {
+		t.Fatalf("status=%d body=%q, want the metadata path relayed intact", resp.StatusCode, body)
+	}
+
+	if err := os.WriteFile(release, []byte("go"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := <-done; r.err != nil || r.code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", r.code, r.err, out.String())
+	}
+	// And the port is gone once the run is over: it is the run's lifetime,
+	// not the machine's.
+	waitFor(t, func() bool {
+		c, err := net.DialTimeout("tcp", strings.TrimPrefix(full[:strings.LastIndex(full, "/v2")], "http://"), 200*time.Millisecond)
+		if err != nil {
+			return true
+		}
+		c.Close()
+		return false
+	}, "the credential proxy to stop listening after the run")
+}
+
+// endpointReturning is a fake 169.254.170.2 that answers every request with
+// the same status, for tests that only need the credential probe to fail
+// fast and locally: unserved, the agent would dial the real link-local
+// address and wait out its 10s dial timeout.
+func endpointReturning(t *testing.T, status int, body string) func(context.Context, string) (net.Conn, error) {
+	t.Helper()
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, body, status)
+	})}
+	cl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	go srv.Serve(cl)
+	return func(ctx context.Context, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", cl.Addr().String())
+	}
+}
+
+// TestRunKeepsTheDevelopersIdentityWhenTheTaskHasNoRole: the hardening that
+// hides ~/.aws and strips the developer's own AWS variables only makes sense
+// when there is a task role to replace them with. A task with no role (or
+// with metadata but no credentials) must leave the child its own identity -
+// hiding both would leave it with no AWS identity at all.
+func TestRunKeepsTheDevelopersIdentityWhenTheTaskHasNoRole(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		taskEnv map[string]string
+	}{
+		{"no role at all", map[string]string{"PORT": "8080"}},
+		{"metadata but no credentials", map[string]string{"ECS_CONTAINER_METADATA_URI_V4": "http://169.254.170.2/v4/task"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ag := startAgentFor(t, c.taskEnv, nil, nil)
+			p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+			t.Setenv("AWS_PROFILE", "mine")
+			t.Setenv("AWS_CONFIG_FILE", "/Users/dev/.aws/config")
+			opts := ssmOpts("sh", "-c", `[ "$AWS_PROFILE" = mine ] || exit 11
+				[ "$AWS_CONFIG_FILE" = /Users/dev/.aws/config ] || exit 12`)
+			var out strings.Builder
+			code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p))
+			if err != nil || code != 0 {
+				t.Fatalf("the child lost its own AWS identity: code=%d err=%v log=%s", code, err, out.String())
+			}
+			if strings.Contains(out.String(), "iam") {
+				t.Errorf("there is no task role to report: %s", out.String())
+			}
+		})
 	}
 }
 
@@ -1095,6 +1366,9 @@ type fakeCapturer struct {
 	// forwarder goroutine reads it while the test goroutine closes it.
 	accept chan capture.Conn
 	once   sync.Once
+	// startErr is what Start returns: pf.apply is where a second `tetherd
+	// run` on the machine finds out it is busy.
+	startErr error
 }
 
 func newFakeCapturer() *fakeCapturer {
@@ -1104,7 +1378,7 @@ func newFakeCapturer() *fakeCapturer {
 func (f *fakeCapturer) Start(_ context.Context, spec capture.Spec) error {
 	f.spec = spec
 	f.started = true
-	return nil
+	return f.startErr
 }
 func (f *fakeCapturer) Accept() (capture.Conn, error) {
 	cc, ok := <-f.accept
@@ -1124,21 +1398,25 @@ func (f *fakeCapturer) Close() error {
 }
 func (f *fakeCapturer) RedirectPort() int { return 15300 }
 
-// TestRunPinsTheCredentialEndpointRoute: connect()'s route lookup runs
-// before pf's output rules, so without a host route for 169.254.170.2 the
-// kernel answers EHOSTUNREACH from the reject route a failed ARP left
-// behind and pf never sees the packet (internal/helper/route.go).
-func TestRunPinsTheCredentialEndpointRoute(t *testing.T) {
-	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+// TestRunDoesNotPinTheRouteUnlessAsked: the child no longer dials
+// 169.254.170.2 at all - it is pointed at a loopback port instead - so the
+// machine-wide host route pf needed (see internal/helper/route.go) is an
+// opt-in escape hatch for a tool inside the child's tree that hardcodes the
+// address, not something every run installs. While it is pinned, every
+// process on the Mac reaches the dev task's credentials.
+func TestRunDoesNotPinTheRouteUnlessAsked(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/abc"}, nil,
+		endpointReturning(t, http.StatusServiceUnavailable, "no credentials for you"))
 	p := &fakeProvider{
-		region: "ap-northeast-1", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
 		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
 		agentAddr: ag.addr,
 	}
 	hc := &fakeHelperClient{}
+	cap := newFakeCapturer()
 	d := depsFor(p)
 	d.DialHelper = func(string) (HelperClient, error) { return hc, nil }
-	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return cap }
 
 	opts := ssmOpts("true")
 	opts.NoNetwork = false
@@ -1147,22 +1425,45 @@ func TestRunPinsTheCredentialEndpointRoute(t *testing.T) {
 	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
 		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
 	}
-	if len(hc.routes) != 1 || hc.routes[0].String() != "169.254.170.2" {
-		t.Fatalf("route.set was called with %v, want the credential endpoint", hc.routes)
+	if len(hc.routes) != 0 {
+		t.Fatalf("routes = %v: the machine-wide pin is opt-in now", hc.routes)
 	}
-	if !hc.routeCleared {
-		t.Error("the route must be cleared when the run ends")
+	// And with no pin there is no reason to hold 169.254.170.0/24 in the
+	// captured set either: that floor existed only to keep the pinned route
+	// usable (v0.2b), and capturing the address costs every local ECS
+	// endpoint emulator on the machine its own address for the session.
+	if addrIn(cap.spec.RemoteCIDRs, "169.254.170.2") {
+		t.Fatalf("the endpoint must not be captured by default: %v", cap.spec.RemoteCIDRs)
+	}
+
+	// With the opt-in set it is pinned - the escape hatch for a tool inside
+	// the child's tree that hardcodes the address.
+	hc2, cap2 := &fakeHelperClient{}, newFakeCapturer()
+	d.DialHelper = func(string) (HelperClient, error) { return hc2, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return cap2 }
+	opts.PinCredentialRoute = true
+	if code, err := RunWithDeps(context.Background(), opts, io.Discard, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if len(hc2.routes) != 1 || hc2.routes[0].String() != "169.254.170.2" {
+		t.Fatalf("routes = %v, want the endpoint pinned when asked", hc2.routes)
+	}
+	if !hc2.routeCleared {
+		t.Error("the route must be cleared when the run ends: it outlives the session otherwise")
 	}
 }
 
 func TestRunDoesNotPinTheRouteWithoutCapture(t *testing.T) {
-	// --no-network never touches the helper, so it pins no route either.
+	// --no-network never touches the helper, so it pins no route even when
+	// asked: there is no pf rule for the route to feed.
 	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
 	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
 	hc := &fakeHelperClient{}
 	d := depsFor(p)
 	d.DialHelper = func(string) (HelperClient, error) { return hc, nil }
-	if code, err := RunWithDeps(context.Background(), ssmOpts("true"), io.Discard, d); err != nil || code != 0 {
+	opts := ssmOpts("true")
+	opts.PinCredentialRoute = true
+	if code, err := RunWithDeps(context.Background(), opts, io.Discard, d); err != nil || code != 0 {
 		t.Fatalf("code=%d err=%v", code, err)
 	}
 	if len(hc.routes) != 0 {
@@ -1170,13 +1471,14 @@ func TestRunDoesNotPinTheRouteWithoutCapture(t *testing.T) {
 	}
 }
 
-// TestRunDoesNotPinARouteTheCaptureWillNotRedirect is the boundary the pin
+// TestRunCapturesTheEndpointWheneverItPinsTheRoute is the boundary the pin
 // has to respect: the route is only correct while pf's `rdr pass on lo0`
-// covers that address. Under --transport direct the operator chooses the
-// remote set by hand, and 169.254.170.0/24 is not in it unless they say so -
-// pinning anyway would send the credential endpoint to lo0 where no rdr rule
-// picks it up, turning an immediate "no route to host" into a hang.
-func TestRunDoesNotPinARouteTheCaptureWillNotRedirect(t *testing.T) {
+// covers that address - pinning it otherwise sends the credential endpoint
+// to lo0, where no rdr rule picks it up and nothing answers. Under
+// --transport direct the operator chooses the remote set by hand and
+// 169.254.170.0/24 is not in it, so asking for the pin has to add it: the
+// floor and the pin are one decision, not two that can disagree.
+func TestRunCapturesTheEndpointWheneverItPinsTheRoute(t *testing.T) {
 	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
 	hc := &fakeHelperClient{}
 	cap := newFakeCapturer()
@@ -1186,49 +1488,38 @@ func TestRunDoesNotPinARouteTheCaptureWillNotRedirect(t *testing.T) {
 	}
 	opts := RunOptions{
 		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
-		RemoteCIDRs: []string{"10.9.0.0/16"},
-		ExecPath:    "/usr/bin/true", Command: []string{"true"},
-	}
-	var out strings.Builder
-	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
-		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
-	}
-	if addrIn(cap.spec.RemoteCIDRs, "169.254.170.2") {
-		t.Fatalf("the premise is wrong: %v already covers the endpoint", cap.spec.RemoteCIDRs)
-	}
-	if len(hc.routes) != 0 {
-		t.Fatalf("routes = %v, want none: no rdr rule covers 169.254.170.2 here", hc.routes)
-	}
-}
-
-// TestRunPinsTheRouteWhenDirectCapturesTheEndpoint is the other half: pass
-// the range explicitly and the pin comes back. Without this, a pin that
-// never happened at all would satisfy the test above.
-func TestRunPinsTheRouteWhenDirectCapturesTheEndpoint(t *testing.T) {
-	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
-	hc := &fakeHelperClient{}
-	d := Deps{
-		DialHelper:  func(string) (HelperClient, error) { return hc, nil },
-		NewCapturer: func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() },
-	}
-	opts := RunOptions{
-		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
-		RemoteCIDRs: []string{"10.9.0.0/16", ecsprov.TaskRoleCIDR.String()},
-		ExecPath:    "/usr/bin/true", Command: []string{"true"},
+		RemoteCIDRs: []string{"10.9.0.0/16"}, PinCredentialRoute: true,
+		ExecPath: "/usr/bin/true", Command: []string{"true"},
 	}
 	var out strings.Builder
 	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
 		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
 	}
 	if len(hc.routes) != 1 || hc.routes[0] != ecsprov.TaskRoleAddr {
-		t.Fatalf("routes = %v, want the credential endpoint pinned", hc.routes)
+		t.Fatalf("routes = %v, want the credential endpoint pinned when asked", hc.routes)
+	}
+	if !addrIn(cap.spec.RemoteCIDRs, "169.254.170.2") {
+		t.Fatalf("a pinned route with no rdr rule behind it is a dead end: %v", cap.spec.RemoteCIDRs)
+	}
+	// Without the opt-in, direct captures exactly what the operator asked
+	// for - so the assertion above is about the pin, not about direct
+	// always adding the range.
+	hc2, cap2 := &fakeHelperClient{}, newFakeCapturer()
+	d.DialHelper = func(string) (HelperClient, error) { return hc2, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return cap2 }
+	opts.PinCredentialRoute = false
+	if code, err := RunWithDeps(context.Background(), opts, io.Discard, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if addrIn(cap2.spec.RemoteCIDRs, "169.254.170.2") || len(hc2.routes) != 0 {
+		t.Fatalf("captured %v, routes %v: neither belongs here", cap2.spec.RemoteCIDRs, hc2.routes)
 	}
 }
 
-// TestRunExplainsABusyHelperFromRouteSet: route.set is now the first call
-// that claims the machine-wide session, so it is where a second `tetherd
-// run` finds out. That must still be the explanation a developer can act on,
-// not a bare wrapped error.
+// TestRunExplainsABusyHelperFromRouteSet: with network.pin_credential_route
+// set, route.set is the first call that claims the machine-wide session, so
+// it is where a second `tetherd run` finds out. That must still be the
+// explanation a developer can act on, not a bare wrapped error.
 func TestRunExplainsABusyHelperFromRouteSet(t *testing.T) {
 	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
 	p := &fakeProvider{
@@ -1244,6 +1535,7 @@ func TestRunExplainsABusyHelperFromRouteSet(t *testing.T) {
 	opts := ssmOpts("true")
 	opts.NoNetwork = false
 	opts.ExecPath = "/usr/bin/true"
+	opts.PinCredentialRoute = true
 	code, err := RunWithDeps(context.Background(), opts, io.Discard, d)
 	if code != 1 || err == nil {
 		t.Fatalf("code=%d err=%v, want a failure", code, err)
@@ -1254,5 +1546,37 @@ func TestRunExplainsABusyHelperFromRouteSet(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Stop the other") {
 		t.Errorf("err = %q, want the same next step pf.apply gives", err)
+	}
+}
+
+// TestRunExplainsABusyHelperFromPfApply is the same explanation from the
+// call that discovers it on a default run: with the route pin opt-in,
+// pf.apply is the first thing to claim the machine-wide session.
+func TestRunExplainsABusyHelperFromPfApply(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{
+		region: "ap-northeast-1", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
+	cap := newFakeCapturer()
+	cap.startErr = &helper.BusyError{PID: 4242, Since: time.Now()}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return cap }
+
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.ExecPath = "/usr/bin/true"
+	code, err := RunWithDeps(context.Background(), opts, io.Discard, d)
+	if code != 1 || err == nil {
+		t.Fatalf("code=%d err=%v, want a failure", code, err)
+	}
+	var busy *helper.BusyError
+	if !errors.As(err, &busy) {
+		t.Fatalf("err = %v, want the BusyError to survive", err)
+	}
+	if !strings.Contains(err.Error(), "Stop the other") {
+		t.Errorf("err = %q, want the next step a developer can act on", err)
 	}
 }
