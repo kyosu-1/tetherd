@@ -78,7 +78,22 @@ type fakeProvider struct {
 	// round trip was (or, for a local_cidrs typo, was not) made.
 	vpcCalls int
 	svcCalls int
+
+	// secrets, secretsErr and pidMode back SecretNames/PIDMode; secretsARN
+	// records what definitionARN SecretNames was actually asked about, so a
+	// test can pin that `tetherd env` passes the task's own DefinitionARN
+	// through rather than some other value.
+	secrets    map[string]bool
+	secretsErr error
+	secretsARN string
+	pidMode    string
+	pidModeErr error
 }
+
+// errAlwaysFails stands in for an AWS permission failure (e.g. no
+// ecs:DescribeTaskDefinition) in tests that must prove EnvRun fails closed
+// rather than falling back to printing everything unmasked.
+var errAlwaysFails = errors.New("simulated AWS failure")
 
 func (f *fakeProvider) Region() string { return f.region }
 func (f *fakeProvider) Discover(context.Context, ecsprov.Target) (transport.Task, error) {
@@ -94,6 +109,13 @@ func (f *fakeProvider) ServiceCIDRs(context.Context, []string) ([]netip.Prefix, 
 }
 func (f *fakeProvider) Transport(func(string, ...any)) transport.Transport {
 	return agentTransport{addr: f.agentAddr}
+}
+func (f *fakeProvider) SecretNames(_ context.Context, definitionARN string) (map[string]bool, error) {
+	f.secretsARN = definitionARN
+	return f.secrets, f.secretsErr
+}
+func (f *fakeProvider) PIDMode(context.Context, string) (string, error) {
+	return f.pidMode, f.pidModeErr
 }
 
 func ssmOpts(cmd ...string) RunOptions {

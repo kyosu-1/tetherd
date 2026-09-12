@@ -322,6 +322,104 @@ func ecsTarget(opts RunOptions) ecsprov.Target {
 	return ecsprov.Target{Cluster: opts.Cluster, Service: opts.Service, TaskID: opts.TaskID}
 }
 
+// usageError marks a discoverTask failure as a bad invocation (missing or
+// contradictory flags) rather than an operational one, so callers can map it
+// to exit code 2 the way Run always has, instead of every discovery failure
+// collapsing onto the same code 1 as an AWS outage.
+type usageError struct{ error }
+
+func (e usageError) Unwrap() error { return e.error }
+
+// isUsageError reports whether err (or something it wraps) is a usageError.
+func isUsageError(err error) bool {
+	var ue usageError
+	return errors.As(err, &ue)
+}
+
+// directProvider is the awsProvider for --transport direct: a bare TCP
+// connection to an address, used by tests and the local e2e harness. There
+// is no AWS session behind it, so discovery, the VPC/service CIDR lookups
+// and the task definition reads all refuse rather than silently succeed
+// with nothing.
+type directProvider struct{}
+
+func (directProvider) Region() string { return "" }
+
+func (directProvider) Discover(context.Context, ecsprov.Target) (transport.Task, error) {
+	return transport.Task{}, errors.New("--transport direct has no discovery; the task is --agent-addr itself")
+}
+
+func (directProvider) VPCCIDRs(context.Context, string) ([]netip.Prefix, error) {
+	return nil, errors.New("--transport direct has no VPC to look up; use --remote-cidr")
+}
+
+func (directProvider) ServiceCIDRs(context.Context, []string) ([]netip.Prefix, error) {
+	return nil, errors.New("--transport direct cannot resolve managed prefix lists (no AWS session)")
+}
+
+func (directProvider) Transport(func(string, ...any)) transport.Transport { return direct.Transport{} }
+
+// SecretNames and PIDMode delegate to the ecs package with a nil API: a
+// direct task's DefinitionARN is always empty, so describe() refuses before
+// ever touching the API - there is no task definition to read over direct.
+func (directProvider) SecretNames(ctx context.Context, definitionARN string) (map[string]bool, error) {
+	return ecsprov.SecretNames(ctx, nil, definitionARN)
+}
+
+func (directProvider) PIDMode(ctx context.Context, definitionARN string) (string, error) {
+	return ecsprov.PIDMode(ctx, nil, definitionARN)
+}
+
+// discoverTask resolves the provider and the task to attach to, and logs the
+// target line. It is the first half of what Run always did in its step 1;
+// EnvRun shares it so `tetherd env` discovers the exact same task `tetherd
+// run` would attach to.
+func discoverTask(ctx context.Context, opts RunOptions, d Deps, logf func(string, ...any)) (awsProvider, transport.Task, error) {
+	switch opts.Transport {
+	case "direct":
+		if opts.AgentAddr == "" {
+			return nil, transport.Task{}, usageError{errors.New("--transport direct needs --agent-addr")}
+		}
+		return directProvider{}, transport.Task{ID: "direct", Addr: opts.AgentAddr}, nil
+	case "ssm":
+		if opts.Cluster == "" || opts.Service == "" {
+			return nil, transport.Task{}, usageError{errors.New("--transport ssm needs --cluster and --service")}
+		}
+		prov, err := d.NewAWSProvider(ctx, opts)
+		if err != nil {
+			return nil, transport.Task{}, fmt.Errorf("aws config: %w", err)
+		}
+		task, err := prov.Discover(ctx, ecsTarget(opts))
+		if err != nil {
+			return nil, transport.Task{}, err
+		}
+		if task.StartedAt.IsZero() {
+			logf("%s/%s  task %s", opts.Cluster, opts.Service, short(task.ID))
+		} else {
+			logf("%s/%s  task %s  (started %s ago)", opts.Cluster, opts.Service, short(task.ID), time.Since(task.StartedAt).Round(time.Minute))
+		}
+		return prov, task, nil
+	default:
+		return nil, transport.Task{}, usageError{fmt.Errorf("unknown transport %q (ssm | direct)", opts.Transport)}
+	}
+}
+
+// dialAgent opens the transport and completes the control handshake. The
+// second half of Run's original steps 1 and 3.
+func dialAgent(ctx context.Context, opts RunOptions, d Deps, prov awsProvider, task transport.Task, logf func(string, ...any)) (*session.Client, error) {
+	tr := prov.Transport(logf)
+	conn, err := tr.Dial(ctx, task)
+	if err != nil {
+		return nil, fmt.Errorf("connect to agent: %w", err)
+	}
+	sess, err := session.Dial(ctx, conn, proto.Hello{Version: proto.Version, User: opts.User}, session.Options{})
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return sess, nil
+}
+
 // Run connects to the agent, installs capture, runs the command and cleans
 // up. It returns the child's exit code.
 func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
@@ -344,19 +442,25 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 	}
 
 	// 1. transport, task, remote set
-	var tr transport.Transport
-	var task transport.Task
-	var cidrs []netip.Prefix
+	prov, task, err := discoverTask(ctx, opts, d, logf)
+	if err != nil {
+		if isUsageError(err) {
+			return 2, err
+		}
+		return 1, err
+	}
 	region := opts.Region
+	if opts.Transport == "ssm" {
+		region = prov.Region()
+	}
+
+	var cidrs []netip.Prefix
 	switch opts.Transport {
 	case "direct":
-		if opts.AgentAddr == "" {
-			return 2, errors.New("--transport direct needs --agent-addr")
-		}
 		if !opts.NoNetwork && len(extra) == 0 {
 			return 2, errors.New("no --remote-cidr given (or use --no-network)")
 		}
-		tr, task, cidrs = direct.Transport{}, transport.Task{ID: "direct", Addr: opts.AgentAddr}, extra
+		cidrs = extra
 		if !opts.NoNetwork {
 			// direct has no AWS session, so remote_services (a prefix-list
 			// lookup) cannot be resolved here - only local_cidrs applies.
@@ -373,32 +477,12 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 			}
 		}
 	case "ssm":
-		if opts.Cluster == "" || opts.Service == "" {
-			return 2, errors.New("--transport ssm needs --cluster and --service")
-		}
-		prov, err := d.NewAWSProvider(ctx, opts)
-		if err != nil {
-			return 1, fmt.Errorf("aws config: %w", err)
-		}
-		region = prov.Region()
-		task, err = prov.Discover(ctx, ecsTarget(opts))
-		if err != nil {
-			return 1, err
-		}
-		if task.StartedAt.IsZero() {
-			logf("%s/%s  task %s", opts.Cluster, opts.Service, short(task.ID))
-		} else {
-			logf("%s/%s  task %s  (started %s ago)", opts.Cluster, opts.Service, short(task.ID), time.Since(task.StartedAt).Round(time.Minute))
-		}
 		if !opts.NoNetwork {
 			cidrs, err = remoteSet(ctx, opts, prov, task, logf)
 			if err != nil {
 				return 1, err
 			}
 		}
-		tr = prov.Transport(logf)
-	default:
-		return 2, fmt.Errorf("unknown transport %q (ssm | direct)", opts.Transport)
 	}
 
 	// 2. helper and the setgid shim, before the SSM session: a helper that
@@ -418,13 +502,8 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 	}
 
 	// 3. session
-	conn, err := tr.Dial(ctx, task)
+	sess, err := dialAgent(ctx, opts, d, prov, task, logf)
 	if err != nil {
-		return 1, fmt.Errorf("connect to agent: %w", err)
-	}
-	sess, err := session.Dial(ctx, conn, proto.Hello{Version: proto.Version, User: opts.User}, session.Options{})
-	if err != nil {
-		conn.Close()
 		return 1, err
 	}
 	defer sess.Close()

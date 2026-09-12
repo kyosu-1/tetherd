@@ -29,6 +29,14 @@ type awsProvider interface {
 	VPCCIDRs(ctx context.Context, subnetID string) ([]netip.Prefix, error)
 	ServiceCIDRs(ctx context.Context, services []string) ([]netip.Prefix, error)
 	Transport(logf func(string, ...any)) transport.Transport
+	// SecretNames returns the env var names the task definition sources from
+	// Secrets Manager or SSM, across all containers. `tetherd env` masks
+	// these by default.
+	SecretNames(ctx context.Context, definitionARN string) (map[string]bool, error)
+	// PIDMode reports the task definition's pidMode ("task" is required for
+	// the agent to read the app container's environment). Task 7 (doctor)
+	// uses this.
+	PIDMode(ctx context.Context, definitionARN string) (string, error)
 }
 
 // HelperClient is the part of the privileged helper the CLI uses.
@@ -110,4 +118,12 @@ func (p *sdkProvider) ServiceCIDRs(ctx context.Context, services []string) ([]ne
 
 func (p *sdkProvider) Transport(logf func(string, ...any)) transport.Transport {
 	return &ssmtr.Transport{API: awsssm.NewFromConfig(p.cfg), Region: p.cfg.Region, Profile: p.profile, Logf: logf}
+}
+
+func (p *sdkProvider) SecretNames(ctx context.Context, definitionARN string) (map[string]bool, error) {
+	return ecsprov.SecretNames(ctx, awsecs.NewFromConfig(p.cfg), definitionARN)
+}
+
+func (p *sdkProvider) PIDMode(ctx context.Context, definitionARN string) (string, error) {
+	return ecsprov.PIDMode(ctx, awsecs.NewFromConfig(p.cfg), definitionARN)
 }

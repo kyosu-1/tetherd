@@ -24,6 +24,15 @@ func defaultRun(opts RunOptions) (int, error) {
 	return Run(ctx, opts, os.Stderr)
 }
 
+// envFn is swapped in tests, the same way runFn is.
+var envFn = defaultEnv
+
+func defaultEnv(opts EnvOptions) (int, error) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return EnvRun(ctx, opts, os.Stdout, os.Stderr)
+}
+
 // NewRootCommand builds `tetherd`.
 func NewRootCommand() *cobra.Command {
 	root := &cobra.Command{
@@ -33,8 +42,28 @@ func NewRootCommand() *cobra.Command {
 		SilenceErrors: true,
 		Version:       version.Version,
 	}
-	root.AddCommand(newRunCommand())
+	root.AddCommand(newRunCommand(), newEnvCommand())
 	return root
+}
+
+// addTargetFlags registers the flags `run` and `env` share: everything
+// needed to discover the task and reach its agent. Both commands' RunE call
+// applyConfig, whose changed() guards look up "user", "profile", "region",
+// "cluster", "service" and "env" by name - registering all of them here on
+// both commands is what keeps applyConfig callable (and its guards
+// non-panicking) under either one.
+func addTargetFlags(cmd *cobra.Command, opts *RunOptions) {
+	f := cmd.Flags()
+	f.StringVar(&opts.Transport, "transport", "ssm", "how to reach the agent: ssm | direct")
+	f.StringVar(&opts.Profile, "profile", "", "AWS profile (default: SDK default chain)")
+	f.StringVar(&opts.Region, "region", "", "AWS region (default: from the profile)")
+	f.StringVar(&opts.Cluster, "cluster", "", "ECS cluster of the dev service")
+	f.StringVarP(&opts.Service, "service", "s", "", "ECS service to attach to")
+	f.StringVar(&opts.TaskID, "task", "", "attach to this task ID instead of the oldest running one")
+	f.StringVar(&opts.TargetEnv, "env", "dev", "expected TETHERD_ENV of the agent; refuse to attach otherwise")
+	f.StringVar(&opts.AgentAddr, "agent-addr", "", "agent control address for --transport direct (host:port)")
+	f.StringVar(&opts.User, "user", "", "user name sent to the agent (default $USER)")
+	f.StringVar(&configPath, "config", "", "path to .tetherd.yml (default: the nearest one above the working directory)")
 }
 
 func newRunCommand() *cobra.Command {
@@ -68,22 +97,40 @@ func newRunCommand() *cobra.Command {
 			return nil
 		},
 	}
+	addTargetFlags(cmd, &opts)
 	f := cmd.Flags()
-	f.StringVar(&opts.Transport, "transport", "ssm", "how to reach the agent: ssm | direct")
-	f.StringVar(&opts.Profile, "profile", "", "AWS profile (default: SDK default chain)")
-	f.StringVar(&opts.Region, "region", "", "AWS region (default: from the profile)")
-	f.StringVar(&opts.Cluster, "cluster", "", "ECS cluster of the dev service")
-	f.StringVarP(&opts.Service, "service", "s", "", "ECS service to attach to")
-	f.StringVar(&opts.TaskID, "task", "", "attach to this task ID instead of the oldest running one")
-	f.StringVar(&opts.TargetEnv, "env", "dev", "expected TETHERD_ENV of the agent; refuse to attach otherwise")
-	f.StringVar(&opts.AgentAddr, "agent-addr", "", "agent control address for --transport direct (host:port)")
 	f.StringArrayVar(&opts.RemoteCIDRs, "remote-cidr", nil, "additional destination CIDR to route through the agent (repeatable; the VPC CIDR is added automatically with --transport ssm)")
 	f.StringVar(&opts.HelperSocket, "helper-socket", helper.DefaultSocket, "tetherd-helper socket")
 	f.StringVar(&opts.ExecPath, "exec-path", helper.ExecInstallDir+"/"+helper.ExecName, "path of the setgid tetherd-exec")
-	f.StringVar(&opts.User, "user", "", "user name sent to the agent (default $USER)")
 	f.BoolVar(&opts.NoNetwork, "no-network", false, "do not capture traffic (only connect to the agent)")
 	f.BoolVar(&opts.NoEnv, "no-env", false, "do not inject the task's environment into the command")
-	f.StringVar(&configPath, "config", "", "path to .tetherd.yml (default: the nearest one above the working directory)")
+	return cmd
+}
+
+func newEnvCommand() *cobra.Command {
+	var opts EnvOptions
+	cmd := &cobra.Command{
+		Use:   "env",
+		Short: "Print the dev task's environment (secrets masked by default)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := applyConfig(cmd, &opts.RunOptions); err != nil {
+				return err
+			}
+			code, err := envFn(opts)
+			if err != nil {
+				if code == 0 {
+					code = 1
+				}
+				return &exitError{code: code, err: err}
+			}
+			return nil
+		},
+	}
+	addTargetFlags(cmd, &opts.RunOptions)
+	f := cmd.Flags()
+	f.StringVar(&opts.Format, "format", "dotenv", "output format: dotenv | shell | json")
+	f.BoolVar(&opts.Reveal, "reveal", false, "print secret values instead of ***")
 	return cmd
 }
 

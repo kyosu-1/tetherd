@@ -231,6 +231,25 @@ func TestChangedPanicsOnAnUnregisteredFlag(t *testing.T) {
 	changed(cmd, "definitely-not-a-flag")
 }
 
+// TestApplyConfigRunsUnderTheEnvCommand pins that `tetherd env` shares the
+// same discovery/target flags as `run` (addTargetFlags), so applyConfig's
+// changed() guards never panic when run against the env command - a
+// regression here would only ever surface at runtime, as a panic on the
+// first real invocation of `tetherd env`, since no test previously exercised
+// applyConfig with any command other than newRunCommand().
+func TestApplyConfigRunsUnderTheEnvCommand(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	t.Chdir(dir) // no .tetherd.yml here or above it: nothing to discover
+
+	cmd := newEnvCommand()
+	configPath = ""
+	var opts EnvOptions
+	if err := applyConfig(cmd, &opts.RunOptions); err != nil {
+		t.Fatalf("applyConfig must not error under the env command: %v", err)
+	}
+}
+
 // TestChangedRecognizesEveryRoutedFlag proves changed() resolves every flag
 // name applyConfig cares about (or might one day) without panicking - a
 // future rename of any of these would be caught by this test failing to

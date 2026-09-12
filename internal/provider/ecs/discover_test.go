@@ -30,6 +30,7 @@ func (f *fakeECS) DescribeTasks(_ context.Context, in *awsecs.DescribeTasksInput
 func task(id string, started time.Time, exec bool, agentStatus string, withAgent bool) types.Task {
 	t := types.Task{
 		TaskArn:              aws.String("arn:aws:ecs:ap-northeast-1:1:task/c/" + id),
+		TaskDefinitionArn:    aws.String("arn:aws:ecs:ap-northeast-1:1:task-definition/" + id + ":1"),
 		LastStatus:           aws.String("RUNNING"),
 		EnableExecuteCommand: exec,
 		StartedAt:            aws.Time(started),
@@ -65,6 +66,9 @@ func TestDiscoverPicksOldestEligible(t *testing.T) {
 	}
 	if got.ID != "a" || got.RuntimeID != "a-rt" || got.SubnetID != "subnet-a" || got.Cluster != "c" {
 		t.Fatalf("got %+v", got)
+	}
+	if got.DefinitionARN != "arn:aws:ecs:ap-northeast-1:1:task-definition/a:1" {
+		t.Fatalf("DefinitionARN = %q, want it filled from DescribeTasks' taskDefinitionArn", got.DefinitionARN)
 	}
 	if aws.ToString(f.list.Cluster) != "c" || aws.ToString(f.list.ServiceName) != "api" || f.list.DesiredStatus != types.DesiredStatusRunning {
 		t.Fatalf("ListTasks input = %+v", f.list)
