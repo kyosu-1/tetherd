@@ -67,13 +67,20 @@ func newRunCommand() *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
-	f.StringVar(&opts.Transport, "transport", "direct", "how to reach the agent: direct (ssm in v0.2)")
+	f.StringVar(&opts.Transport, "transport", "ssm", "how to reach the agent: ssm | direct")
+	f.StringVar(&opts.Profile, "profile", "", "AWS profile (default: SDK default chain)")
+	f.StringVar(&opts.Region, "region", "", "AWS region (default: from the profile)")
+	f.StringVar(&opts.Cluster, "cluster", "", "ECS cluster of the dev service")
+	f.StringVarP(&opts.Service, "service", "s", "", "ECS service to attach to")
+	f.StringVar(&opts.TaskID, "task", "", "attach to this task ID instead of the oldest running one")
+	f.StringVar(&opts.TargetEnv, "env", "dev", "expected TETHERD_ENV of the agent; refuse to attach otherwise")
 	f.StringVar(&opts.AgentAddr, "agent-addr", "", "agent control address for --transport direct (host:port)")
-	f.StringArrayVar(&opts.RemoteCIDRs, "remote-cidr", nil, "destination CIDR to route through the agent (repeatable)")
+	f.StringArrayVar(&opts.RemoteCIDRs, "remote-cidr", nil, "additional destination CIDR to route through the agent (repeatable; the VPC CIDR is added automatically with --transport ssm)")
 	f.StringVar(&opts.HelperSocket, "helper-socket", helper.DefaultSocket, "tetherd-helper socket")
 	f.StringVar(&opts.ExecPath, "exec-path", helper.ExecInstallDir+"/"+helper.ExecName, "path of the setgid tetherd-exec")
 	f.StringVar(&opts.User, "user", "", "user name sent to the agent (default $USER)")
 	f.BoolVar(&opts.NoNetwork, "no-network", false, "do not capture traffic (only connect to the agent)")
+	f.BoolVar(&opts.NoEnv, "no-env", false, "do not inject the task's environment into the command")
 	return cmd
 }
 

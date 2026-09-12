@@ -176,8 +176,13 @@ tetherd run [flags] -- <command...>
   -s, --service    対象サービス（複数サービスのリポジトリ用）
       --as NAME    X-Dev-User の値を上書き（他人の代わりにデバッグ）
       --task ID    タスクを明示（既定は RUNNING な全タスク）
+      --profile / --region   AWS プロファイルとリージョン
+      --cluster    対象の ECS クラスタ（v0.2b で .tetherd.yml から）
+      --env NAME   agent の TETHERD_ENV と照合（既定 dev）
+      --no-env     タスクの env を注入しない
+      --transport  ssm（既定）| direct（ローカル e2e 用）
       --local-port N
-      --no-incoming / --no-network / --no-env
+      --no-incoming / --no-network
   -q, --quiet
 
 tetherd env [--format dotenv|json|shell] [--reveal]
@@ -296,7 +301,7 @@ S3 / DynamoDB / SQS / Secrets Manager / Bedrock など VPC 外のサービスは
 
 ### 副産物: タスクロールが自動で効く
 
-タスクの env には `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` が入っていて、SDK はそれを見て `169.254.170.2` に認証情報を取りに行く。透過モードではこの通信も捕まって agent 経由でタスク内の本物のエンドポイントに届くので、**追加実装なしで SDK がタスクロールとして振る舞う**。`ECS_CONTAINER_METADATA_URI_V4` も同様。`run` は起動時に同じ経路でクレデンシャルを取り `sts:GetCallerIdentity` で確認して表示する。
+タスクの env には `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` が入っていて、SDK はそれを見て `169.254.170.2` に認証情報を取りに行く。透過モードではこの通信も捕まって agent 経由でタスク内の本物のエンドポイントに届くので、**追加実装なしで SDK がタスクロールとして振る舞う**。`ECS_CONTAINER_METADATA_URI_V4` も同様。`run` は起動時に同じ経路でクレデンシャルを取り `sts:GetCallerIdentity` で確認して表示する。ただし「自動で効く」ためには、開発者の `~/.aws/config` の `default` プロファイルがコンテナクレデンシャルを覆い隠さないようにする必要がある（SDK のチェーンは共有設定のほうが先）。tetherd は透過モードでタスクロールが使えるとき、子プロセスの `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` を空ファイルに向けてこの層を外し、リージョンを明示注入する。
 
 ### v2 で扱うもの
 
@@ -353,7 +358,7 @@ aws:
   profile: myapp-dev-shota
 ```
 
-タスク env から既定で除外するもの: `PATH HOME HOSTNAME USER LOGNAME SHELL TMPDIR PWD OLDPWD TERM LANG LC_* SHLVL _ AWS_EXECUTION_ENV`。`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` と `ECS_CONTAINER_METADATA_URI_V4` は透過モードで必要なので残し、`--no-network` のときだけ除外する（残すと SDK が失敗する）。
+タスク env から既定で除外するもの: `PATH HOME HOSTNAME USER LOGNAME SHELL TMPDIR PWD OLDPWD TERM LANG LC_* SHLVL _ AWS_EXECUTION_ENV`。`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` と `ECS_CONTAINER_METADATA_URI_V4` は透過モードで必要なので残し、`--no-network` のときだけ除外する（残すと SDK が失敗する）。さらに、コンテナのパスを指してランタイムの挙動を変える変数（`SSL_CERT_FILE`、`LD_LIBRARY_PATH`、`JAVA_HOME`、`PYTHONPATH` など）も既定で除外する。distroless の `SSL_CERT_FILE` が macOS に注入されると子プロセスの TLS が全部壊れることを実機で確認したため。
 
 ---
 

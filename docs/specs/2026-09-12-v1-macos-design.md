@@ -237,7 +237,7 @@ type Transport interface {
 }
 ```
 
-- `ssm`: SDK で `ssm:StartSession`（Target `ecs:<cluster>_<taskId>_<runtimeId>`、DocumentName `AWS-StartPortForwardingSession`、Parameters `portNumber: ["9900"]`, `localPortNumber: ["<空きポート>"]`）。応答を `session-manager-plugin` に AWS CLI と同じ引数（セッション JSON、リージョン、`StartSession`、プロファイル、パラメータ JSON、エンドポイント）で渡して子プロセスとして起動し、`127.0.0.1:<port>` に dial。AWS CLI 自体には依存しない
+- `ssm`: SDK で `ssm:StartSession`（Target `ecs:<cluster>_<taskId>_<runtimeId>`、DocumentName `AWS-StartPortForwardingSession`、Parameters `portNumber: ["9900"]`, `localPortNumber: ["<空きポート>"]`）。**ターゲットの runtimeId はタスク内のどのコンテナでもよい**: awsvpc ではタスク内の全コンテナが同じネットワーク名前空間を共有するので、どのコンテナの ECS Exec エージェント経由で転送しても `127.0.0.1:9900` の agent に届く。`DescribeTasks` は SSM から実際には到達できないコンテナでも `ExecuteCommandAgent` を `RUNNING` と報告する（distroless の agent コンテナが実機でこれに該当し、`TargetNotConnected` になる）ため、CLI は候補（agent コンテナ → 他のコンテナ）を順に試し、`TargetNotConnected` なら次へ進む。応答を `session-manager-plugin` に AWS CLI と同じ引数（セッション JSON、リージョン、`StartSession`、プロファイル、パラメータ JSON、エンドポイント）で渡して子プロセスとして起動し、`127.0.0.1:<port>` に dial。AWS CLI 自体には依存しない
 - `direct`: 指定アドレスに TCP。ローカル e2e と結合テスト用。`run --transport direct --agent-addr host:port --remote-cidr ...` で使う
 - 再接続: yamux セッションが死んだら指数バックオフ（1s → 30s）で `StartSession` からやり直し、`hello` を再送。進行中の dial は切れる
 - plugin の埋め込み（`aws/session-manager-plugin` の datachannel を組み込んで依存ゼロにする）は v2 候補。`Transport` の実装として足せる
@@ -246,6 +246,7 @@ type Transport interface {
 
 - `ListTasks(cluster, serviceName, desiredStatus=RUNNING)` → `DescribeTasks`。`tetherd-agent` コンテナがあり、`enableExecuteCommand` が true で、`managedAgents[ExecuteCommandAgent].lastStatus == RUNNING` のものを対象に
 - 対象タスク**全部**に SSM + yamux + `hello`。steal はどのタスクからでも受ける
+- タスクごとの SSM ターゲットは「そのタスクのコンテナのうち exec エージェントが繋がっているもの」。§6.1 のとおり候補を順に試す
 - `dial` / `resolve` / env は primary（起動が最も古いタスク）を使う。primary が落ちたら次に古いものへ
 - 10 秒おきに `ListTasks` を再実行し、新しいタスクには接続、消えたタスクは片付ける（rolling deploy の追従）
 - `--task ID` で明示した場合はそのタスクだけ
@@ -271,7 +272,13 @@ Ctrl-C は端末がプロセスグループ全体に SIGINT を送るので、CL
 
 タスク env から既定で除外: `PATH HOME HOSTNAME USER LOGNAME SHELL TMPDIR PWD OLDPWD TERM LANG LC_* SHLVL _ AWS_EXECUTION_ENV`。
 
-`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` と `ECS_CONTAINER_METADATA_URI_V4` は透過モードで必要なので残す。`--no-network` のときだけ除外する（残すと SDK が `169.254.170.2` に行って失敗し、フォールバックしない）。
+これに加えて、**コンテナのファイルシステムを指し、ランタイムの信頼やコード解決を黙って変えてしまう変数**も既定で除外する: `SSL_CERT_FILE` `SSL_CERT_DIR` `AWS_CA_BUNDLE` `REQUESTS_CA_BUNDLE` `CURL_CA_BUNDLE` `NODE_EXTRA_CA_CERTS` `LD_LIBRARY_PATH` `LD_PRELOAD` `DYLD_LIBRARY_PATH` `DYLD_INSERT_LIBRARIES` `JAVA_HOME` `GOROOT` `PYTHONHOME` `PYTHONPATH`。実機で確認した例: distroless イメージは `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` を設定しており、macOS にこのパスは無いため、これを尊重する子プロセス（Go の `crypto/x509` など）の TLS が全部 `certificate signed by unknown authority` で落ちた（独自の CA バンドルを持つ `aws` CLI は影響を受けなかった）。
+
+`169.254.170.2` を指すエンドポイント変数（`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`、`ECS_CONTAINER_METADATA_URI_V4`、`ECS_CONTAINER_METADATA_URI`、`ECS_AGENT_URI`）は透過モードでは残し（これがタスクロールとタスクメタデータを効かせる）、`--no-network` では 4 つとも落とす。
+
+透過モードでタスクの env が `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` を持つときは、それだけでは子プロセスがタスクロールにならない。どの SDK も**共有設定プロファイルをコンテナクレデンシャルより先に**評価するので、開発者の `~/.aws/config` の `default` プロファイルが認証ソース（SSO、login session、`credential_process` など）を持っていると、そちらが勝つ（実機で確認: 子プロセスの `aws sts get-caller-identity` が「session has expired」を返し、共有設定を隠すと即座にタスクロールを返した）。そこで tetherd は静的キーと `AWS_PROFILE` を除去するだけでなく、`AWS_CONFIG_FILE` と `AWS_SHARED_CREDENTIALS_FILE` をセッション用の空ファイルに向け、`AWS_REGION` / `AWS_DEFAULT_REGION` をタスクのリージョンで明示する。`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` は残すので、認証情報の自動更新は SDK 任せのまま。共有設定を隠すことは `✓ iam` の次の行に明示する。
+
+`--no-network` では tetherd は認証情報に一切触らない（開発者自身の身元のまま）。タスクの `AWS_REGION` は注入されるが、`169.254.170.2` を指す 4 つの変数は落とす。セッションの中で自分のプロファイルを使いたい場合は `--no-env`（タスクの env を注入しない）か `--no-network`（捕捉しない）を使う。
 
 ### 6.5 コマンド
 
@@ -477,6 +484,7 @@ design.md §10 に加えて:
 - `:9900` は無認証だが lo にしか bind せず、信頼境界は「タスク内」。design.md に明記する
 - ローカルアプリは共有 dev DB に書く。ローカルブランチの auto-migrate が dev DB を変えうることを README で注意する
 - セッション中は `tetherd-exec` が誰でも実行可能（mode `2755`、setgid `tetherd`）なので、同じマシンの他のローカルユーザーも gid `tetherd` でコマンドを起動しトンネルに到達できる。シングルユーザーのラップトップでは許容するが、その前提であることを明記する
+- セッション中、ラップトップ上の SSM ローカルフォワードのポート（`127.0.0.1:9900`）は無認証で agent に届く経路になる: 同じマシンの他のローカルプロセスがそのポートに直接繋いで `welcome.app_env` を読んだり、VPC 内へ dial したりできる。lo にしか bind しないので同一マシンには閉じるが、それ自体が信頼境界。`hello` にユーザー単位のトークンを載せる（v0.3）までこの経路が開いていることを明記する
 
 ---
 
@@ -503,7 +511,32 @@ design.md §10 に加えて:
 | 2 | `DIOCNATLOOK`（84 バイト、`0xC0544417`）が元の宛先を正しく返した |
 | 3 | `DIOCCHANGERULE` は不要。既定 `/etc/pf.conf` の `com.apple/*` に子アンカー `com.apple/900.tetherd` で乗り、セッションごとの `pfctl -E`/`-X` と `-F rules/nat/Tables` で終了後のアンカーは空 |
 | 4 | 未検証（`remote_domains` を使う v0.2 で） |
-| 5, 6 | 未検証（AWS。v0.2） |
+| 5 | **通った**。`pidMode: task` + agent への `SYS_PTRACE` + ECS Exec（ssm-agent 注入）は同じタスク定義で共存し、agent が app コンテナの `/proc/<pid>/environ` から 19 個の env を読めた。Secrets Manager 由来の `DB_PASSWORD`（24 文字）と SSM Parameter Store 由来の `FEATURE_FLAG` が解決済みの値で入っていた |
+| 6 | **通った**。`ssm:StartSession` + `AWS-StartPortForwardingSession` で `127.0.0.1:9900` に届く。ただしターゲットは **agent コンテナの runtimeId では駄目**だった（§6.1 参照）。所要時間は `StartSession` から `welcome` まで 2〜4 秒、確立後のフロー 1 本あたりの往復は RDS のクエリで体感できないレベル |
+
+### AWS 検証結果（2026-09-12、`deploy/dev-env` + `docs/e2e-aws.md`）
+
+実機の Fargate タスク（ap-northeast-1、ARM64、`pidMode: task`）に対して macOS 26.6.2 から実行。
+
+| 検証 | 結果 |
+|---|---|
+| env 注入 | ✅ タスクの env 19 個。`DB_PASSWORD`（Secrets Manager）と `FEATURE_FLAG`（Parameter Store）が解決済みで届く。`PATH` などはローカルのまま |
+| VPC 内への透過アクセス | ✅ ローカルの Go プロセスが `DB_HOST` の RDS に接続して `SELECT now()` を返した（pf rdr → `DIOCNATLOOK` → SSM → agent → RDS） |
+| タスクのプライベート IP への到達 | ✅ `curl http://10.0.11.229:8081/` が通り、タスク側は `from 10.0.11.229`（自分の ENI）と認識した |
+| タスクロール | ✅ 子プロセスの `aws sts get-caller-identity` が `assumed-role/tetherd-dev-api-task/…`。ただし §6.4 の対策（共有設定を隠す）が必要だった |
+| VPC 外の AWS サービス | ✅ `aws s3 ls` がタスクロールで成功（署名ベースなのでラップトップの回線から出る） |
+| gid のスコープ | ✅ `go run` がビルドして起動したバイナリも gid `tetherd`（309）。孫・ひ孫まで継承される |
+| 環境ガード | ✅ `--env prod` で dev のタスクに繋ごうとすると `refusing to attach: agent reports TETHERD_ENV="dev", expected "prod"` で exit 1 |
+| 1 台 1 セッション | ✅ 2 つ目の `run` が `another tetherd session is active (pid …, since …)` で exit 1 |
+| セッション断 | ✅ トランスポートを殺すと即座に `✗ agent session lost: control stream closed: EOF`、子プロセスを停止して exit 1 |
+
+実機でしか出なかった問題（すべて修正済み。詳細は §6.1、§6.4）:
+
+1. `ssm:StartSession` のターゲットに agent コンテナの runtimeId を使うと `TargetNotConnected`。distroless の agent コンテナでは ECS Exec の SSM エージェントが接続できていないのに、`DescribeTasks` は `RUNNING` と報告する。awsvpc は netns を共有するので、同じタスクの別コンテナ経由で転送すれば `127.0.0.1:9900` に届く
+2. 開発者の `~/.aws/config` の `default` プロファイルがコンテナクレデンシャルより先に評価され、タスクロールを覆い隠す
+3. distroless イメージの `SSL_CERT_FILE`（コンテナ内のパス）が注入され、macOS 側の子プロセスの TLS が全部壊れる
+
+---
 
 ---
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,7 +24,7 @@ func TestConfigFromEnv(t *testing.T) {
 		}
 		return ""
 	})
-	if err != nil || cfg.Env != "dev" || cfg.Control != "127.0.0.1:9900" {
+	if err != nil || cfg.Env != "dev" || cfg.Control != "127.0.0.1:9900" || cfg.AppContainer != "app" {
 		t.Fatalf("cfg = %+v, err = %v", cfg, err)
 	}
 }
@@ -138,5 +139,60 @@ func TestEmptyUserRejected(t *testing.T) {
 	var rej *session.RejectedError
 	if !errors.As(err, &rej) || rej.Err.Code != proto.CodeBadHello {
 		t.Fatalf("want bad_hello, got %v", err)
+	}
+}
+
+type fakeEnv struct {
+	env map[string]string
+	arn string
+	err error
+}
+
+func (f fakeEnv) Read(context.Context) (map[string]string, string, error) { return f.env, f.arn, f.err }
+
+func TestWelcomeCarriesAppEnv(t *testing.T) {
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	a := New(Config{Env: "dev"}, nil)
+	a.SetEnvReader(fakeEnv{env: map[string]string{"PORT": "8081"}, arn: "arn:task"})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go a.Serve(ctx, ln)
+	c, err := connect(t, ln.Addr().String(), "shota")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	w := c.Welcome()
+	if w.AppEnv["PORT"] != "8081" || w.TaskARN != "arn:task" || w.EnvError != "" {
+		t.Fatalf("welcome = %+v", w)
+	}
+}
+
+func TestWelcomeReportsEnvError(t *testing.T) {
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	a := New(Config{Env: "dev", TaskARN: "arn:cfg"}, nil)
+	a.SetEnvReader(fakeEnv{err: errors.New("no process of container \"app\" visible; is pidMode \"task\" set")})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go a.Serve(ctx, ln)
+	c, err := connect(t, ln.Addr().String(), "shota")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	w := c.Welcome()
+	if w.EnvError == "" || w.AppEnv != nil || w.TaskARN != "arn:cfg" {
+		t.Fatalf("welcome = %+v", w)
+	}
+}
+
+func TestWelcomeWithoutMetadata(t *testing.T) {
+	c, err := connect(t, startAgent(t), "shota") // startAgent has no MetadataURL
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if w := c.Welcome(); !strings.Contains(w.EnvError, "not running in ECS") {
+		t.Fatalf("welcome = %+v", w)
 	}
 }
