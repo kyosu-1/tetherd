@@ -130,17 +130,17 @@ func (a *Agent) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
-// sessionInfos is what Welcome.Sessions carries: every session attached
-// other than user's own, with where it attached from and since when.
+// sessionInfos is what Welcome.Sessions carries: every registered session
+// except user's, with where it attached from and since when. An empty user
+// excludes nothing, which is what a read-only attach wants - it has no
+// registered session of its own (see register).
 //
 // It reuses Sessions()'s sort, which is a contract rather than tidiness
 // (see registry.go): unsorted, the welcome one developer reads would differ
 // from one attach to the next and so would `tetherd status`'s output.
 //
-// user's own session is left out so that this is exactly the set others()
-// returns, one field richer - see Welcome. It is also what makes `tetherd
-// status`, which has to attach in order to ask, not report itself as an
-// attached developer.
+// The exclusion is what makes this exactly the set others() returns, one
+// field richer - see Welcome.
 func (a *Agent) sessionInfos(user string) []proto.SessionInfo {
 	var out []proto.SessionInfo
 	for _, s := range a.Sessions() {
@@ -186,11 +186,33 @@ func (h *handler) Hello(hello proto.Hello, remote string, open session.Opener) (
 	if e := h.a.register(hello, remote, open); e != nil {
 		return proto.Welcome{}, e
 	}
-	h.user = hello.User
-	h.a.logf("user %q attached from %s", hello.User, remote)
+	// Only a session the registry recorded may set this: Closed
+	// unregisters whatever it names, so a read-only session that set it
+	// would unregister this developer's own steal session on detaching.
+	// stealSession is the one predicate both sides ask (see registry.go).
+	if stealSession(hello) {
+		h.user = hello.User
+		h.a.logf("user %q attached from %s", hello.User, remote)
+	} else {
+		// Said differently because this session is not in the registry and
+		// so gets no "detached" line either: the log would otherwise read
+		// as an attach that never ended.
+		h.a.logf("user %q attached from %s to read only", hello.User, remote)
+	}
 	// One snapshot of the registry for both views of it: Others is the
 	// names, Sessions the same set with the detail `tetherd status` needs.
-	sessions := h.a.sessionInfos(hello.User)
+	//
+	// What is left out is the session this welcome is *for*, which for a
+	// read-only attach is none of them: it was not recorded, so there is
+	// nothing of its own to leave out. Filtering by name instead would
+	// have `tetherd status` hide this developer's own `tetherd run` - the
+	// session they are most likely asking about, and the one whose absence
+	// would read as "your run is not attached to this task".
+	self := ""
+	if stealSession(hello) {
+		self = hello.User
+	}
+	sessions := h.a.sessionInfos(self)
 	w := proto.Welcome{
 		Version:  proto.Version,
 		TaskARN:  h.a.cfg.TaskARN,

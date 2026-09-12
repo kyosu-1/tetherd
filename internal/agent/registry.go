@@ -109,10 +109,39 @@ func (a *Agent) Match(header func(string) string) *Session {
 	return MatchSession(all, header)
 }
 
-// register records the session described by h. One user may hold one
-// session at a time; a second hello for the same user is refused and
-// changes nothing about the session that is already attached.
+// register records the session described by h, if it is one the registry is
+// for. One user may hold one *steal* session at a time; a second such hello
+// for the same user is refused and changes nothing about the session that is
+// already attached.
+//
+// A session that does not declare Incoming.Enabled is not recorded at all,
+// and is never refused. The registry is the steal routing table and nothing
+// else - MatchSession skips every session with Incoming disabled, so a
+// read-only session could not be matched even when it was recorded - so
+// leaving those out costs nothing and buys three things:
+//
+//   - `tetherd env`, `tetherd doctor` and `tetherd status` stop colliding
+//     with this developer's own `tetherd run`. Until this change any of
+//     them, run while that developer's run was attached, was refused with
+//     duplicate_user - and a live run is exactly when someone reaches for
+//     doctor or status. (Shipped in v0.2b and v0.3a; found by `status`.)
+//   - Welcome.Others and Welcome.Sessions come to mean "who can receive
+//     requests", which is the question `tetherd status` answers. A
+//     read-only attach reported as "attached" would be misleading: it can
+//     receive nothing and it is gone a moment later.
+//   - unregister(user) stays unambiguous, because no two entries can share
+//     a name. Recording read-only sessions under a second key would have
+//     made the detach path ambiguous instead - and with the map keyed by
+//     user, recording them under the same key would have a `status` attach
+//     overwrite that developer's run and its detach delete it, which is
+//     the developer's requests silently stopping.
+//
+// Nothing about steal routing changes: a second steal session for one user
+// is still refused, which is the ambiguity the rule exists to prevent.
 func (a *Agent) register(h proto.Hello, from string, open session.Opener) *proto.Error {
+	if !stealSession(h) {
+		return nil
+	}
 	a.mu.Lock()
 	if s, ok := a.sessions[h.User]; ok {
 		e := &proto.Error{
@@ -154,6 +183,17 @@ func (a *Agent) register(h proto.Hello, from string, open session.Opener) *proto
 	}
 	return nil
 }
+
+// stealSession reports whether a hello asks to receive requests, and so
+// whether it belongs in the registry.
+//
+// It is a named function with two callers on purpose: register records only
+// these, and handler.Hello may set handler.user only for these, because
+// handler.Closed unregisters whatever handler.user names. A read-only
+// session that set it would, on detaching, unregister that developer's own
+// steal session - and their requests would stop arriving with nothing
+// naming the cause. One predicate, so the two cannot drift apart.
+func stealSession(h proto.Hello) bool { return h.Incoming.Enabled }
 
 // incomingGap names what an enabled Incoming is missing, or "" if it is
 // usable. It never returns the token itself.

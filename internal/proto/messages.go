@@ -91,15 +91,18 @@ type SessionInfo struct {
 
 // Welcome is the agent's reply to Hello.
 //
-// Others and Sessions are the same set - every session attached other than
-// the one being welcomed - and differ only in detail. Others is user names
-// alone and is what every CLI up to v0.3a reads; Sessions adds where each
-// session attached from and since when, which is what `tetherd status`
-// prints and what answers "is my colleague still attached, and since
-// when?". Both are sent, because fields are additive only and a CLI that
-// predates Sessions must keep working against this agent - just as this
-// CLI must keep working against the v0.3a agent that is deployed today,
-// which sends Others and no Sessions at all.
+// Others and Sessions are the same set and differ only in detail: every
+// session that can receive requests for a user, except the one being
+// welcomed when it is one of those. (A session that declares Incoming
+// disabled - env, doctor, status - can receive nothing and is not one of
+// them, so such a welcome lists them all.) Others is user names alone and
+// is what every CLI up to v0.3a reads; Sessions adds where each session
+// attached from and since when, which is what `tetherd status` prints and
+// what answers "is my colleague still attached, and since when?". Both are
+// sent, because fields are additive only and a CLI that predates Sessions
+// must keep working against this agent - just as this CLI must keep working
+// against the v0.3a agent that is deployed today, which sends Others and no
+// Sessions at all.
 type Welcome struct {
 	Version  string            `json:"version"`
 	TaskARN  string            `json:"task_arn"`

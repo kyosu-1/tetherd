@@ -313,21 +313,28 @@ func TestStatusNeverSendsATokenOrTakesRequests(t *testing.T) {
 	// Half two: what the agent would do with a request while that session
 	// is attached. Asked of a real *agent.Agent, inside the window the
 	// session exists: the gate blocks the agent in the middle of its own
-	// hello handling, after the session is registered and before the
-	// welcome is sent. Reading the registry back after the command returned
-	// would prove nothing, because the agent unregisters on the goroutine
-	// that notices the disconnect.
+	// hello handling, after it has decided what to do with the hello and
+	// before the welcome is sent. Reading the registry back after the
+	// command returned would prove nothing - the session is gone by then.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	gate := &gateEnvReader{entered: make(chan struct{}), release: make(chan struct{})}
+	// blockFrom 2, because the colleague attached below goes through the
+	// same reader and must not be held in its own handshake.
+	gate := &gateEnvReader{entered: make(chan struct{}), release: make(chan struct{}), blockFrom: 2}
 	t.Cleanup(gate.open)
 	a := agent.New(agent.Config{Env: "dev", TaskARN: "arn:test", AppContainer: "app"}, nil)
 	a.SetEnvReader(gate)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); ln.Close() })
 	go a.Serve(ctx, ln)
+	// A colleague who *is* taking requests, so the assertions below are
+	// against a registry that is demonstrably readable and non-empty: "the
+	// agent has no session for tester" then means the read-only session
+	// was left out, not that nothing was observed at all.
+	attachAs(t, ln.Addr().String(), "shota")
+	waitFor(t, func() bool { return len(a.Sessions()) == 1 }, "the colleague to attach")
 
 	p2 := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"}, agentAddr: ln.Addr().String()}
 	done := make(chan int, 1)
@@ -341,8 +348,10 @@ func TestStatusNeverSendsATokenOrTakesRequests(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the agent never reached the env read, so the session window was never observed")
 	}
-	if n := len(a.Sessions()); n != 1 {
-		t.Fatalf("sessions during the window = %d, want status's own: the assertion below would be vacuous", n)
+	// A read-only session is not recorded at all, so the only session the
+	// agent holds during the window is the colleague's.
+	if got := a.Sessions(); len(got) != 1 || got[0].User != "shota" {
+		t.Errorf("sessions during the window = %+v, want only the colleague's", got)
 	}
 	// A request carrying the name status attached under and the token it
 	// was given must belong to the application, not to status.
@@ -372,13 +381,28 @@ func TestStatusNeverSendsATokenOrTakesRequests(t *testing.T) {
 type gateEnvReader struct {
 	entered chan struct{}
 	release chan struct{}
-	in      sync.Once
-	out     sync.Once
+	// blockFrom is which read to start blocking at, counting from 1. A
+	// fixture that attaches a session of its own before the one under test
+	// sets it to 2: the earlier attach must complete, and it has when the
+	// client it returns has its welcome, which the agent sends only after
+	// this read returns.
+	blockFrom int
+
+	mu    sync.Mutex
+	calls int
+	in    sync.Once
+	out   sync.Once
 }
 
 func (g *gateEnvReader) Read(context.Context) (map[string]string, string, error) {
-	g.in.Do(func() { close(g.entered) })
-	<-g.release
+	g.mu.Lock()
+	g.calls++
+	n := g.calls
+	g.mu.Unlock()
+	if g.blockFrom == 0 || n >= g.blockFrom {
+		g.in.Do(func() { close(g.entered) })
+		<-g.release
+	}
 	return map[string]string{"PORT": "1"}, "arn:test", nil
 }
 
@@ -498,32 +522,80 @@ func TestStatusRefusesAnEnvironmentMismatch(t *testing.T) {
 	}
 }
 
-// TestStatusSaysWhenThisNameIsAlreadyAttached covers the case a developer
-// hits most often: `tetherd status` run while their own `tetherd run` is
-// live. The agent allows one session per name, so the attach is refused -
-// and a bare "rejected by agent (duplicate_user)" would read as a broken
-// service. The row has to name what is actually going on, and how to read
-// the task anyway.
-func TestStatusSaysWhenThisNameIsAlreadyAttached(t *testing.T) {
+// TestStatusReadsATaskWhileThisDevelopersRunIsAttached is the payoff of
+// narrowing the agent's one-session-per-user rule to sessions that can
+// receive requests. `tetherd status` run alongside your own `tetherd run`
+// is the common case - a live run is exactly when you ask who else is
+// attached - and until that change the attach was refused with
+// duplicate_user on every task, so the command could answer nothing at the
+// one moment it was wanted. It must now read the task and report the run.
+func TestStatusReadsATaskWhileThisDevelopersRunIsAttached(t *testing.T) {
 	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
-	attachAs(t, ag.addr, "tester") // the name statusOpts attaches under
-	waitFor(t, func() bool { return len(ag.a.Sessions()) == 1 }, "the earlier session to attach")
+	attachAs(t, ag.addr, "tester") // this developer's own run, same name
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 1 }, "the run to attach")
 	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"}, agentAddr: ag.addr}
+	var out, logs strings.Builder
+	code, err := StatusRunWithDeps(context.Background(), statusOpts(), &out, &logs, depsFor(p))
+	if err != nil || code != 0 {
+		t.Fatalf("status must read a task this developer is already attached to: code=%d err=%v logs=%s", code, err, logs.String())
+	}
+	report := out.String()
+	// The run is reported, from where and since when - it is a session that
+	// can receive requests, so it is exactly what `status` is asked about,
+	// even though it happens to be this developer's own.
+	if !strings.Contains(report, "tester") || !strings.Contains(report, "from 127.0.0.1:") {
+		t.Errorf("the attached run must be reported:\n%s", report)
+	}
+	if strings.Contains(report, "nobody attached") || strings.Contains(report, "not read") {
+		t.Errorf("nothing may be refused or missing here:\n%s", report)
+	}
+}
+
+// TestStatusReportsARefusalWithWhatTheAgentSaid covers what is left of the
+// duplicate_user path now that a read-only attach is not refused: an agent
+// older than that change - v0.3a's, deployed today - refuses any second
+// hello for a name, including `status`'s. RejectedError's own text drops
+// the refusal's From and Since, so the row prints them instead of the raw
+// protocol wording.
+func TestStatusReportsARefusalWithWhatTheAgentSaid(t *testing.T) {
+	refusing := &refusingAgentHandler{err: proto.Error{
+		Code:    proto.CodeDuplicateUser,
+		Message: `another session for user "tester" is already attached`,
+		From:    "10.0.0.7:51000",
+		Since:   "2026-09-12T09:00:00Z",
+	}}
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"}, agentAddr: startFakeAgent(t, refusing)}
 	var out, logs strings.Builder
 	code, err := StatusRunWithDeps(context.Background(), statusOpts(), &out, &logs, depsFor(p))
 	if code != 1 || err != nil {
 		t.Fatalf("code=%d err=%v, want 1 with the reason in the report", code, err)
 	}
 	report := out.String()
-	for _, want := range []string{"already attached", "tetherd run", "--user"} {
+	for _, want := range []string{"tester", "10.0.0.7:51000", "2026-09-12T09:00:00Z"} {
 		if !strings.Contains(report, want) {
-			t.Errorf("the row must contain %q:\n%s", want, report)
+			t.Errorf("the row must carry %q from the refusal:\n%s", want, report)
 		}
 	}
-	if !strings.Contains(report, "from 127.0.0.1:") {
-		t.Errorf("the refusal names where the existing session attached from; print it:\n%s", report)
-	}
 }
+
+// refusingAgentHandler answers every hello with one error - an agent that
+// refuses this attach, whatever the reason it gives.
+type refusingAgentHandler struct{ err proto.Error }
+
+func (h *refusingAgentHandler) Hello(proto.Hello, string, session.Opener) (proto.Welcome, *proto.Error) {
+	e := h.err
+	return proto.Welcome{}, &e
+}
+
+func (h *refusingAgentHandler) Dial(context.Context, string) (net.Conn, error) {
+	return nil, errors.New("this agent does not dial")
+}
+
+func (h *refusingAgentHandler) Resolve(context.Context, string) ([]string, int, error) {
+	return nil, 0, errors.New("this agent does not resolve")
+}
+
+func (h *refusingAgentHandler) Closed() {}
 
 // TestStatusCommandParsesFlags exercises the cobra layer end to end
 // (NewRootCommand -> flag parsing -> statusFn). Without it, forgetting to

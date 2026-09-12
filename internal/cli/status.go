@@ -230,14 +230,13 @@ func sessionLines(sessions []proto.SessionInfo) []string {
 
 // statusReason says why a task could not be read.
 //
-// duplicate_user gets its own wording because it is not a broken task: it
-// is this developer's own name already being attached, which is almost
-// always their own `tetherd run` - and a live run is exactly when someone
-// reaches for `tetherd status`. The refusal carries where that session
-// attached from and since when, which is worth printing instead of the raw
-// protocol wording. It does not carry the other sessions on the task, and
-// the agent allows one session per name, so reading that task at all needs
-// a name of its own: --user is how to give one.
+// duplicate_user gets its own wording because the refusal carries where the
+// conflicting session attached from and since when, and RejectedError's own
+// text drops both. `status` attaches read-only, so an agent that knows
+// read-only sessions are not registered never refuses it; what remains
+// reachable is an agent older than that change - v0.3a's, which refuses any
+// second hello for a name - and a genuine second session under this name.
+// Either way the useful facts are which name, from where, and since when.
 func statusReason(user string, err error) string {
 	var rej *session.RejectedError
 	if errors.As(err, &rej) && rej.Err.Code == proto.CodeDuplicateUser {
@@ -248,7 +247,7 @@ func statusReason(user string, err error) string {
 		if rej.Err.Since != "" {
 			detail += " since " + rej.Err.Since
 		}
-		return fmt.Sprintf("(not read: %q is already attached%s - probably your own `tetherd run`; read this task under another name with --user %s-status)", user, detail, user)
+		return fmt.Sprintf("(not read: the agent is holding another session for %q%s)", user, detail)
 	}
 	return fmt.Sprintf("(not read: %v)", err)
 }

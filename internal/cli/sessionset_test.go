@@ -20,13 +20,22 @@ import (
 // dialInto attaches to ag as user and returns the session. It is the test's
 // stand-in for run.go's dialAgent, which needs a provider and options this
 // test has no use for.
+//
+// It attaches as a session that takes requests - Incoming enabled, with a
+// token and the header names to match against - because the agent's
+// registry is the steal routing table and records nothing else. A session
+// that declared no Incoming would never appear in ag.a.Sessions(), so
+// "Remove detaches from the agent" would be a claim about a session the
+// agent never held: the assertion could not fail, whatever Remove did.
 func dialInto(t *testing.T, ag *inProcessAgent, user string) *session.Client {
 	t.Helper()
 	conn, err := net.Dial("tcp", ag.addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess, err := session.Dial(context.Background(), conn, proto.Hello{Version: proto.Version, User: user}, session.Options{})
+	hello := proto.Hello{Version: proto.Version, User: user, Token: "tok-" + user,
+		Incoming: proto.Incoming{Enabled: true, Header: DefaultMatchHeader, TokenHeader: DefaultMatchTokenHeader}}
+	sess, err := session.Dial(context.Background(), conn, hello, session.Options{})
 	if err != nil {
 		conn.Close()
 		t.Fatal(err)
