@@ -595,9 +595,19 @@ func TestApplySharedIncomingReachesDoctor(t *testing.T) {
 //
 // Precedence in this project is decided on whether the flag was *passed*,
 // not on whether its value is non-zero (flags > personal > shared >
-// defaults), so the two cases a value-based guard would get wrong are
-// pinned here as well: the flag typed with the default port's own value,
-// and the flag typed with zero.
+// defaults), so the two cases a value-based guard (`if opts.LocalPort == 0
+// || opts.LocalPort == DefaultLocalPort`) would get wrong are pinned here
+// as well: the flag typed with the default port's own value, and the flag
+// typed with zero.
+//
+// The file's port must therefore differ from every typed value, including
+// from DefaultLocalPort. An earlier version of this test committed 8080 to
+// the file and typed 8080 for the default-port case - typed value, config
+// value and expectation one number, so that case could only ever pass, and
+// it did pass under both mutations it exists to catch. What it has to
+// distinguish is "a typed value that happens to equal the default still
+// beats a different config value", which needs the two to be different
+// numbers.
 func TestLocalPortFlagBeatsTheIncomingBlock(t *testing.T) {
 	for _, c := range []struct {
 		name string
@@ -609,14 +619,15 @@ func TestLocalPortFlagBeatsTheIncomingBlock(t *testing.T) {
 		{"a port the developer typed", []string{"--local-port", "3000"}, 3000, 3000},
 		{"the default port, typed", []string{"--local-port", fmt.Sprint(DefaultLocalPort)}, DefaultLocalPort, DefaultLocalPort},
 		{"zero, typed", []string{"--local-port", "0"}, 0, DefaultLocalPort},
-		{"no flag at all", nil, 8080, 8080},
+		{"no flag at all", nil, 9999, 9999},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, ".tetherd.yml")
-			// 8080 in the file, so "no flag at all" reads it from there and
-			// the typed cases have something to beat.
-			if err := os.WriteFile(path, []byte("version: 1\nincoming:\n  local_port: 8080\n"), 0o644); err != nil {
+			// 9999 in the file: not zero, and not DefaultLocalPort, so
+			// every typed case above has a different number to beat and
+			// "no flag at all" can only get 9999 by reading the file.
+			if err := os.WriteFile(path, []byte("version: 1\nincoming:\n  local_port: 9999\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("HOME", dir)

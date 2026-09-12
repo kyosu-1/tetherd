@@ -1233,7 +1233,7 @@ const duplicateUserRetry = 2 * time.Second
 | 27 | `desired_count` を 2 にして `$RUN -- <自分のサーバ>`、一致するヘッダーで 20 回 `curl` | 20 回すべてラップトップに届く | どのタスクに落ちても steal できる（v0.3b の本体） |
 | 28 | `$RUN` 実行中に `aws ecs update-service --force-new-deployment` | 新しいタスクに `↻ session` が出て繋がり、古いタスクが落ちても run は生き続ける | deploy 追従 |
 | 29 | `./bin/tetherd status` | 各タスクに誰が繋いでいるかが出る | 共有時の診断 |
-| 30 | `./bin/tetherd token rotate` 後に古いトークンで `curl` | タスクの応答（ラップトップには来ない） | 回転が効く |
+| 30 | `$RUN` を生かしたまま `./bin/tetherd token rotate`、その後**古い**トークンで `curl`。続けて `$RUN` を再起動し、古いトークンと新しいトークンの両方で `curl` | rotate 直後は**古いトークンでまだラップトップに届く**（`token rotate` の出力もそう警告する）。`~/.tetherd/config.yml` は 0600 のまま `user` と `aws` も残る。再起動後は古いトークンがタスクの応答になり、新しいトークンでラップトップに届く | 回転はファイルを差し替えるだけで、走行中のセッションは attach 時の `hello` で受け取った値と照合し続ける — 漏洩を閉じるには全セッションの再起動が必要。**「回転すれば即座に古いトークンが無効」ではない**（この行の期待値は当初そう書いていたが、実装と出力の通り誤り） |
 | 31 | ターゲットグループを HTTP2 にして `./bin/tetherd doctor` | `✗` で `protocol_version` を名指しする | steal の要件検査 |
 
 **`terraform apply` は実行しない。** developer policy の変更をまとめて人間に提示し、依頼する。27 と 28 は `desired_count` の変更が必要なので、それも同じ依頼に含める（**検証後に 1 に戻すことも依頼に含めること** — 課金が倍になるため）。
