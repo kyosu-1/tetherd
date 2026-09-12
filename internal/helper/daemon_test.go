@@ -284,7 +284,7 @@ func fakeStat(m map[string]ownerFact) StatOwner {
 func rootOwned(paths ...string) map[string]ownerFact {
 	m := map[string]ownerFact{}
 	for _, p := range paths {
-		m[p] = ownerFact{uid: 0, mode: 0o755}
+		m[p] = ownerFact{uid: 0, mode: fs.ModeDir | 0o755}
 	}
 	return m
 }
@@ -306,7 +306,7 @@ func TestCheckOwnershipVisitsEveryExistingComponent(t *testing.T) {
 	var seen []string
 	stat := func(path string) (uint32, fs.FileMode, error) {
 		seen = append(seen, path)
-		return 0, 0o755, nil
+		return 0, fs.ModeDir | 0o755, nil
 	}
 	if err := CheckOwnership(stat, ownLeaf); err != nil {
 		t.Fatal(err)
@@ -321,9 +321,14 @@ func TestCheckOwnershipNamesTheComponentThatIsWrong(t *testing.T) {
 		name string
 		bad  ownerFact
 	}{
-		{"group-writable", ownerFact{uid: 0, mode: 0o775}},
-		{"world-writable", ownerFact{uid: 0, mode: 0o757}},
-		{"owned by a user", ownerFact{uid: 501, mode: 0o755}},
+		{"group-writable", ownerFact{uid: 0, mode: fs.ModeDir | 0o775}},
+		{"world-writable", ownerFact{uid: 0, mode: fs.ModeDir | 0o757}},
+		{"owned by a user", ownerFact{uid: 501, mode: fs.ModeDir | 0o755}},
+		// Not a directory: a regular file (or a device node, or a
+		// symlink to one) at /usr/local/libexec used to pass the
+		// check and then fail inside MkdirAll with a much worse
+		// error, after the precondition had said the path was fine.
+		{"a regular file", ownerFact{uid: 0, mode: 0o644}},
 	} {
 		for _, badPath := range []string{"/aa", "/aa/bb", ownLeaf} {
 			t.Run(c.name+" "+badPath, func(t *testing.T) {
@@ -355,7 +360,7 @@ func TestCheckOwnershipToleratesAMissingLeafAndStillChecksTheParents(t *testing.
 		t.Fatalf("err = %v; Install creates the leaf, so it not existing yet is not a failure", err)
 	}
 	m := rootOwned(present...)
-	m["/aa/bb"] = ownerFact{uid: 501, mode: 0o755}
+	m["/aa/bb"] = ownerFact{uid: 501, mode: fs.ModeDir | 0o755}
 	err := CheckOwnership(fakeStat(m), ownLeaf)
 	if err == nil {
 		t.Fatal("a missing leaf stopped the parents from being checked")
@@ -384,6 +389,12 @@ func TestOSStatOwnerReadsWhatItClaims(t *testing.T) {
 	if mode.Perm() != 0o731 {
 		t.Errorf("mode = %#o, want 0731", mode.Perm())
 	}
+	// The type bit, not just the permission bits: CheckOwnership reads
+	// mode.IsDir(), so a StatOwner that masked the mode down to Perm()
+	// would make every component look like a regular file.
+	if !mode.IsDir() {
+		t.Errorf("mode = %v, want the directory bit set", mode)
+	}
 	// A missing path has to come back as fs.ErrNotExist, because that is
 	// the one error CheckOwnership treats as "the leaf is not there yet".
 	if _, _, err := OSStatOwner(filepath.Join(dir, "nope")); !errors.Is(err, fs.ErrNotExist) {
@@ -402,10 +413,10 @@ func TestCheckOwnershipRejectsARelativePath(t *testing.T) {
 // alwaysRootOwned approves every path. Install's ownership check is
 // exercised on its own above; here the subject is what Install writes, and a
 // t.TempDir() is necessarily owned by the test user.
-func alwaysRootOwned(string) (uint32, fs.FileMode, error) { return 0, 0o755, nil }
+func alwaysRootOwned(string) (uint32, fs.FileMode, error) { return 0, fs.ModeDir | 0o755, nil }
 
 func userOwned(string) (uint32, fs.FileMode, error) {
-	return uint32(os.Getuid()), 0o755, nil
+	return uint32(os.Getuid()), fs.ModeDir | 0o755, nil
 }
 
 func testPaths(t *testing.T) Paths {
@@ -878,6 +889,68 @@ func TestInstallWritesNothingWhenTheTargetPathIsNotRootOwned(t *testing.T) {
 	}
 	if len(f.calls) != 0 {
 		t.Errorf("ran %v before refusing", f.calls)
+	}
+}
+
+func TestInstallWritesNothingWhenThePlistDirectoryIsNotRootOwned(t *testing.T) {
+	// The plist is the other input that decides what launchd starts as
+	// root: a directory whose group can write it is enough to replace the
+	// file, whatever the file's own mode is. Only /Library/LaunchDaemons
+	// is wrong here - the binaries' destination is fine - so this fails
+	// only if the check is applied to both paths.
+	p, f := testPaths(t), newFakeSystem()
+	stat := func(path string) (uint32, fs.FileMode, error) {
+		if path == p.LaunchDirPath() {
+			return uint32(os.Getuid()), fs.ModeDir | 0o755, nil
+		}
+		return 0, fs.ModeDir | 0o755, nil
+	}
+	_, err := Install(p, stat, f.run, fakeSrcDir(t))
+	if err == nil {
+		t.Fatal("wrote a LaunchDaemon plist into a directory a non-root user can write, so the file launchd reads to decide what to run as root can be replaced")
+	}
+	if !strings.Contains(err.Error(), p.LaunchDirPath()) {
+		t.Errorf("error %q does not name %s", err, p.LaunchDirPath())
+	}
+	for _, path := range []string{
+		p.PlistPath(),
+		filepath.Join(p.InstallDirPath(), HelperName),
+		filepath.Join(p.InstallDirPath(), ExecName),
+	} {
+		if _, serr := os.Stat(path); !errors.Is(serr, fs.ErrNotExist) {
+			t.Errorf("%s exists; both checks have to happen before anything is written", path)
+		}
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("ran %v before refusing", f.calls)
+	}
+}
+
+func TestCheckOwnershipRefusalSaysHowToFixIt(t *testing.T) {
+	// Every other user-facing failure in this project ends with the next
+	// command to run (doctor's Next, VersionError's `brew upgrade`). The
+	// realistic way to hit the ownership refusal is a machine where
+	// someone once ran `sudo chown -R $(whoami) /usr/local`; a correct
+	// diagnosis with no instruction leaves that user stuck.
+	for _, c := range []struct {
+		name string
+		bad  ownerFact
+		want string
+	}{
+		{"owned by a user", ownerFact{uid: 501, mode: fs.ModeDir | 0o755}, "sudo chown root:wheel /aa/bb"},
+		{"group-writable", ownerFact{uid: 0, mode: fs.ModeDir | 0o775}, "sudo chmod go-w /aa/bb"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := rootOwned(ownChain...)
+			m["/aa/bb"] = c.bad
+			err := CheckOwnership(fakeStat(m), ownLeaf)
+			if err == nil {
+				t.Fatalf("accepted /aa/bb as %s", c.name)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("error %q does not tell the operator to run %q", err, c.want)
+			}
+		})
 	}
 }
 

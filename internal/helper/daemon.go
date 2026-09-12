@@ -199,8 +199,8 @@ func OSStatOwner(path string) (uint32, fs.FileMode, error) {
 	return st.Uid, fi.Mode(), nil
 }
 
-// CheckOwnership verifies that every existing component of dir is owned by
-// root and is not group- or world-writable.
+// CheckOwnership verifies that every existing component of dir is a directory
+// owned by root that is not group- or world-writable.
 //
 // internal/helper/install.go already says why ExecInstallDir has to be
 // root-owned: the Homebrew prefix is user-writable, and a root LaunchDaemon
@@ -213,6 +213,20 @@ func OSStatOwner(path string) (uint32, fs.FileMode, error) {
 // A component that does not exist is not a failure: Install creates the leaf.
 // Everything above it that does exist is checked, because the weakest
 // component in the chain is the one that decides.
+//
+// Only the permission bits and the type bit are looked at. setuid, setgid and
+// sticky on a *directory* are deliberately not rejected: setgid only changes
+// group inheritance for new entries, sticky only restricts who may delete
+// them, and the one dangerous combination - world-writable plus sticky, as on
+// /tmp - is already refused by the 0o022 test. The type bit does matter: a
+// regular file, a device node or a symlink to one at, say, /usr/local/libexec
+// would otherwise pass and then fail inside the mkdir below with a much worse
+// error, after this function has already reported the path as fine.
+//
+// Every refusal names both the offending component and the command that fixes
+// it. The realistic way to hit the ownership case is a machine where someone
+// once ran the widely copy-pasted `sudo chown -R $(whoami) /usr/local`, and a
+// correct diagnosis with no instruction leaves that user stuck.
 func CheckOwnership(stat StatOwner, dir string) error {
 	if !filepath.IsAbs(dir) {
 		return fmt.Errorf("%s is not an absolute path, so its parents cannot be checked", dir)
@@ -227,10 +241,13 @@ func CheckOwnership(stat StatOwner, dir string) error {
 			return err
 		}
 		if uid != 0 {
-			return fmt.Errorf("%s is owned by uid %d, not root: a LaunchDaemon started from a path a non-root user can change hands that user root", p, uid)
+			return fmt.Errorf("%s is owned by uid %d, not root: a LaunchDaemon started from a path a non-root user can change hands that user root. Fix it with: sudo chown root:wheel %s && sudo chmod go-w %s", p, uid, p, p)
 		}
 		if mode.Perm()&0o022 != 0 {
-			return fmt.Errorf("%s is mode %04o, which its group or the world can write: a LaunchDaemon started from a path a non-root user can change hands that user root", p, mode.Perm())
+			return fmt.Errorf("%s is mode %04o, which its group or the world can write: a LaunchDaemon started from a path a non-root user can change hands that user root. Fix it with: sudo chmod go-w %s", p, mode.Perm(), p)
+		}
+		if !mode.IsDir() {
+			return fmt.Errorf("%s is not a directory (mode %v): every component of the path has to be one. Move or remove it", p, mode)
 		}
 	}
 	return nil
@@ -274,11 +291,21 @@ func Install(p Paths, stat StatOwner, run func(string, ...string) (string, error
 	var res InstallResult
 	installDir := p.InstallDirPath()
 
-	// First, and before anything is written or any command is run: if the
-	// destination is not root-owned all the way down, refusing is the only
-	// safe answer.
-	if err := CheckOwnership(stat, installDir); err != nil {
-		return res, fmt.Errorf("refusing to install: %w", err)
+	// First, and before anything is written or any command is run: if
+	// either destination is not root-owned all the way down, refusing is
+	// the only safe answer.
+	//
+	// Both directories, not just the one the binaries go in. The plist is
+	// the other input that decides what launchd starts as root, and a
+	// directory whose group or the world can write it is enough to replace
+	// the file whatever the file's own mode is - launchd's rule (see
+	// writeFileAtomic's caller below) is about the plist's mode, not its
+	// parent's. /Library/LaunchDaemons is root:wheel 0755 on a stock Mac,
+	// so this normally costs five stat calls and changes nothing.
+	for _, dir := range []string{installDir, p.LaunchDirPath()} {
+		if err := CheckOwnership(stat, dir); err != nil {
+			return res, fmt.Errorf("refusing to install: %w", err)
+		}
 	}
 
 	gid, err := EnsureGroup(run, GroupName)

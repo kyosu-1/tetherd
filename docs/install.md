@@ -127,10 +127,35 @@ user-writable. On an Intel Mac the prefix is `/usr/local`, which is two levels
 above `ExecInstallDir`. So the assumption is enforced rather than trusted:
 `helper.CheckOwnership` walks **every** component of the destination - `/`,
 `/usr`, `/usr/local`, `/usr/local/libexec`, `/usr/local/libexec/tetherd` -
-and requires each one that exists to be owned by root and not group- or
-world-writable. If any is not, `install` **writes nothing and runs nothing**,
-and the error names the component that is wrong. A component that does not
-exist yet is fine; `install` creates the leaf.
+and requires each one that exists to be a directory owned by root that is not
+group- or world-writable. A component that does not exist yet is fine;
+`install` creates the leaf.
+
+**The same check runs on `/Library/LaunchDaemons`.** The plist is the other
+input that decides what launchd starts as root, and a directory whose group
+can write it is enough to replace the file whatever the file's own mode is.
+
+If any component fails, `install` **writes nothing and runs nothing** - no
+binaries copied, no group created, no `launchctl` run - and the error names
+the component that is wrong *and* the command that fixes it:
+
+```
+refusing to install: /usr/local is owned by uid 501, not root: a LaunchDaemon
+started from a path a non-root user can change hands that user root. Fix it
+with: sudo chown root:wheel /usr/local && sudo chmod go-w /usr/local
+```
+
+The realistic way to reach that message is a machine where someone once ran
+the widely copy-pasted `sudo chown -R $(whoami) /usr/local`. Run what the
+error says, then run `sudo tetherd-helper install` again.
+
+What the check deliberately does *not* reject is setuid, setgid or sticky on
+a directory: setgid only changes group inheritance for new entries, sticky
+only restricts who may delete them, and the one dangerous combination -
+world-writable plus sticky, as on `/tmp` - is already refused. It does reject
+a component that is not a directory at all, so a stray regular file at
+`/usr/local/libexec` is named here rather than becoming a confusing `mkdir`
+failure after the check has already said the path is fine.
 
 Measured on this machine (Apple Silicon, prefix `/opt/homebrew`), all of
 `/usr/local/libexec/tetherd`, `/Library/LaunchDaemons` and `/var/log` are
