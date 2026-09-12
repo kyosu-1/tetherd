@@ -140,10 +140,20 @@ func stealSettings(opts RunOptions) (stealConfig, error) {
 // ReadHeaderTimeout applies only to the request line and headers, which the
 // agent writes immediately after opening the stream; net/http clears the
 // read deadline once they are in, so a slow endpoint - or a stolen
-// websocket that idles for an hour - is not cut off by it. IdleTimeout is
-// longer than net/http.Transport's own IdleConnTimeout (90s) on purpose: the
-// agent's proxy pools its streams, and a receiver that hangs up first turns
-// a pooled stream into a failed request.
+// websocket that idles for an hour - is not cut off by it.
+//
+// IdleTimeout is a backstop, not a negotiation with the other end. An
+// earlier version of this comment said it had to exceed
+// net/http.Transport's IdleConnTimeout because "the agent's proxy pools its
+// streams"; it does not. internal/agent's streamTransport is a hand-written
+// RoundTripper that opens one fresh yamux stream per request and closes it
+// with the response, so there is no pool on either side of this stream and
+// no number here to keep in step with one. What IdleTimeout actually
+// bounds is a stream the agent opened and then left open without sending a
+// second request - which nothing does today, so it should never fire. The
+// 90s figure in the old comment was net/http's default for a pool that is
+// not in play; the 30s IdleConnTimeout further down is a different thing
+// again, on our own transport to the developer's process.
 var (
 	stealReadHeaderTimeout = 20 * time.Second
 	stealIdleTimeout       = 120 * time.Second
