@@ -287,7 +287,16 @@ func Install(p Paths, stat StatOwner, run func(string, ...string) (string, error
 	}
 	res.GID = gid
 
-	if err := os.MkdirAll(installDir, 0o755); err != nil {
+	if err := mkdirAllMode(installDir, installDirMode); err != nil {
+		return res, err
+	}
+	// The leaf is tetherd's own directory, so an existing one is brought to
+	// installDirMode too, not just a freshly created one: a machine that
+	// ran an earlier install under a restrictive umask has it at 0700, and
+	// `install` is the upgrade path, so repairing it here is what makes the
+	// second run fix the first. Components above the leaf belong to the
+	// operator and mkdirAllMode leaves those alone.
+	if err := os.Chmod(installDir, installDirMode); err != nil {
 		return res, err
 	}
 	// The daemon runs this copy, not the one in the Homebrew prefix.
@@ -301,7 +310,7 @@ func Install(p Paths, stat StatOwner, run func(string, ...string) (string, error
 	}
 	res.ExecPath = execPath
 
-	if err := os.MkdirAll(p.LaunchDirPath(), 0o755); err != nil {
+	if err := mkdirAllMode(p.LaunchDirPath(), installDirMode); err != nil {
 		return res, err
 	}
 	res.PlistPath = p.PlistPath()
@@ -401,6 +410,53 @@ func copyExecutable(src, dst string) error {
 		return err
 	}
 	return os.Rename(tmp, dst)
+}
+
+// installDirMode is the mode Install gives the directories it creates.
+//
+// 0755 is not a nicety: the setgid tetherd-exec inside ExecInstallDir has to
+// be reachable by the developer's own non-root processes, and docs/install.md
+// promises the plist is written "into a 0755 directory".
+const installDirMode fs.FileMode = 0o755
+
+// mkdirAllMode is os.MkdirAll with the mode actually applied.
+//
+// os.MkdirAll passes its mode argument through the process umask, so
+// os.MkdirAll(dir, 0o755) does not produce a 0755 directory - it produces
+// 0755 &^ umask. sudo's default sudoers policy uses the union of the caller's
+// umask and 0022, so a developer with `umask 077` in their shell propagates
+// it straight through `sudo tetherd-helper install`.
+//
+// Measured (Install run with syscall.Umask(0o077) in a throwaway copy, and
+// pinned by TestInstallSetsDirectoryModesAgainstTheUmask): before this, a
+// first install created ExecInstallDir as 0700. Every file mode in Install is
+// already set explicitly against the umask - copyExecutable, InstallExec and
+// writeFileAtomic all Chmod after writing - and the directories were the one
+// thing left to it. A 0700 ExecInstallDir on a machine that has never had
+// tetherd means the developer's own processes cannot traverse it, the setgid
+// tetherd-exec is unreachable, `tetherd run` cannot start a child, and
+// doctor's setgid row cannot even stat the path.
+//
+// Only directories this call creates get the mode. An existing component is
+// left exactly as the operator has it: /usr, /usr/local and
+// /Library/LaunchDaemons are not ours to relax, and CheckOwnership has
+// already established that none of them is group- or world-writable.
+func mkdirAllMode(dir string, mode fs.FileMode) error {
+	for _, p := range pathComponents(dir) {
+		err := os.Mkdir(p, mode)
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		// os.Mkdir's mode is umask-masked as well; this is the line that
+		// makes the mode the one that was asked for.
+		if err := os.Chmod(p, mode); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // writeFileAtomic writes b to path with exactly mode, whatever the umask is,

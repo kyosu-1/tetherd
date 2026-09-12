@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -708,6 +709,120 @@ func TestInstallIsIdempotentAndUpgradesInPlace(t *testing.T) {
 	}
 	if got := f.launchctls(); strings.Join(got, " | ") != strings.Join(want, " | ") {
 		t.Errorf("launchctl calls =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+func TestInstallSetsDirectoryModesAgainstTheUmask(t *testing.T) {
+	// The failure this pins is a first install on a Mac that has never had
+	// tetherd, by a developer with `umask 077` in their shell: sudo's
+	// default sudoers policy uses the union of the caller's umask and
+	// 0022, so the umask reaches Install, and os.MkdirAll(dir, 0o755) then
+	// produces a 0700 directory. Nobody but root can traverse it, so the
+	// setgid tetherd-exec inside it is unreachable for the tetherd group,
+	// `tetherd run` cannot start a child, and doctor's setgid row cannot
+	// even stat the path. Every *file* mode here was already set
+	// explicitly against the umask; the directories were not.
+	//
+	// syscall.Umask is per-process, so this must not run in parallel with
+	// anything - no test in this package calls t.Parallel().
+	old := syscall.Umask(0o077)
+	defer syscall.Umask(old)
+
+	p, f := testPaths(t), newFakeSystem()
+	res, err := Install(p, alwaysRootOwned, f.run, fakeSrcDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The leaf and the component above it: chmodding only the leaf leaves
+	// the path just as untraversable.
+	for _, dir := range []string{
+		p.InstallDirPath(),
+		filepath.Dir(p.InstallDirPath()),
+		p.LaunchDirPath(),
+	} {
+		st, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !st.IsDir() {
+			t.Fatalf("%s is not a directory", dir)
+		}
+		if st.Mode().Perm() != 0o755 {
+			t.Errorf("%s is mode %#o under umask 077, want 0755: a directory the tetherd group cannot "+
+				"traverse makes the setgid %s inside it unreachable", dir, st.Mode().Perm(), ExecName)
+		}
+	}
+
+	// docs/install.md: "The plist is written root:wheel 0644 into a 0755
+	// directory." launchd refuses a plist its group or the world can
+	// write, and the umask must not be able to make it one either way.
+	st, err := os.Stat(res.PlistPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o644 {
+		t.Errorf("plist is mode %#o under umask 077, want 0644", st.Mode().Perm())
+	}
+	est, err := os.Stat(res.ExecPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if est.Mode() != fs.ModeSetgid|0o755 {
+		t.Errorf("%s is mode %v under umask 077, want 02755", ExecName, est.Mode())
+	}
+}
+
+func TestInstallRepairsItsOwnDirectoryThatIsAlreadyTooTight(t *testing.T) {
+	// A machine installed before the umask fix has ExecInstallDir at 0700.
+	// `install` is the documented upgrade path, so the second run is what
+	// has to fix the first - which means the leaf's mode is set whether or
+	// not this run created it.
+	p, f := testPaths(t), newFakeSystem()
+	if err := os.MkdirAll(p.InstallDirPath(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p.InstallDirPath(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Install(p, alwaysRootOwned, f.run, fakeSrcDir(t)); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(p.InstallDirPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o755 {
+		t.Errorf("%s is still mode %#o after a re-install, want 0755: `install` is the upgrade path, so it "+
+			"has to repair a directory an earlier install left untraversable", p.InstallDirPath(), st.Mode().Perm())
+	}
+}
+
+func TestInstallDoesNotRelaxADirectoryItDidNotCreate(t *testing.T) {
+	// The other half of the decision above: only components Install
+	// creates get the mode. /usr, /usr/local and /Library/LaunchDaemons
+	// are the operator's, and loosening one because tetherd happens to
+	// install below it would be a security change made silently.
+	// CheckOwnership has already established that no existing component is
+	// group- or world-writable, which is the property that matters.
+	p, f := testPaths(t), newFakeSystem()
+	above := filepath.Dir(p.InstallDirPath())
+	if err := os.MkdirAll(above, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(above, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Install(p, alwaysRootOwned, f.run, fakeSrcDir(t)); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(above)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o700 {
+		t.Errorf("%s is mode %#o, want the 0700 it already had: install must not relax a directory it did not create",
+			above, st.Mode().Perm())
 	}
 }
 

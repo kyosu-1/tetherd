@@ -227,6 +227,19 @@ the directory beside it has no `tetherd-exec` in it.
 - The plist is written `root:wheel 0644` into a `0755` directory. launchd
   refuses a plist its group or the world can write.
 
+  Both the file modes and the **directory** modes are set explicitly rather
+  than left to the umask. `sudo`'s default sudoers policy uses the union of
+  your shell's umask and `0022`, so a developer with `umask 077` propagates it
+  through `sudo tetherd-helper install`; `os.MkdirAll(dir, 0755)` under that
+  umask produces `0700`, which would make `/usr/local/libexec/tetherd`
+  untraversable and the setgid `tetherd-exec` inside it unreachable. `install`
+  sets the mode on every directory it creates, and brings its own
+  `/usr/local/libexec/tetherd` to `0755` even when it already exists, so a
+  re-run repairs a machine installed before this was fixed. Directories it did
+  **not** create - `/usr`, `/usr/local`, `/Library/LaunchDaemons` - are left
+  exactly as you have them; `CheckOwnership` has already established that none
+  of them is group- or world-writable, which is the property that matters.
+
 ## Signing and notarization
 
 Not done, and not planned before v1. The consequence is the `postflight`
