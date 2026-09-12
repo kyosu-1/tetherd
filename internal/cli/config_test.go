@@ -161,6 +161,12 @@ func TestApplyConfigPersonalOverridesShared(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
+	// Pinned to something other than "shota" (review item 5): without this,
+	// the User assertion below only kills a mutant that deletes the
+	// `opts.User = cfg.Personal.User` fallback by accident, on whatever
+	// $USER this machine happens to have - on a machine or CI runner where
+	// $USER is already "shota" the mutant would survive undetected.
+	t.Setenv("USER", "env-user")
 
 	var captured RunOptions
 	runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
@@ -176,5 +182,68 @@ func TestApplyConfigPersonalOverridesShared(t *testing.T) {
 	}
 	if captured.User != "shota" {
 		t.Errorf("user must come from the personal file: %q", captured.User)
+	}
+}
+
+// TestApplyConfigSeedsThePersonalFileWithTheResolvedUser pins item 2: a
+// first-ever run must seed ~/.tetherd/config.yml with the user this
+// invocation actually resolved to (an explicit --user, here), not
+// unconditionally $USER - otherwise `tetherd run --user alice` on a machine
+// where $USER=bob would permanently record `user: bob` for every later run.
+func TestApplyConfigSeedsThePersonalFileWithTheResolvedUser(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home") // no .tetherd/config.yml yet: first run
+	t.Setenv("HOME", home)
+	t.Setenv("USER", "bob")
+	t.Chdir(dir) // no .tetherd.yml here or above it
+
+	runFn = func(opts RunOptions) (int, error) { return 0, nil }
+	t.Cleanup(func() { runFn = defaultRun })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"run", "--transport", "direct", "--agent-addr", "x:1", "--user", "alice", "--", "true"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(home, ".tetherd", "config.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "user: alice") {
+		t.Fatalf("a first run with --user alice must seed the personal file with alice, not $USER=bob: %s", body)
+	}
+	if strings.Contains(string(body), "bob") {
+		t.Fatalf("the personal file must not mention $USER=bob at all: %s", body)
+	}
+}
+
+// TestChangedPanicsOnAnUnregisteredFlag pins item 4: a guard on a
+// misspelled or not-yet-registered flag name must be caught immediately
+// (pflag itself would just silently answer false).
+func TestChangedPanicsOnAnUnregisteredFlag(t *testing.T) {
+	cmd := newRunCommand()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("changed must panic on an unregistered flag name")
+		}
+	}()
+	changed(cmd, "definitely-not-a-flag")
+}
+
+// TestChangedRecognizesEveryRoutedFlag proves changed() resolves every flag
+// name applyConfig cares about (or might one day) without panicking - a
+// future rename of any of these would be caught by this test failing to
+// compile-equivalent-panic, rather than the config silently winning over an
+// unrecognized flag.
+func TestChangedRecognizesEveryRoutedFlag(t *testing.T) {
+	cmd := newRunCommand()
+	for _, name := range []string{
+		"profile", "region", "cluster", "service", "task", "env",
+		"user", "transport", "agent-addr", "remote-cidr",
+	} {
+		if got := changed(cmd, name); got {
+			t.Errorf("%s: Changed() must be false before any flag is parsed", name)
+		}
 	}
 }

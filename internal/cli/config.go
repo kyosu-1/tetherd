@@ -12,6 +12,19 @@ import (
 // configPath is set by --config; empty means "look upwards for .tetherd.yml".
 var configPath string
 
+// changed reports whether the named flag was set on the command line. It
+// panics on an unregistered name: pflag answers false for a flag that does
+// not exist, so a guard on a misspelled (or renamed, or not-yet-added) flag
+// name would silently let the config win over a flag that was never
+// actually checked - a bug with no compile-time or test signal otherwise.
+// Every Changed check in applyConfig goes through this.
+func changed(cmd *cobra.Command, name string) bool {
+	if cmd.Flags().Lookup(name) == nil {
+		panic("tetherd: config guard names unregistered flag " + name)
+	}
+	return cmd.Flags().Changed(name)
+}
+
 // applyConfig fills RunOptions fields the flags did not set, from
 // ~/.tetherd/config.yml and then .tetherd.yml. Flags always win, so a
 // value the user typed is never overwritten.
@@ -39,8 +52,16 @@ func applyConfig(cmd *cobra.Command, opts *RunOptions) error {
 		return err
 	}
 	// The personal file is created on first run (spec §6.7), before Load so
-	// the file Load reads back is the one just created.
-	if _, _, err := config.EnsurePersonal(personalPath, os.Getenv("USER")); err != nil {
+	// the file Load reads back is the one just created. Seed it with the
+	// user this invocation actually resolved to - an explicit --user if one
+	// was given, $USER otherwise - not unconditionally $USER: a first-ever
+	// `tetherd run --user alice` on a machine where $USER=bob must not
+	// permanently record `user: bob` for every later run.
+	seedUser := os.Getenv("USER")
+	if changed(cmd, "user") {
+		seedUser = opts.User
+	}
+	if _, _, err := config.EnsurePersonal(personalPath, seedUser); err != nil {
 		return err
 	}
 	cfg, err := config.Load(shared, personalPath)
@@ -48,7 +69,7 @@ func applyConfig(cmd *cobra.Command, opts *RunOptions) error {
 		return err
 	}
 
-	if !cmd.Flags().Changed("user") {
+	if !changed(cmd, "user") {
 		opts.User = cfg.Personal.User
 		if opts.User == "" {
 			opts.User = os.Getenv("USER")
@@ -57,7 +78,7 @@ func applyConfig(cmd *cobra.Command, opts *RunOptions) error {
 
 	// The personal file may pin a different profile than the repository's.
 	set := func(flag string, dst *string, values ...string) {
-		if cmd.Flags().Changed(flag) {
+		if changed(cmd, flag) {
 			return
 		}
 		for _, v := range values {
@@ -80,24 +101,16 @@ func applyConfig(cmd *cobra.Command, opts *RunOptions) error {
 	// range the repository committed, routing it direct with no warning.
 	opts.RemoteCIDRs = unionStrings(cfg.Shared.Network.RemoteCIDRs, opts.RemoteCIDRs)
 
-	// These remain replace-shaped (no flag binds them yet), but are guarded
-	// the same way so a future flag of the matching name (Task 5) is not
-	// silently clobbered by the config the moment it exists.
-	if !cmd.Flags().Changed("local-cidr") {
-		opts.LocalCIDRs = cfg.Shared.Network.LocalCIDRs
-	}
-	if !cmd.Flags().Changed("remote-service") {
-		opts.RemoteServices = cfg.Shared.Network.RemoteServices
-	}
-	if !cmd.Flags().Changed("remote-domain") {
-		opts.RemoteDomains = cfg.Shared.Network.RemoteDomains
-	}
-	if !cmd.Flags().Changed("env-override") {
-		opts.EnvOverride = cfg.Shared.Env.Override
-	}
-	if !cmd.Flags().Changed("env-exclude") {
-		opts.EnvExclude = cfg.Shared.Env.Exclude
-	}
+	// These stay unconditional (no flag binds any of them yet): guarding on
+	// a name with nothing registered would be a silent no-op today and,
+	// worse, would give no signal at all if a later flag landed under a
+	// different spelling than guessed here. Guard each one, through
+	// changed(), the day its flag actually exists.
+	opts.LocalCIDRs = cfg.Shared.Network.LocalCIDRs
+	opts.RemoteServices = cfg.Shared.Network.RemoteServices
+	opts.RemoteDomains = cfg.Shared.Network.RemoteDomains
+	opts.EnvOverride = cfg.Shared.Env.Override
+	opts.EnvExclude = cfg.Shared.Env.Exclude
 
 	if cfg.SharedPath != "" {
 		opts.ConfigPath = cfg.SharedPath
