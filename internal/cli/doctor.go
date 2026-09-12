@@ -290,7 +290,11 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 		results = append(results, notChecked("agent session", "the task could not be found"))
 	default:
 		sctx, scancel := context.WithTimeout(ctx, agentTimeout)
-		s, dialErr := dialAgent(sctx, opts.RunOptions, d, prov, task, quiet)
+		// Incoming off and no receiver: the report attaches to check that
+		// `tetherd run` could, and a session that advertised it would take
+		// requests would have the agent steal them into a doctor run that
+		// is about to exit.
+		s, dialErr := dialAgent(sctx, opts.RunOptions, d, prov, task, quiet, proto.Incoming{}, nil)
 		scancel()
 		if dialErr == nil {
 			sess = s

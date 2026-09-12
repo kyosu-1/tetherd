@@ -14,6 +14,15 @@ const Version = "1"
 // "unknown stream type ...") on that stream instead of the type-specific
 // reply. Anything that opens a stream must handle that TypeError shape as
 // well as its own reply type — see Client.Resolve for the pattern.
+//
+// Error codes are additive the same way, and for the same reason a refusal
+// carries both a code and a message: a peer that does not know a code still
+// reads a usable Message, so the code is an optimisation for routing (the
+// agent's L7 proxy deciding whether to pass the request to the application
+// or to report a bug) and never the only thing that makes a refusal
+// intelligible. Compare the code first and fall back to the message, never
+// the other way round — a rule that parses the other side's wording is a
+// rule both sides' tests will agree with and the wire will not.
 const (
 	TypeHello   = "hello"
 	TypeWelcome = "welcome"
@@ -31,6 +40,29 @@ const (
 	CodeDuplicateUser   = "duplicate_user"
 	CodeVersionMismatch = "version_mismatch"
 	CodeBadHello        = "bad_hello"
+	// CodeNoIncoming refuses an http stream because that CLI is not
+	// accepting incoming requests (`tetherd run --no-incoming`). It is a
+	// distinct code from CodeBadHello on purpose: this refusal is expected
+	// and the agent's proxy must quietly serve the request from the
+	// application, whereas CodeBadHello on an http stream means the CLI did
+	// not recognise the stream type at all — a bug, or a newer agent
+	// talking to an older CLI.
+	//
+	// A CLI older than this milestone answers NEITHER code: it has no
+	// accept loop at all, so opening the stream and writing the header both
+	// succeed and the reply simply never arrives (measured — see
+	// TestAPreAcceptLoopCLIAnswersAnHTTPStreamWithNothing). Whoever opens an
+	// http stream must therefore bound its own read of the reply; a missing
+	// reply is not an impossible case.
+	//
+	// Nor is a stream-level refusal how the agent should decide whether to
+	// steal in the first place. Hello.Incoming.Enabled already travels
+	// CLI -> agent at handshake time, and a CLI that predates this work
+	// leaves it false by zero value, so that flag is the signal — known
+	// before any request arrives, and without a round trip. Refusing the
+	// stream is the backstop for a CLI whose flag and whose handler
+	// disagree.
+	CodeNoIncoming = "no_incoming"
 )
 
 // Incoming tells the agent whether and how to steal requests for this user.
@@ -76,6 +108,37 @@ type DialHeader struct {
 type DialReply struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
+}
+
+// NoListenerHeader is how the CLI tells the agent's proxy that its 502
+// means "nothing is listening on the developer's own port", as opposed to
+// "the developer's application answered 502".
+//
+// The distinction decides whether the request may be served a second time.
+// The CLI sets this header only when the dial to the local port failed -
+// before a single byte of the request reached any application, so nothing
+// can have executed - and the agent then serves that request from the task
+// instead, which is what docs/e2e-aws.md row 24 asks for: a developer who
+// forgot to start their server sees the task's answer, not a 502 from their
+// own laptop. A 502 without this header may be the developer's own
+// application answering, and replaying a POST that has already run is worse
+// than relaying the 502.
+//
+// It belongs to the CLI-agent hop only. The agent strips it from every
+// response it relays, because that response goes out of a public ALB.
+const NoListenerHeader = "X-Tetherd-No-Listener"
+
+// HTTPHeader is the first line of an http stream, agent -> CLI.
+//
+// Put nothing load-bearing in here. The CLI reads the header only to learn
+// the stream type and discards the payload, and session.Options.OnHTTP takes
+// no header argument, so the CLI cannot see User at all today. The agent
+// only ever opens the stream toward that user's session and the CLI has
+// exactly one, so User is redundant by construction; it is carried so that a
+// stream read out of a packet capture says who it was for. Anything the CLI
+// must actually act on needs OnHTTP's signature widened first.
+type HTTPHeader struct {
+	User string `json:"user"`
 }
 
 // ResolveHeader is the first line of a resolve stream.

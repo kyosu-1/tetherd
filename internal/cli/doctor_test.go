@@ -226,11 +226,16 @@ func TestDoctorPrintsEveryRowAndExitsOnAFailure(t *testing.T) {
 	if d := findRow(t, rows, "attachable task").detail; !strings.Contains(d, "t1") {
 		t.Errorf("the task row must name the task, got %q", d)
 	}
-	// The set doctor prints is the set run captures, including the
-	// credential endpoint run adds for the child's SDK.
+	// The set doctor prints is the set run captures - both call remoteSet -
+	// so with network.pin_credential_route off it is the VPC and nothing
+	// else: the credential endpoint is served on loopback now, not
+	// captured.
 	cidrs := findRow(t, rows, "remote CIDRs").detail
-	if !strings.Contains(cidrs, "10.0.0.0/16") || !strings.Contains(cidrs, "169.254.170.0/24") {
-		t.Errorf("remote CIDRs = %q, want the VPC and the credential endpoint", cidrs)
+	if !strings.Contains(cidrs, "10.0.0.0/16") {
+		t.Errorf("remote CIDRs = %q, want the VPC", cidrs)
+	}
+	if strings.Contains(cidrs, "169.254.170.0/24") {
+		t.Errorf("remote CIDRs = %q, want no credential endpoint without pin_credential_route", cidrs)
 	}
 	if !strings.Contains(out.String(), "tetherd-helper install") {
 		t.Errorf("the failing row must say what to do:\n%s", out.String())

@@ -103,7 +103,9 @@ func TestLocalOverlaps(t *testing.T) {
 }
 
 func TestRunSSMRequiresClusterAndService(t *testing.T) {
-	code, err := Run(context.Background(), RunOptions{Transport: "ssm", Command: []string{"true"}}, io.Discard)
+	// NoIncoming because this is about the target flags: steal is on by
+	// default and would otherwise be the first thing refused (no token).
+	code, err := Run(context.Background(), RunOptions{Transport: "ssm", Command: []string{"true"}, NoIncoming: true}, io.Discard)
 	if code != 2 || err == nil || !strings.Contains(err.Error(), "--cluster") {
 		t.Fatalf("code %d err %v", code, err)
 	}
@@ -276,31 +278,6 @@ func TestTaskRoleEnv(t *testing.T) {
 	taskRegion := taskRoleEnv(map[string]string{"AWS_REGION": "us-east-1"}, "ap-northeast-1", "/tmp/empty")
 	if taskRegion["AWS_REGION"] != "us-east-1" || taskRegion["AWS_DEFAULT_REGION"] != "us-east-1" {
 		t.Fatalf("the task's own region must win: %v", taskRegion)
-	}
-}
-
-func TestTaskRoleReachable(t *testing.T) {
-	withURI := map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}
-	vpcOnly := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}
-	withCreds := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16"), netip.MustParsePrefix("169.254.170.0/24")}
-
-	if taskRoleReachable(withURI, vpcOnly) {
-		t.Error("the credential endpoint is not captured, so the task role is not reachable")
-	}
-	if !taskRoleReachable(withURI, withCreds) {
-		t.Error("the credential endpoint is captured, so the task role is reachable")
-	}
-	if taskRoleReachable(map[string]string{}, withCreds) {
-		t.Error("without the URI there is no task role to use")
-	}
-	// A wider range that contains the endpoint counts.
-	if !taskRoleReachable(withURI, []netip.Prefix{netip.MustParsePrefix("169.254.0.0/16")}) {
-		t.Error("a range containing 169.254.170.0/24 must count as captured")
-	}
-	// A sub-range that overlaps the /24 but misses 169.254.170.2 does not:
-	// the child would still have nowhere to fetch credentials from.
-	if taskRoleReachable(withURI, []netip.Prefix{netip.MustParsePrefix("169.254.170.16/28")}) {
-		t.Error("a range that does not cover 169.254.170.2 must not count as captured")
 	}
 }
 
@@ -490,17 +467,23 @@ func TestSubtractDoesNotAliasInput(t *testing.T) {
 }
 
 // TestRemoteSet pins the whole set remoteSet assembles: the VPC CIDRs, the
-// task-role endpoint, the extra --remote-cidr ranges and any
-// network.remote_services prefixes - minus what network.local_cidrs claims
-// for the laptop. Deleting any one term from remoteSet's assembly (the VPC
-// append, the TaskRoleCIDR append, the extra append, the ServiceCIDRs call,
-// or the closing Subtract) changes this set and fails the test. Comparing
-// sorted slices, not a map keyed by string, means a duplicated prefix cannot
-// mask a missing one the way an equal len(map) could.
+// extra --remote-cidr ranges and any network.remote_services prefixes -
+// minus what network.local_cidrs claims for the laptop. Deleting any one
+// term from remoteSet's assembly (the VPC append, the extra append, the
+// ServiceCIDRs call, or the closing Subtract) changes this set and fails the
+// test. Comparing sorted slices, not a map keyed by string, means a
+// duplicated prefix cannot mask a missing one the way an equal len(map)
+// could.
+//
+// 169.254.170.0/24 is not in it: the credential endpoint is served on
+// loopback (credproxy.go), so it is captured only when the operator asks for
+// the machine-wide route pin that needs it.
 func TestRemoteSet(t *testing.T) {
-	p := &fakeProvider{
-		vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
-		svc: []netip.Prefix{netip.MustParsePrefix("52.219.0.0/20")},
+	newProvider := func() *fakeProvider {
+		return &fakeProvider{
+			vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+			svc: []netip.Prefix{netip.MustParsePrefix("52.219.0.0/20")},
+		}
 	}
 	opts := RunOptions{
 		RemoteCIDRs:    []string{"10.9.0.0/16"},
@@ -509,11 +492,24 @@ func TestRemoteSet(t *testing.T) {
 		// network in this scenario: local_cidrs must remove it again.
 		LocalCIDRs: []string{"10.9.0.0/16"},
 	}
-	got, err := remoteSet(context.Background(), opts, p, transport.Task{SubnetID: "subnet-a"}, func(string, ...any) {})
+	got, err := remoteSet(context.Background(), opts, newProvider(), transport.Task{SubnetID: "subnet-a"}, func(string, ...any) {})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"10.0.0.0/16", "169.254.170.0/24", "52.219.0.0/20"}
+	want := []string{"10.0.0.0/16", "52.219.0.0/20"}
+	slices.Sort(want)
+	if !slices.Equal(sortedPrefixStrings(got), want) {
+		t.Fatalf("got %v, want %v", sortedPrefixStrings(got), want)
+	}
+
+	// With the route pin asked for, the endpoint joins the set: the pin is
+	// only usable while pf's rdr rule covers the address.
+	opts.PinCredentialRoute = true
+	got, err = remoteSet(context.Background(), opts, newProvider(), transport.Task{SubnetID: "subnet-a"}, func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = append(want, "169.254.170.0/24")
 	slices.Sort(want)
 	if !slices.Equal(sortedPrefixStrings(got), want) {
 		t.Fatalf("got %v, want %v", sortedPrefixStrings(got), want)
@@ -521,27 +517,51 @@ func TestRemoteSet(t *testing.T) {
 }
 
 // TestRemoteSetTaskRoleCIDRSurvivesLocalCIDRs pins that TaskRoleCIDR cannot
-// be removed via network.local_cidrs, even by the most extreme possible
-// entry: it is required infrastructure (the child's only path to the task's
-// AWS credentials), not part of the operator-tunable remote set. Before this
-// fix, TaskRoleCIDR was unioned in *before* the subtraction, so
-// "0.0.0.0/0" - or the more plausible "169.254.0.0/16" the review called
-// out - silently dropped it and left the child with the developer's own AWS
-// identity while the status line still printed a green iam line.
+// be removed via network.local_cidrs *while the route pin is on*, even by
+// the most extreme possible entry: with the pin asked for, the endpoint has
+// to be redirected by pf or the pinned route is a dead end, so it is
+// required infrastructure rather than part of the operator-tunable set.
+// Before this became a floor, TaskRoleCIDR was unioned in *before* the
+// subtraction, so "0.0.0.0/0" - or the more plausible "169.254.0.0/16" the
+// review called out - silently dropped it.
+//
+// With the pin off (the default, v0.3a) the address is nothing special: it
+// is served on loopback instead, so local_cidrs is simply honoured.
 func TestRemoteSetTaskRoleCIDRSurvivesLocalCIDRs(t *testing.T) {
-	p := &fakeProvider{vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}}
 	// "keep link-local on the laptop" is the plausible spelling of this
 	// mistake, and it covers 169.254.170.0/24 exactly.
-	opts := RunOptions{LocalCIDRs: []string{"169.254.0.0/16"}}
+	p := &fakeProvider{vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}}
+	opts := RunOptions{LocalCIDRs: []string{"169.254.0.0/16"}, PinCredentialRoute: true}
 	got, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !addrIn(got, "169.254.170.2") {
-		t.Fatalf("the task-role endpoint must survive local_cidrs 169.254.0.0/16: %v", got)
+		t.Fatalf("the pinned endpoint must survive local_cidrs 169.254.0.0/16: %v", got)
 	}
 	if !addrIn(got, "10.0.0.42") {
 		t.Fatalf("the VPC must still be captured: %v", got)
+	}
+	// "0.0.0.0/0" is the one spelling the floor must *not* rescue: it
+	// leaves nothing else at all, and a run that captured only the
+	// credential endpoint would print a green network line while every VPC
+	// connection left over the laptop's own route (see
+	// TestRemoteSetRejectsLocalCIDRsThatRemoveEverything - emptiness is
+	// judged before the floor goes back on).
+	p = &fakeProvider{vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}}
+	if _, err := remoteSet(context.Background(), RunOptions{LocalCIDRs: []string{"0.0.0.0/0"}, PinCredentialRoute: true}, p, transport.Task{}, func(string, ...any) {}); err == nil {
+		t.Fatal("local_cidrs 0.0.0.0/0 must be refused, not reduced to the floor")
+	}
+
+	// Without the pin there is no floor to defend: the operator asked for
+	// link-local to stay on the laptop and nothing in tetherd needs it.
+	p = &fakeProvider{vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}}
+	got, err = remoteSet(context.Background(), RunOptions{LocalCIDRs: []string{"169.254.0.0/16"}}, p, transport.Task{}, func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addrIn(got, "169.254.170.2") {
+		t.Fatalf("local_cidrs must be honoured with no route pin asked for: %v", got)
 	}
 }
 
@@ -607,16 +627,56 @@ func TestRemoteSetParsesLocalCIDRsBeforeAnyAWSCall(t *testing.T) {
 // floor went back on, that run started normally with a green network line
 // and every VPC connection quietly left over the laptop's own route.
 func TestRemoteSetRejectsLocalCIDRsThatRemoveEverything(t *testing.T) {
-	p := &fakeProvider{vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}}
-	opts := RunOptions{LocalCIDRs: []string{"10.0.0.0/8"}}
-	_, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {})
-	if err == nil {
-		t.Fatal("a local_cidrs that removes every remote range must be reported, not hidden by the task-role floor")
+	// Under both settings: with the route pin on, the floor must not double
+	// as a reason to accept it either.
+	for _, pin := range []bool{false, true} {
+		p := &fakeProvider{vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}}
+		opts := RunOptions{LocalCIDRs: []string{"10.0.0.0/8"}, PinCredentialRoute: pin}
+		_, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {})
+		if err == nil {
+			t.Fatalf("pin=%v: a local_cidrs that removes every remote range must be reported, not hidden by the task-role floor", pin)
+		}
+		if !strings.Contains(err.Error(), "local_cidrs") {
+			t.Fatalf("pin=%v: the error must name local_cidrs: %v", pin, err)
+		}
+		if !isUsageError(err) {
+			t.Errorf("pin=%v: a local_cidrs that removes everything is a usage error (exit 2), got %v", pin, err)
+		}
 	}
-	if !strings.Contains(err.Error(), "local_cidrs") {
-		t.Fatalf("the error must name local_cidrs: %v", err)
-	}
-	if !isUsageError(err) {
-		t.Errorf("a local_cidrs that removes everything is a usage error (exit 2), got %v", err)
+}
+
+// TestRemoteSetRejectsAnEmptyRemoteSetWithoutBlamingLocalCIDRs: with the
+// task-role floor gone from the default path, a run whose remote set is
+// empty for some other reason - an IPv6-only VPC, whose IPv4 prefixes are
+// none - reaches the same "nothing would be captured" guard. Until v0.2b
+// the floor hid that case; blaming network.local_cidrs for it would send the
+// operator to a key they never set.
+//
+// Both pin settings, because the first round of this guard read
+// `len(cidrs) == 0 && len(floor) == 0` and so did not fire with the pin on:
+// measured, that run started and printed "✓ network … remote:
+// 169.254.170.0/24" while every VPC connection the child made left over the
+// laptop's own route. The floor is infrastructure for the route pin, never a
+// remote set on its own.
+func TestRemoteSetRejectsAnEmptyRemoteSetWithoutBlamingLocalCIDRs(t *testing.T) {
+	for _, pin := range []bool{false, true} {
+		p := &fakeProvider{} // VPCCIDRs returns nothing
+		_, err := remoteSet(context.Background(), RunOptions{PinCredentialRoute: pin}, p, transport.Task{}, func(string, ...any) {})
+		if err == nil {
+			t.Fatalf("pin=%v: capturing nothing at all must be reported", pin)
+		}
+		if strings.Contains(err.Error(), "local_cidrs") {
+			t.Fatalf("pin=%v: local_cidrs was never set; the error must not blame it: %v", pin, err)
+		}
+		// The remedy that actually works for an IPv6-only VPC: nothing
+		// under "check the VPC / --remote-cidr / remote_services" helps,
+		// but --no-network still delivers the task's environment, metadata
+		// and role over the session.
+		if !strings.Contains(err.Error(), "--no-network") {
+			t.Errorf("pin=%v: the error must name the way out: %v", pin, err)
+		}
+		if !isUsageError(err) {
+			t.Errorf("pin=%v: pointing tetherd at a VPC it cannot capture is a usage error (exit 2), got %v", pin, err)
+		}
 	}
 }

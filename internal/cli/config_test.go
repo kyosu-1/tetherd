@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,44 @@ func TestApplyConfigFillsUnsetFlagsOnly(t *testing.T) {
 	}
 }
 
+// TestApplyConfigCarriesPinCredentialRoute: the machine-wide route pin has
+// no flag on purpose (it is rarely wanted and affects every process on the
+// Mac), so .tetherd.yml is the only way to ask for it - and it has to be
+// off when the file does not mention it.
+func TestApplyConfigCarriesPinCredentialRoute(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"asked for", "version: 1\nnetwork:\n  pin_credential_route: true\n", true},
+		{"not mentioned", "version: 1\nnetwork:\n  remote_cidrs: [10.9.0.0/16]\n", false},
+		{"explicitly off", "version: 1\nnetwork:\n  pin_credential_route: false\n", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, ".tetherd.yml")
+			if err := os.WriteFile(path, []byte(c.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("HOME", dir)
+
+			var captured RunOptions
+			runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+			t.Cleanup(func() { runFn = defaultRun })
+
+			root := NewRootCommand()
+			root.SetArgs([]string{"run", "--config", path, "--", "true"})
+			if err := root.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if captured.PinCredentialRoute != c.want {
+				t.Fatalf("PinCredentialRoute = %v, want %v", captured.PinCredentialRoute, c.want)
+			}
+		})
+	}
+}
+
 // TestApplyConfigExplicitMissingConfigErrors pins item 1: --config naming a
 // file that does not exist must fail loudly (the run would otherwise fall
 // through to "defaults" and die complaining about --cluster instead of
@@ -70,7 +109,7 @@ func TestApplyConfigDiscoveredMissingConfigIsFine(t *testing.T) {
 	configPath = ""
 	cmd := newRunCommand()
 	var opts RunOptions
-	if err := applyConfig(cmd, &opts); err != nil {
+	if _, err := applyConfig(cmd, &opts); err != nil {
 		t.Fatalf("a missing discovered config must not error: %v", err)
 	}
 }
@@ -245,7 +284,7 @@ func TestApplyConfigRunsUnderTheEnvCommand(t *testing.T) {
 	cmd := newEnvCommand()
 	configPath = ""
 	var opts EnvOptions
-	if err := applyConfig(cmd, &opts.RunOptions); err != nil {
+	if _, err := applyConfig(cmd, &opts.RunOptions); err != nil {
 		t.Fatalf("applyConfig must not error under the env command: %v", err)
 	}
 }
@@ -260,9 +299,236 @@ func TestChangedRecognizesEveryRoutedFlag(t *testing.T) {
 	for _, name := range []string{
 		"profile", "region", "cluster", "service", "task", "env",
 		"user", "transport", "agent-addr", "remote-cidr",
+		// applyIncoming's guards. They are `run`-only flags, which is
+		// exactly why they belong in this list: nothing else would catch
+		// applyIncoming being called from a command that does not have
+		// them, or either name being renamed out from under it.
+		"local-port", "as", "no-incoming",
 	} {
 		if got := changed(cmd, name); got {
 			t.Errorf("%s: Changed() must be false before any flag is parsed", name)
 		}
+	}
+}
+
+// writePersonal writes ~/.tetherd/config.yml under a fake HOME, so a test
+// can pin what the token and user actually reaching RunOptions are instead
+// of the random token EnsurePersonal would mint.
+func writePersonal(t *testing.T, home, body string) {
+	t.Helper()
+	dir := filepath.Join(home, ".tetherd")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.yml"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestApplyIncomingReadsTheIncomingBlockAndTheToken: the steal settings come
+// from two different files - the repository's incoming block and the
+// developer's own token - and nothing downstream can invent either.
+func TestApplyIncomingReadsTheIncomingBlockAndTheToken(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".tetherd.yml")
+	body := "version: 1\nincoming:\n  local_port: 4321\n  match:\n    header: X-Team-User\n    token_header: X-Team-Token\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+	writePersonal(t, dir, "user: shota\ntoken: tok-from-personal\n")
+
+	var captured RunOptions
+	runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+	t.Cleanup(func() { runFn = defaultRun })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"run", "--config", path, "--", "true"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if captured.LocalPort != 4321 {
+		t.Errorf("LocalPort = %d, want incoming.local_port", captured.LocalPort)
+	}
+	if captured.MatchHeader != "X-Team-User" || captured.MatchTokenHeader != "X-Team-Token" {
+		t.Errorf("match headers = %q / %q, want the file's", captured.MatchHeader, captured.MatchTokenHeader)
+	}
+	if string(captured.Token) != "tok-from-personal" {
+		t.Errorf("Token = %q, want the personal file's", string(captured.Token))
+	}
+	if captured.User != "shota" {
+		t.Errorf("User = %q, want the personal file's", captured.User)
+	}
+	// The resolved settings are what the agent is told, so check them here
+	// too: an incoming block with no port default applied is the failure
+	// this whole path exists to prevent.
+	st, err := stealSettings(captured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LocalPort != 4321 || st.Incoming.Header != "X-Team-User" || st.Incoming.TokenHeader != "X-Team-Token" {
+		t.Errorf("resolved = %+v", st)
+	}
+}
+
+// --local-port beats incoming.local_port, and not passing it leaves the
+// file's value alone rather than overwriting it with the flag's zero.
+func TestLocalPortFlagBeatsTheConfig(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		args []string
+		want int
+	}{
+		{"flag", []string{"--local-port", "9999"}, 9999},
+		{"no flag", nil, 4321},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, ".tetherd.yml")
+			if err := os.WriteFile(path, []byte("version: 1\nincoming:\n  local_port: 4321\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("HOME", dir)
+
+			var captured RunOptions
+			runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+			t.Cleanup(func() { runFn = defaultRun })
+
+			root := NewRootCommand()
+			root.SetArgs(append(append([]string{"run", "--config", path}, c.args...), "--", "true"))
+			if err := root.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if captured.LocalPort != c.want {
+				t.Fatalf("LocalPort = %d, want %d", captured.LocalPort, c.want)
+			}
+		})
+	}
+}
+
+// --as sets the name the agent matches, which is the same value as
+// hello.user: it must beat the personal file and the deprecated --user
+// alike. The both-flags case is the one a developer hits while migrating.
+func TestAsSetsTheMatchedUserAndBeatsUser(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"--as alone", []string{"--as", "alice"}, "alice"},
+		{"--as with --user", []string{"--user", "bob", "--as", "alice"}, "alice"},
+		{"--user before --as in the other order", []string{"--as", "alice", "--user", "bob"}, "alice"},
+		{"--user alone still works", []string{"--user", "bob"}, "bob"},
+		{"neither", nil, "from-personal"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("HOME", dir)
+			t.Chdir(dir)
+			writePersonal(t, dir, "user: from-personal\ntoken: tok\n")
+			configPath = ""
+
+			var captured RunOptions
+			runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+			t.Cleanup(func() { runFn = defaultRun })
+
+			root := NewRootCommand()
+			root.SetArgs(append(append([]string{"run"}, c.args...), "--", "true"))
+			var stderr bytes.Buffer
+			root.SetErr(&stderr)
+			if err := root.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if captured.User != c.want {
+				t.Fatalf("User = %q, want %q", captured.User, c.want)
+			}
+		})
+	}
+}
+
+// --user is the v0.2b spelling of --as: still working, but warned about and
+// out of the help, so that only one of the two names is discoverable.
+func TestUserFlagIsDeprecatedNotRemoved(t *testing.T) {
+	f := newRunCommand().Flags().Lookup("user")
+	if f == nil {
+		t.Fatal("--user must keep working: anything already scripted uses it")
+	}
+	if f.Deprecated == "" || !strings.Contains(f.Deprecated, "--as") {
+		t.Errorf("--user must say what to use instead, got %q", f.Deprecated)
+	}
+	if !f.Hidden {
+		t.Error("--user must be out of the help; two visible names for one field is the wart")
+	}
+	// `env` and `doctor` have no --as to move to, so theirs stays.
+	if e := newEnvCommand().Flags().Lookup("user"); e == nil || e.Hidden {
+		t.Error("`tetherd env` still needs a documented way to name the user")
+	}
+}
+
+// --no-incoming reaches RunOptions from the flag alone: there is no config
+// key for it, and stealSettings reads nothing else to decide.
+func TestNoIncomingFlagReachesRunOptions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".tetherd.yml")
+	if err := os.WriteFile(path, []byte("version: 1\nincoming:\n  local_port: 4321\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+
+	for _, c := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"--no-incoming"}, true},
+		{nil, false},
+	} {
+		var captured RunOptions
+		runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+		t.Cleanup(func() { runFn = defaultRun })
+
+		root := NewRootCommand()
+		root.SetArgs(append(append([]string{"run", "--config", path}, c.args...), "--", "true"))
+		if err := root.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		if captured.NoIncoming != c.want {
+			t.Fatalf("%v: NoIncoming = %v, want %v", c.args, captured.NoIncoming, c.want)
+		}
+		st, err := stealSettings(captured)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Incoming.Enabled == c.want {
+			t.Fatalf("%v: incoming enabled = %v with NoIncoming %v", c.args, st.Incoming.Enabled, c.want)
+		}
+	}
+}
+
+// The token a fresh machine gets is the one the agent will match, so the
+// file EnsurePersonal creates has to be the file applyIncoming reads.
+func TestApplyIncomingPicksUpTheGeneratedToken(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Chdir(dir)
+	configPath = ""
+
+	var captured RunOptions
+	runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+	t.Cleanup(func() { runFn = defaultRun })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"run", "--", "true"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if captured.Token == "" {
+		t.Fatal("the token generated on first run must reach RunOptions, or steal can never match")
+	}
+	onDisk, err := os.ReadFile(filepath.Join(dir, ".tetherd", "config.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(onDisk), string(captured.Token)) {
+		t.Errorf("the token in RunOptions is not the one on disk")
 	}
 }

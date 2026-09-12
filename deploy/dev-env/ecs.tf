@@ -98,15 +98,17 @@ resource "aws_ecs_task_definition" "api" {
 
   container_definitions = jsonencode([
     {
-      name      = "tetherd-agent"
-      image     = "${local.registry}/tetherd-agent:${var.image_tag}"
-      essential = true
+      name         = "tetherd-agent"
+      image        = "${local.registry}/tetherd-agent:${var.image_tag}"
+      essential    = true
+      portMappings = [{ containerPort = 8080, protocol = "tcp" }]
       linuxParameters = {
         capabilities = { add = ["SYS_PTRACE"] }
       }
       environment = [
         { name = "TETHERD_ENV", value = "dev" },
         { name = "TETHERD_APP_CONTAINER", value = "app" },
+        { name = "TETHERD_APP_ADDR", value = "127.0.0.1:8081" },
       ]
       restartPolicy    = { enabled = true, restartAttemptPeriod = 60 }
       logConfiguration = local.log_config
@@ -150,8 +152,8 @@ resource "aws_ecs_service" "api" {
 
   load_balancer {
     target_group_arn = aws_lb_target_group.app.arn
-    container_name   = "app"
-    container_port   = 8081
+    container_name   = "tetherd-agent"
+    container_port   = 8080
   }
 
   service_registries {

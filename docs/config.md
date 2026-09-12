@@ -33,7 +33,8 @@ network:
   local_cidrs: []               # 上の範囲から除外して、ラップトップから直接出す
   remote_domains: []            # /etc/resolver 経由で agent 側に解決させるドメイン
   remote_services: []           # s3 | dynamodb
-incoming:                       # v0.3。今は読まれるだけで使われない
+  pin_credential_route: false   # env を読まないツールのための逃げ道（下記。マシン全体に効く）
+incoming:                       # v0.3a で有効。steal（下記）の受け口
   local_port: 8080
   match:
     header: X-Dev-User
@@ -53,6 +54,8 @@ incoming:                       # v0.3。今は読まれるだけで使われな
 - `network.local_cidrs` — リモート集合から**引く**範囲。自宅 LAN が VPC CIDR と重なっているときの逃げ道
 - `network.remote_domains` — このドメインの名前解決を agent に任せる。Cloud Map やプライベートホストゾーンの名前がここに入る
 - `network.remote_services` — `s3` と `dynamodb` のみ。その managed prefix list の範囲をリモート集合に足す
+- `network.pin_credential_route` — 既定 `false`。`169.254.170.2` を lo0 に固定して、env を読まずにこのアドレスを直書きしているツールにもタスクロールを届ける。**マシン全体に効く**ので、必要なときだけ（下記）
+- `incoming` — v0.3a で有効。ALB に届いたリクエストのうち、`incoming.match.header`（既定 `X-Dev-User`）と `incoming.match.token_header`（既定 `X-Dev-Token`）の両方が一致するものだけを `run` 中のラップトップの `incoming.local_port`（既定 `8080`）に転送する（agent 側の steal。spec §5.2）。一致しないリクエストと、ヘッダーの無いヘルスチェック / WebSocket upgrade は常にタスクの app へ素通しする。既定値はこの CLI が適用するもので、`internal/config` 自体は何も既定を持たない（キーを省略すればそのフィールドはゼロ値のまま CLI に渡る）。フラグとの対応は `--no-incoming`（steal を止めて常時素通しにする）、`--local-port <port>`（`incoming.local_port` の上書き）、`--as <user>`（`~/.tetherd/config.yml` の `user` の上書き。一致条件の片方になる）。この配線により agent は誰も繋いでいなくても常に ALB のデータパス上に居続ける（素通しになるだけで、経路から外れるわけではない）ので、ALB のヘルスチェックは常に agent 経由で app に届く必要があり、agent が死ねばヘルスチェックも失敗する — agent の健全性がそのままサービスの健全性になる
 
 ## `~/.tetherd/config.yml`
 
@@ -65,9 +68,13 @@ aws:
   profile: myapp-dev-shota      # 共有設定より強い
 ```
 
-- `user` — agent に名乗る名前。`--user` で上書きできる。ALB から自分宛のリクエストを識別するのにも使う（v0.3）
-- `token` — v0.3 の steal で `X-Dev-Token` として照合される秘密。**ファイルは 0600 で、一度作られたトークンは再生成されない**。手で作ったファイルにトークンが無ければ、他のキーを保ったまま書き足す
+- `user` — agent に名乗る名前（`hello.user` ＝ `X-Dev-User` に載る値）。`--as` で上書きできる。ALB から自分宛のリクエストを識別する steal の一致条件の片方（v0.3a）
+- `token` — steal の一致条件の片方になる秘密。`run` の開始時に `hello` で agent に渡り、`X-Dev-Token` ヘッダーと比較される。**ファイルは 0600 で、一度作られたトークンは再生成されない**。手で作ったファイルにトークンが無ければ、他のキーを保ったまま書き足す。ALB は public なので `X-Dev-User` と `X-Dev-Token` の両方が一致しない限りラップトップには届かない — `user` は秘密ではなく誰でも知り得る名前なので、片方だけでは steal は起きない。**トークンは任意ではなく必須の照合条件**であり、無くても動く利便のための仕組みではない
 - `aws.profile` / `aws.region` — 共有設定の `aws` ブロックを個人的に上書きする。チームで 1 つのアカウントを共有していない場合に使う
+
+### ブラウザから steal を試す
+
+`curl` と違い、ブラウザは `X-Dev-User` / `X-Dev-Token` を自分では付けない。ModHeader のような拡張機能で、dev の ALB のドメインだけに絞ったプロファイルを作り、2 つのヘッダーを常時付与するのが手っ取り早い。プロファイルを他のドメインに広げないこと（`token` はその拡張機能の設定に平文で残るため、dev 用の ALB 以外に漏らす意味も理由も無い）。チームで配るなら、ドメインは書いてもトークンは書かない ModHeader プロファイルを配布し、各自が自分の `~/.tetherd/config.yml` の `token` を値として入れる運用にする。
 
 ### 信頼境界
 
@@ -77,7 +84,7 @@ aws:
 
 `tetherd env` は「`run` がタスクから注入する変数」を出す。上の除外リストと `env.override` / `env.exclude` は同じように適用されるので、`eval "$(tetherd env --format shell)"` でシェルに取り込んでも `HOME` や `PATH` は自分のものが残る。
 
-ただし AWS の身元に関する変数だけは一致しない。`run` は透過モードで捕捉が張れているときだけ、タスクロールを使わせるために `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` を空ファイルに向け、ローカルの認証情報変数を取り除き、リージョンを補う。`env` は捕捉を張らないので、その判定ができず何もしない。`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` などの 4 変数も、`run` は透過モードで残す（agent 経由で `169.254.170.2` に届く）が、`env` は常に落とす（誰も応答しないため）。
+ただし AWS の身元に関する変数だけは一致しない。`run` は透過モードで捕捉が張れているときだけ、タスクロールを使わせるために `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` を空ファイルに向け、ローカルの認証情報変数を取り除き、リージョンを補う。`env` は捕捉を張らないので、その判定ができず何もしない。`169.254.170.2` を指す 4 変数も、`run` は透過モードではループバック口に向け直す（下記）が、`env` は常に落とす（その口はセッション中しか無いため）。
 
 つまり `eval "$(tetherd env)"` した後のシェルでは、AWS の身元は**自分のまま**。タスクロールで何かを実行したいなら `tetherd run -- <cmd>` を使う。
 
@@ -86,13 +93,13 @@ aws:
 `tetherd run` が捕捉する宛先は次の式で決まる。
 
 ```
-(VPC CIDR) + 169.254.170.0/24 + remote_cidrs + (remote_services の prefix list) − local_cidrs
+(VPC CIDR) + remote_cidrs + (remote_services の prefix list) + (pin_credential_route のとき 169.254.170.0/24) − local_cidrs
 ```
 
 - **VPC CIDR** はタスクのサブネットから自動で引く（`--transport ssm` のとき）。書く必要はない
-- **169.254.170.0/24** はタスクロールの認証情報エンドポイント。これが捕捉範囲に入っていることが、ローカルの SDK がタスクロールで署名できる条件
+- **169.254.170.0/24** はタスクロールの認証情報エンドポイント。既定では捕捉範囲に**入らない** — 認証情報はループバック口から配るので、このアドレスに誰も接続しない。`pin_credential_route: true` にしたときだけ入る
 - **`remote_services`** は `com.amazonaws.<region>.s3` のような managed prefix list を引いて、その IPv4 prefix を足す（`ap-northeast-1` の S3 は 15 件。件数はリージョンごとに違い、API は 1 ページ 100 件で切るので tetherd は `NextToken` を最後まで追う）。S3 と DynamoDB だけが対象（この 2 つだけが gateway endpoint を持ち、通信がパブリックアドレスのまま VPC を出るため、`aws:SourceVpc` のようなネットワーク条件付きポリシーを満たすには**タスクの ENI から出る必要がある**）。インターフェース型エンドポイントの他サービスは VPC 内の IP に解決されるので `remote_domains` の側で扱う
-- **`local_cidrs`** は最後に引かれる。引き算は範囲を分割する正確なもので、`10.0.0.0/16` から `10.0.5.0/24` を引くと残りは 8 個のプレフィックスになる（pf は 1 つのテーブルに集合として持つので数は問題にならない）。ただし `169.254.170.0/24` は引かれない床で、`local_cidrs` に何を書いても残る — ここが外れると子プロセスはタスクロールを失い、開発者自身の身元で動いてしまうため。`local_cidrs` が床以外のすべてを消した場合は起動時にエラーになり、`local_cidrs` が名指しされる（`10.0.0.0/8` と書いて `10.0.0.0/16` の VPC を丸ごと消してしまう、が現実的な失敗）
+- **`local_cidrs`** は最後に引かれる。引き算は範囲を分割する正確なもので、`10.0.0.0/16` から `10.0.5.0/24` を引くと残りは 8 個のプレフィックスになる（pf は 1 つのテーブルに集合として持つので数は問題にならない）。`pin_credential_route` を有効にしているときだけ `169.254.170.0/24` が引かれない床になり、`local_cidrs` に何を書いても残る — 固定しておきながら捕捉から外すと、そのアドレスが lo0 に吸い込まれたまま誰も応答しない状態になるため。`local_cidrs` が（床以外の）すべてを消した場合は起動時にエラーになり、`local_cidrs` が名指しされる（`10.0.0.0/8` と書いて `10.0.0.0/16` の VPC を丸ごと消してしまう、が現実的な失敗）
 
 起動時の `✓ network` 行に、この計算結果がそのまま出る。`tetherd doctor` が表示する集合も同じ関数から出るので、両者がずれることはない。
 
@@ -130,7 +137,27 @@ RDS / ElastiCache / 内部 ALB のエンドポイント名はパブリック DNS
 実機で踏んだ: distroless イメージが `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` を設定していて、macOS にそのパスは無いため Go の子プロセスの TLS が全部 `certificate signed by unknown authority` で失敗した。
 
 **ローカルの AWS 認証情報**（これは逆方向 — 子プロセスの env から取り除く） — `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CREDENTIAL_EXPIRATION`, `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_ARN`, `AWS_ROLE_SESSION_NAME`, `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_CONTAINER_AUTHORIZATION_TOKEN`, `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, `AWS_ACCESS_KEY`, `AWS_SECRET_KEY`, `AWS_SECURITY_TOKEN`
-どれも SDK のチェーンでコンテナ認証情報より先に解決されるので、残っているとタスクロールにならない。これらを外すのは透過モードでタスクロールのエンドポイントが捕捉できているときだけで、そうでなければ開発者自身の身元のまま動かす（`✓ iam` 行に出る）。
+どれも SDK のチェーンでコンテナ認証情報より先に解決されるので、残っているとタスクロールにならない。これらを外すのは透過モードでタスクロールを配れているときだけで、そうでなければ開発者自身の身元のまま動かす（`✓ iam` 行に出る）。なお `AWS_CONTAINER_CREDENTIALS_FULL_URI` はこの一覧にあるが、これは**開発者が export していたもの**を落とすためで、`run` はそのあと自分のループバック口の値を入れ直す。
 
-**タスク内でしか意味を持つもの**（`--no-network` のときだけ落とす） — `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, `ECS_CONTAINER_METADATA_URI_V4`, `ECS_CONTAINER_METADATA_URI`, `ECS_AGENT_URI`
-これらは `169.254.170.2` を指す。透過モードでは agent 経由で届くので残すが、捕捉していないモードでは誰も応答しないので落とす。
+**タスク内でしか意味を持つもの** — `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, `ECS_CONTAINER_METADATA_URI_V4`, `ECS_CONTAINER_METADATA_URI`, `ECS_AGENT_URI`
+どれもタスクの中にしか無い `169.254.170.2` を指すので、そのまま渡しても子プロセスからは届かない。`--no-network` では 4 つとも落とす。透過モードでの扱いは 2 通り:
+
+- メタデータの 3 変数（`ECS_CONTAINER_METADATA_URI_V4`, `ECS_CONTAINER_METADATA_URI`, `ECS_AGENT_URI`）は**ホストだけをループバック口に書き換える**。パスはそのまま転送されるので、1 ポートで 3 つとも賄える
+- `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` は**取り除いて**、代わりに `AWS_CONTAINER_CREDENTIALS_FULL_URI` をループバック口の URL で与える。空文字にするのでは駄目で、消さなければならない: aws-sdk-go-v2 は relative を full より先に評価し、botocore は**値ではなく変数の存在**で分岐する（`return self.ENV_VAR in self._environ`）ので、空文字を残すと `aws` CLI と boto3 は `169.254.170.2` を叩きに行って認証情報を得られない
+
+タスクの env の中に、この 4 つ以外でも `169.254.170.2` を含む値があれば（アプリ独自の変数など）、`run` が `⚠ env` 行でその名前を挙げる。書き換えようがないので、必要なら `pin_credential_route` を使う。
+
+## `pin_credential_route` を使うとき
+
+既定では、タスクロールの認証情報は CLI が開く `127.0.0.1:<空きポート>` の口から配られ、子プロセスには env（`AWS_CONTAINER_CREDENTIALS_FULL_URI` とメタデータの 3 変数）でそこを教える。AWS の各言語 SDK と `aws` CLI はこれに従う。root 操作も要らない。
+
+従わないのは、env を読まずに `169.254.170.2` を直書きしているツールだけ。それに当たったときに `pin_credential_route: true` にすると、helper が `169.254.170.2` の host route を lo0 に張り、pf がそれを agent 経由に流す（`tetherd-helper` が動いている必要がある）。
+
+有効にする前に知っておくこと:
+
+- 固定は**マシン全体**に効く。セッション中は `tetherd` グループ以外のプロセスも `169.254.170.2` で dev タスクの認証情報に到達できる（pf の `rdr` は `group` 句を受け付けないので gid で絞れない）
+- `amazon-ecs-local-container-endpoints` のようにこのアドレスをローカルで使うツールと衝突する。そちらが**タスクの**ロールを掴む形になる
+- 有効なときに `tetherd doctor` が警告する行は v0.3b で追加する。v0.3a の `doctor` はこの設定を見ないので、有効かどうかは `.tetherd.yml` と `run` の出力で確認する
+- `local_cidrs` に何を書いても `169.254.170.0/24` は捕捉から外れない（外すと誰も応答しないアドレスになる）
+
+なお既定のループバック口も無認証で、**同じマシンのどのプロセスからでも**叩けばタスクロールの認証情報を得られる（ポートは毎回変わるが、秘密ではない）。信頼境界は SSM のローカルフォワードと同じ「同一マシンに閉じるが、それ自体が境界」。固定方式より狭いのは「アドレスが予測できない」点だけ。

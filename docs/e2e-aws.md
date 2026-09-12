@@ -23,7 +23,7 @@ v0.2b から、cluster / service / profile / region / env は `.tetherd.yml` か
 | 0 | `./bin/tetherd run -- true` | exit 0。冒頭に `config     .tetherd.yml` 行が出る | 共有設定だけで探索・接続が解決し、フラグが 1 つも要らない（v0.2b の主目的） |
 | 1 | `$RUN -- env \| grep -E '^(DB_PASSWORD\|FEATURE_FLAG\|PORT\|PATH)='` | `DB_PASSWORD=<24 文字>`、`FEATURE_FLAG=from-parameter-store`、`PORT=8081`、`PATH` はローカルのまま | Secrets Manager / Parameter Store 経由の値が `/proc` 経由で届き、除外リストが効いている |
 | 2 | `$RUN -- psql "postgres://tetherd@$RDS/app?sslmode=require" -c 'select now()'` に `PGPASSWORD` を env から: `$RUN -- sh -c 'PGPASSWORD=$DB_PASSWORD psql -h '"$RDS"' -U tetherd -d app -c "select now()"'` | `now` の 1 行 | VPC 内の RDS に pf → SSM → agent 経由で届き、パスワードはタスクの secret |
-| 3 | `$RUN -- aws sts get-caller-identity` | `Arn` が `assumed-role/tetherd-dev-api-task/…` | 169.254.170.2 が透過で通り、ローカルの SDK がタスクロールになる。起動時の `✓ iam` 行も同じ ARN。`env -u AWS_PROFILE` の前置きはもう不要 — tetherd がローカルの `AWS_PROFILE` / `AWS_ACCESS_KEY_ID` 等を子プロセスの env から自動で取り除くので、手元に `aws login` 済みのプロファイルがあってもタスクロールが優先される（`✓ env      local AWS credentials (...) removed …` 行が出る）。ローカルの `~/.aws` の設定は子プロセスから隠されるので、`AWS_PROFILE` が何であっても結果は変わらない |
+| 3 | `$RUN -- aws sts get-caller-identity` | `Arn` が `assumed-role/tetherd-dev-api-task/…` | tetherd がループバック口で配る認証情報でローカルの SDK がタスクロールになる（§4.2）。起動時の `✓ iam` 行も同じ ARN で、`(via 127.0.0.1:<port> → the task)` が付く。`env -u AWS_PROFILE` の前置きはもう不要 — tetherd がローカルの `AWS_PROFILE` / `AWS_ACCESS_KEY_ID` 等を子プロセスの env から自動で取り除くので、手元に `aws login` 済みのプロファイルがあってもタスクロールが優先される（`✓ env      local AWS credentials (...) removed …` 行が出る）。ローカルの `~/.aws` の設定は子プロセスから隠されるので、`AWS_PROFILE` が何であっても結果は変わらない |
 | 4 | `$RUN -- aws s3 ls` | バケット一覧（無ければ空）で **エラーなし** | VPC 外の AWS サービスにタスクロールで届く（署名ベース）。同じく、共有設定に引っ張られずタスクロールで署名される |
 | 5 | `$RUN -- curl -s http://$(cd deploy/dev-env && terraform output -raw alb_dns_name)/` | `sampleapp on … from 10.0.x.x` | ALB は public なので、これは agent 経由ではなくラップトップから直接（`from` が ALB の IP）。既定「VPC 内だけリモート」の確認 |
 | 6 | `$RUN -- curl -s http://api.myapp.internal:8081/` | `sampleapp on … from 10.0.x.x` | `remote_domains: [myapp.internal]` で Cloud Map の名前が VPC リゾルバ経由で解け、その IP が捕捉範囲に入って agent 経由で届く。別端末で実行中に `cat /etc/resolver/myapp.internal` の 1 行目が `# managed by tetherd`、`port` が起動ログの `DNS:` に出たポートと一致し、終了後にファイルが消えていること |
@@ -41,6 +41,18 @@ v0.2b から、cluster / service / profile / region / env は `.tetherd.yml` か
 | 18 | `local_cidrs: [10.0.0.0/8]`（VPC を丸ごと消す）で `$RUN -- true` | `network.local_cidrs excludes the entire remote set` で exit 2（設定の誤りなので usage 扱い） | 設定ミスで捕捉範囲が空になったら黙って起動しない。タスクロールのエンドポイントを足し戻して「1 件あるから OK」にしない |
 | 19 | `$RUN -- python3 -c "import socket,time; t=time.time()\ntry: socket.gethostbyname('nope.myapp.internal')\nexcept socket.gaierror as e: print('gaierror in %.1fs' % (time.time()-t))"` | 1 秒未満で `gaierror` | 存在しない名前が NXDOMAIN として返る。SERVFAIL だと macOS がリトライして数秒待たされる |
 
+v0.3a から、agent は常に ALB のデータパス上に居る（§5.1）。一致するヘッダーが無い限り app への素通しなので、これまでの 0〜19 行の挙動はそのまま変わらない。以下は steal（一致時にラップトップへ届く経路）の確認。
+
+| # | コマンド | 期待 | 確認すること |
+|---|---|---|---|
+| 20 | `$RUN -- <自分のサーバ>` を起動した状態で `curl -H 'X-Dev-User: abe' -H "X-Dev-Token: $(grep token ~/.tetherd/config.yml \| awk '{print $2}')" http://<alb>/` | ラップトップのプロセスの応答。CLI に `← GET / 200 <ms> (from <自分の IP>)` が出る | ALB → agent → yamux → ラップトップが通る |
+| 21 | ヘッダー無しで `curl http://<alb>/` | `sampleapp on ip-10-0-…`（タスクの応答） | 一致しないリクエストは素通し |
+| 22 | トークンを 1 文字変えて `curl` | タスクの応答。ラップトップには来ない | 公開 ALB でユーザー名だけでは届かない |
+| 23 | `$RUN` を Ctrl-C した直後に `curl -H 'X-Dev-User: abe' -H 'X-Dev-Token: …' http://<alb>/` | タスクの応答（502 ではない） | セッション断で即時に素通しへ復帰 |
+| 24 | ラップトップのサーバだけ落として `curl`（`$RUN` は生かす） | タスクの応答。CLI に `502 nothing is listening on 127.0.0.1:8080` | dial 失敗はそのリクエストだけ app にフォールバック |
+| 25 | `$RUN --no-incoming -- sleep 60` 中に一致するヘッダーで `curl` | タスクの応答。CLI に `✓ steal` 行が無い | `--no-incoming` は何も取らない |
+| 26 | ALB のヘルスチェックが 2 分間 healthy のまま | ターゲットが healthy | ヘルスチェックは常に app に届く（agent 経由。§5.1） |
+
 所要時間の目安: `StartSession` → `welcome` まで 2〜4 秒、psql の接続確立 +50〜100 ms。
 
-結果は `docs/specs/2026-09-12-v1-macos-design.md` §12 の 5・6 に追記する。
+結果は `docs/specs/2026-09-12-v1-macos-design.md` §12 の 5・6、および v0.3a の節に追記する。

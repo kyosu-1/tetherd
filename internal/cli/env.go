@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/kyosu-1/tetherd/internal/env"
+	"github.com/kyosu-1/tetherd/internal/proto"
 )
 
 // maskedValue is what `tetherd env` prints instead of a secret. It is a
@@ -55,7 +56,9 @@ func EnvRunWithDeps(ctx context.Context, opts EnvOptions, stdout, stderr io.Writ
 		}
 		return 1, err
 	}
-	sess, err := dialAgent(ctx, opts.RunOptions, d, prov, task, logf)
+	// `tetherd env` prints the task's environment and exits; it never takes
+	// a request, so it attaches with incoming off and no receiver.
+	sess, err := dialAgent(ctx, opts.RunOptions, d, prov, task, logf, proto.Incoming{}, nil)
 	if err != nil {
 		return 1, err
 	}

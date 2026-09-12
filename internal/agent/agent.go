@@ -4,20 +4,12 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"sort"
 	"sync"
 	"time"
 
 	"github.com/kyosu-1/tetherd/internal/proto"
 	"github.com/kyosu-1/tetherd/internal/session"
 )
-
-// SessionInfo describes one attached CLI.
-type SessionInfo struct {
-	User  string
-	From  string
-	Since time.Time
-}
 
 // Agent serves control sessions.
 type Agent struct {
@@ -28,7 +20,7 @@ type Agent struct {
 	lookup func(ctx context.Context, name string) ([]net.IPAddr, error)
 
 	mu       sync.Mutex
-	sessions map[string]SessionInfo
+	sessions map[string]*Session
 }
 
 // New returns an Agent. logf receives one line per event (nil = silent).
@@ -36,7 +28,7 @@ func New(cfg Config, logf func(string, ...any)) *Agent {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	a := &Agent{cfg: cfg, logf: logf, sessions: map[string]SessionInfo{}}
+	a := &Agent{cfg: cfg, logf: logf, sessions: map[string]*Session{}}
 	if cfg.MetadataURL != "" {
 		a.env = &ProcEnvReader{MetadataURL: cfg.MetadataURL, ProcRoot: "/proc", AppContainer: cfg.AppContainer}
 	}
@@ -53,7 +45,58 @@ func (a *Agent) SetDialer(dial func(ctx context.Context, addr string) (net.Conn,
 	a.dial = dial
 }
 
-// ListenAndServe listens on cfg.Control and serves until ctx is done.
+// Run serves both ports the agent owns - the control port the CLIs attach
+// to and the ALB port in front of the application - until ctx is done.
+//
+// It returns as soon as either one stops, and the caller is expected to
+// exit: the sidecar is an essential container, so exiting has ECS replace
+// the task, whereas half an agent is a task whose attach path or whose ALB
+// path is silently dead. Both listeners are opened before either is served
+// so that a port already in use is a startup error naming the port rather
+// than a task that comes up serving one half.
+func (a *Agent) Run(ctx context.Context) error {
+	control, err := net.Listen("tcp", a.cfg.Control)
+	if err != nil {
+		return fmt.Errorf("agent: listen on the control port %s: %w", a.cfg.Control, err)
+	}
+	defer control.Close()
+	proxy, err := net.Listen("tcp", a.cfg.Proxy)
+	if err != nil {
+		return fmt.Errorf("agent: listen on the ALB port %s: %w", a.cfg.Proxy, err)
+	}
+	defer proxy.Close()
+	// One line, both addresses: this is what says in CloudWatch that the
+	// task is on the ALB's data path at all.
+	a.logf("control listening on %s, proxy listening on %s -> app %s (env=%s)",
+		control.Addr(), proxy.Addr(), a.cfg.AppAddr, a.cfg.Env)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 2)
+	go func() { done <- a.Serve(ctx, control) }()
+	go func() { done <- a.ServeProxy(ctx, proxy) }()
+
+	// Both halves, not whichever stops first. The control accept loop
+	// returns the moment its listener closes, while ServeProxy is still
+	// draining the ALB's in-flight requests through http.Server.Shutdown -
+	// so returning on the first send would have main exit and sever exactly
+	// the requests that drain exists to finish. On SIGTERM that is the
+	// difference between a rolling deployment and a handful of 502s.
+	first := <-done
+	// Whichever half stopped, the other one is asked to stop too: half an
+	// agent is a task whose attach path or whose ALB path is silently dead.
+	cancel()
+	second := <-done
+	// The first non-nil error, so that a real failure is not hidden behind
+	// the nil the other half returns for an ordinary shutdown.
+	if first != nil {
+		return first
+	}
+	return second
+}
+
+// ListenAndServe listens on cfg.Control and serves until ctx is done. It
+// serves the control port only; Run is what production starts.
 func (a *Agent) ListenAndServe(ctx context.Context) error {
 	ln, err := net.Listen("tcp", a.cfg.Control)
 	if err != nil {
@@ -87,39 +130,6 @@ func (a *Agent) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
-// Sessions lists attached users, sorted by user.
-func (a *Agent) Sessions() []SessionInfo {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	out := make([]SessionInfo, 0, len(a.sessions))
-	for _, s := range a.sessions {
-		out = append(out, s)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].User < out[j].User })
-	return out
-}
-
-func (a *Agent) register(user, from string) *proto.Error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if s, ok := a.sessions[user]; ok {
-		return &proto.Error{
-			Code:    proto.CodeDuplicateUser,
-			Message: fmt.Sprintf("another session for user %q is already attached", user),
-			From:    s.From,
-			Since:   s.Since.UTC().Format(time.RFC3339),
-		}
-	}
-	a.sessions[user] = SessionInfo{User: user, From: from, Since: time.Now()}
-	return nil
-}
-
-func (a *Agent) unregister(user string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	delete(a.sessions, user)
-}
-
 func (a *Agent) others(user string) []string {
 	var out []string
 	for _, s := range a.Sessions() {
@@ -136,11 +146,14 @@ type handler struct {
 	user string
 }
 
-func (h *handler) Hello(hello proto.Hello, remote string) (proto.Welcome, *proto.Error) {
+// Hello registers the user's session: the user and where they attached
+// from, plus the token and incoming rules a request is matched against and
+// the Opener the L7 proxy uses to push a stolen request at this user's CLI.
+func (h *handler) Hello(hello proto.Hello, remote string, open session.Opener) (proto.Welcome, *proto.Error) {
 	if hello.User == "" {
 		return proto.Welcome{}, &proto.Error{Code: proto.CodeBadHello, Message: "hello.user is empty"}
 	}
-	if e := h.a.register(hello.User, remote); e != nil {
+	if e := h.a.register(hello, remote, open); e != nil {
 		return proto.Welcome{}, e
 	}
 	h.user = hello.User

@@ -55,6 +55,20 @@ type Network struct {
 	LocalCIDRs     []string `yaml:"local_cidrs"`
 	RemoteDomains  []string `yaml:"remote_domains"`
 	RemoteServices []string `yaml:"remote_services"`
+	// PinCredentialRoute asks for a host route to 169.254.170.2 through
+	// lo0, so that a tool inside the child's tree which hardcodes that
+	// address (rather than reading AWS_CONTAINER_CREDENTIALS_FULL_URI)
+	// reaches the task's credential endpoint too.
+	//
+	// Off by default, and there is deliberately no flag for it: the route
+	// is machine-wide and pf's rdr rule cannot be scoped by gid, so while
+	// it is pinned *every* process on the Mac reaches the dev task's
+	// credentials - and anything that owns that address locally (
+	// amazon-ecs-local-container-endpoints aliases it onto lo0) loses it
+	// for the length of the session. tetherd's own path needs none of that:
+	// it serves the endpoint on loopback and rewrites the child's
+	// environment (internal/cli/credproxy.go).
+	PinCredentialRoute bool `yaml:"pin_credential_route"`
 }
 
 // Match is the steal condition (used from v0.3; parsed now so a repository

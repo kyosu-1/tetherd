@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -15,20 +18,47 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/miekg/dns"
 
 	"github.com/kyosu-1/tetherd/internal/agent"
 	"github.com/kyosu-1/tetherd/internal/capture"
 	"github.com/kyosu-1/tetherd/internal/env"
 	"github.com/kyosu-1/tetherd/internal/helper"
+	"github.com/kyosu-1/tetherd/internal/proto"
 	ecsprov "github.com/kyosu-1/tetherd/internal/provider/ecs"
+	"github.com/kyosu-1/tetherd/internal/session"
 	"github.com/kyosu-1/tetherd/internal/transport"
 )
 
 // inProcessAgent runs a real tetherd-agent on a local listener and returns a
 // Transport that dials it, so Run's ssm branch can be exercised without AWS.
+//
+// proxyAddr is set only by startAgentForWithApp: it is the agent's real
+// reverse proxy, which is where the ALB puts a request.
 type inProcessAgent struct {
-	addr string
+	addr      string
+	proxyAddr string
+	a         *agent.Agent
+}
+
+// waitDetached blocks until the agent has processed the previous session's
+// disconnect.
+//
+// handler.Closed - and so unregister - runs on the agent's own goroutine
+// when it notices the connection is gone. Nothing orders that against
+// RunWithDeps returning on this one, so a test that attaches twice as the
+// same user has to wait in between or the second hello is refused with
+// duplicate_user.
+//
+// This is not a narrow race. Measured: at the instant RunWithDeps returns,
+// the agent still held the previous session in 60 of 60 runs. The window is
+// always open; whether a test loses it depends only on how much work happens
+// before its next hello arrives. That is why this failed in CI and not
+// locally - not a faster machine, just a different amount of slack.
+func (ag *inProcessAgent) waitDetached(t *testing.T) {
+	t.Helper()
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 0 }, "the agent to see the previous session detach")
 }
 
 func startAgentFor(t *testing.T, env map[string]string, envErr error, dial func(context.Context, string) (net.Conn, error)) *inProcessAgent {
@@ -45,7 +75,32 @@ func startAgentFor(t *testing.T, env map[string]string, envErr error, dial func(
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); ln.Close() })
 	go a.Serve(ctx, ln)
-	return &inProcessAgent{addr: ln.Addr().String()}
+	return &inProcessAgent{addr: ln.Addr().String(), a: a}
+}
+
+// startAgentForWithApp is startAgentFor plus the agent's own reverse proxy
+// on a second listener, with appAddr standing in for the application
+// container. proxyAddr is then where a request from the ALB arrives, so a
+// test can put the agent's real matching and real steal transport in front
+// of the CLI's real receiver rather than a stand-in's idea of either.
+func startAgentForWithApp(t *testing.T, env map[string]string, appAddr string) *inProcessAgent {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agent.New(agent.Config{Env: "dev", TaskARN: "arn:test", AppContainer: "app"}, nil)
+	a.SetEnvReader(fakeEnvReader{env: env, arn: "arn:test"})
+	ctx, cancel := context.WithCancel(context.Background())
+	proxy := &http.Server{Handler: (&agent.Proxy{Agent: a, AppAddr: appAddr}).Handler()}
+	t.Cleanup(func() { cancel(); proxy.Close(); ln.Close(); proxyLn.Close() })
+	go a.Serve(ctx, ln)
+	go proxy.Serve(proxyLn)
+	return &inProcessAgent{addr: ln.Addr().String(), proxyAddr: proxyLn.Addr().String(), a: a}
 }
 
 type fakeEnvReader struct {
@@ -143,6 +198,12 @@ func ssmOpts(cmd ...string) RunOptions {
 	return RunOptions{
 		Transport: "ssm", Cluster: "c", Service: "api", TargetEnv: "dev",
 		User: "tester", NoNetwork: true, Command: cmd,
+		// Steal is on by default (see DefaultLocalPort) and a session that
+		// takes requests must carry a token, so a bare RunOptions with
+		// neither would be refused before it ever reached the agent. The
+		// tests that are about steal say so by clearing this and setting a
+		// port and a token; every other test here is about something else.
+		NoIncoming: true,
 	}
 }
 
@@ -188,6 +249,7 @@ func TestRunEnvErrorIsFatalForSSMAndSkippableWithNoEnv(t *testing.T) {
 
 	opts := ssmOpts("true")
 	opts.NoEnv = true
+	ag.waitDetached(t)
 	if code, err := RunWithDeps(context.Background(), opts, io.Discard, depsFor(p)); code != 0 || err != nil {
 		t.Fatalf("--no-env must run anyway: code=%d err=%v", code, err)
 	}
@@ -219,10 +281,16 @@ func TestRunBuildsTheRemoteSet(t *testing.T) {
 	for _, p := range cap.spec.RemoteCIDRs {
 		got[p.String()] = true
 	}
-	for _, want := range []string{"10.0.0.0/16", "169.254.170.0/24", "10.9.0.0/16"} {
+	for _, want := range []string{"10.0.0.0/16", "10.9.0.0/16"} {
 		if !got[want] {
 			t.Errorf("%s missing from the captured set: %v", want, cap.spec.RemoteCIDRs)
 		}
+	}
+	// 169.254.170.0/24 is deliberately absent: the credential endpoint is
+	// served on loopback now, so capturing it machine-wide buys nothing and
+	// takes the address away from anything local that owns it.
+	if got["169.254.170.0/24"] {
+		t.Errorf("the credential endpoint must not be captured by default: %v", cap.spec.RemoteCIDRs)
 	}
 }
 
@@ -323,12 +391,31 @@ func TestRunVerifiesTheTaskRoleThroughTheAgent(t *testing.T) {
 	// failure; what matters is that tetherd got that far through the agent
 	// and said so honestly.
 	RunWithDeps(context.Background(), opts, &out, d)
-	if !strings.Contains(out.String(), "iam") {
-		t.Fatalf("no iam line at all: %s", out.String())
+	// The probe has to travel the child's own path: through the loopback
+	// port, over the session, to the endpoint - and the line has to say so
+	// on the line that reports the probe, not merely somewhere in the log
+	// (the ✓ endpoint line above already names the port, so a
+	// whole-output Contains check here would pin nothing).
+	if l := iamResultLine(t, out.String()); !strings.Contains(l, "127.0.0.1:") {
+		t.Errorf("the iam line must name the loopback port the child is pointed at, got %q", l)
 	}
-	if strings.Contains(out.String(), "the task advertises a role but") {
-		t.Errorf("169.254.170.0/24 is captured, so the not-captured warning must not fire: %s", out.String())
+}
+
+// iamResultLine returns the ✓/⚠ iam line that reports what the credential
+// probe found - the one carrying "(via …)". Asserting on this line rather
+// than on the whole log is what makes "the probe went through the loopback
+// proxy" testable: the ✓ endpoint line names the same port a few lines
+// earlier, so a Contains check over out.String() passes even with the iam
+// line reverted to "(via 169.254.170.2)".
+func iamResultLine(t *testing.T, out string) string {
+	t.Helper()
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "iam") && strings.Contains(l, "(via ") {
+			return l
+		}
 	}
+	t.Fatalf("no iam line reporting the probe (a '(via …)' line) in:\n%s", out)
+	return ""
 }
 
 // TestRunTaskRoleOverrideBeatsConfigEnvOverride pins item 8b: a committed
@@ -492,13 +579,25 @@ func TestRunStripsLocalAWSCredentialsFromTheChild(t *testing.T) {
 	// A sanity check on the harness itself: if the dump were empty or the
 	// script never ran, every assertion below would pass for the wrong
 	// reason.
-	if len(childEnv) == 0 || childEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] == "" {
+	if len(childEnv) == 0 || childEnv["AWS_CONTAINER_CREDENTIALS_FULL_URI"] == "" {
 		t.Fatalf("the child's environment was not captured (%d vars): %s", len(childEnv), out.String())
 	}
 	for _, name := range env.LocalAWSCredentialVars {
-		if got, ok := childEnv[name]; ok {
-			t.Errorf("%s reached the child as %q: the child would sign with the developer's own identity while the status line claims the task role", name, got)
+		got, ok := childEnv[name]
+		if !ok {
+			continue
 		}
+		// AWS_CONTAINER_CREDENTIALS_FULL_URI is the one name in the list
+		// tetherd sets itself: the developer's value has to go and be
+		// replaced by the loopback port this run serves, not merely be
+		// absent.
+		if name == "AWS_CONTAINER_CREDENTIALS_FULL_URI" {
+			if !strings.HasPrefix(got, "http://127.0.0.1:") {
+				t.Errorf("%s = %q, want the loopback port tetherd serves", name, got)
+			}
+			continue
+		}
+		t.Errorf("%s reached the child as %q: the child would sign with the developer's own identity while the status line claims the task role", name, got)
 	}
 	if !strings.Contains(out.String(), "local AWS credentials") {
 		t.Errorf("removing them silently is not enough; the run must say so: %s", out.String())
@@ -550,14 +649,26 @@ func writeChildScript(t *testing.T, body string) string {
 
 func waitForFile(t *testing.T, path string) {
 	t.Helper()
+	waitFor(t, func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}, path+" to appear")
+}
+
+// waitFor polls cond until it holds, and fails naming what never happened.
+// Polling, not sleeping: the thing being waited for (a file the child wrote,
+// a listener that shut down) happens in another process or goroutine, and a
+// fixed sleep is either a flake or a wasted second.
+func waitFor(t *testing.T, cond func() bool, what string) {
+	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
+		if cond() {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("%s never appeared", path)
+	t.Fatalf("timed out waiting for %s", what)
 }
 
 // runInBackground starts Run and returns a channel carrying its result, so a
@@ -710,7 +821,7 @@ func TestRunExitsTwoForEveryBadCIDRValue(t *testing.T) {
 	}
 	directCase := func(mod func(*RunOptions)) RunOptions {
 		o := RunOptions{
-			Transport: "direct", AgentAddr: "127.0.0.1:1", TargetEnv: "dev", User: "tester",
+			Transport: "direct", AgentAddr: "127.0.0.1:1", TargetEnv: "dev", User: "tester", NoIncoming: true,
 			RemoteCIDRs: []string{"10.0.0.0/16"}, ExecPath: "/usr/bin/true", Command: []string{"true"},
 		}
 		mod(&o)
@@ -780,7 +891,7 @@ func TestRunDirectAppliesLocalCIDRs(t *testing.T) {
 	}
 
 	opts := RunOptions{
-		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
+		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester", NoIncoming: true,
 		RemoteCIDRs: []string{"10.0.0.0/16"}, LocalCIDRs: []string{"10.0.5.0/24"},
 		ExecPath: "/usr/bin/true", Command: []string{"true"},
 	}
@@ -809,7 +920,7 @@ func TestRunDirectIgnoresRemoteServicesWithALogLine(t *testing.T) {
 	}
 
 	opts := RunOptions{
-		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
+		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester", NoIncoming: true,
 		RemoteCIDRs: []string{"10.0.0.0/16"}, RemoteServices: []string{"s3"},
 		ExecPath: "/usr/bin/true", Command: []string{"true"},
 	}
@@ -835,7 +946,7 @@ func TestRunDirectIgnoresRemoteServicesWithALogLine(t *testing.T) {
 // same mistake.
 func TestRunDirectRejectsLocalCIDRsExcludingEverything(t *testing.T) {
 	opts := RunOptions{
-		Transport: "direct", AgentAddr: "127.0.0.1:1", TargetEnv: "dev", User: "tester",
+		Transport: "direct", AgentAddr: "127.0.0.1:1", TargetEnv: "dev", User: "tester", NoIncoming: true,
 		RemoteCIDRs: []string{"10.0.0.0/16"}, LocalCIDRs: []string{"10.0.0.0/8"},
 		ExecPath: "/usr/bin/true", Command: []string{"true"},
 	}
@@ -845,21 +956,450 @@ func TestRunDirectRejectsLocalCIDRsExcludingEverything(t *testing.T) {
 	}
 }
 
-func TestRunWarnsWhenTheCredentialEndpointIsNotCaptured(t *testing.T) {
-	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil, nil)
-	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", Addr: ag.addr}, agentAddr: ag.addr}
+// TestRunGivesTheChildTheTaskRoleWithoutCapturingTheEndpoint replaces the
+// "the task advertises a role but 169.254.170.0/24 is not captured" warning
+// this used to assert. Nothing has to be captured any more: the endpoint is
+// served on loopback and the child is pointed at it by environment
+// variable, so a remote set the operator chose by hand (--transport direct
+// with one --remote-cidr) still gets the task role.
+func TestRunGivesTheChildTheTaskRoleWithoutCapturingTheEndpoint(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil,
+		endpointReturning(t, http.StatusServiceUnavailable, "no credentials for you"))
+	cap := newFakeCapturer()
+	d := Deps{
+		DialHelper:  func(string) (HelperClient, error) { return &fakeHelperClient{}, nil },
+		NewCapturer: func(HelperClient, func(string, ...any)) Capturer { return cap },
+	}
+
+	dir := t.TempDir()
+	dump := filepath.Join(dir, "env-dump")
+	script := filepath.Join(dir, "fake-exec.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nenv > "+dump+"\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	opts := RunOptions{
+		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester", NoIncoming: true,
+		RemoteCIDRs: []string{"10.0.0.0/16"}, ExecPath: script, Command: []string{"true"},
+	}
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if addrIn(cap.spec.RemoteCIDRs, "169.254.170.2") {
+		t.Fatalf("the premise is wrong: %v already covers the endpoint", cap.spec.RemoteCIDRs)
+	}
+	childEnv := map[string]string{}
+	for _, line := range strings.Split(strings.TrimRight(readFile(t, dump), "\n"), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			childEnv[k] = v
+		}
+	}
+	if !strings.HasPrefix(childEnv["AWS_CONTAINER_CREDENTIALS_FULL_URI"], "http://127.0.0.1:") {
+		t.Fatalf("the child must still get the task role: %v", childEnv["AWS_CONTAINER_CREDENTIALS_FULL_URI"])
+	}
+	// Transparent mode is the only place the explicit exclusion of the
+	// relative URI is load-bearing: env.Options.DropAWSContainer (which
+	// --no-network sets) happens to drop the same name, so every
+	// --no-network test would pass with the exclusion deleted - measured.
+	// The workload that matters most, `tetherd run -- aws s3 ls` in
+	// transparent mode, is this one, and botocore reads the variable's
+	// presence.
+	if v, ok := childEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]; ok {
+		t.Fatalf("the relative URI reached the child as %q in transparent mode; botocore would fetch http://169.254.170.2", v)
+	}
+	if strings.Contains(out.String(), "not captured") {
+		t.Errorf("nothing has to be captured for the task role any more: %s", out.String())
+	}
+}
+
+// TestRunPointsTheChildAtTheLoopbackCredentialProxy: the task's environment
+// names 169.254.170.2, which only exists inside the task. The child must be
+// handed the loopback port tetherd serves instead, with the relative form
+// cleared so nothing falls back to the address nothing routes.
+//
+// The endpoint answers 503 on purpose (as in
+// TestRunVerifiesTheTaskRoleThroughTheAgent): serving usable credentials
+// would send Run's own probe on to sts.<region>.amazonaws.com, and leaving
+// the endpoint unserved would make the agent dial the real 169.254.170.2.
+func TestRunPointsTheChildAtTheLoopbackCredentialProxy(t *testing.T) {
+	dial := endpointReturning(t, http.StatusServiceUnavailable, "no credentials for you")
+	ag := startAgentFor(t, map[string]string{
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/abc",
+		"ECS_CONTAINER_METADATA_URI_V4":          "http://169.254.170.2/v4/task",
+	}, nil, dial)
+	p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+	// The child's exit status carries the assertion: a loopback FULL_URI,
+	// no mention of the endpoint's address, and the relative form cleared.
+	//
+	// The relative form is checked for *presence*, not emptiness:
+	// `[ -z "$X" ]` passes both for a variable that is gone and for one set
+	// to "", and the difference is the whole bug - botocore's
+	// ContainerProvider tests `ENV_VAR in self._environ` and then fetches
+	// http://169.254.170.2 + "", so an empty variable takes `aws s3 ls`
+	// to the address nothing routes while the developer's own credentials
+	// have already been stripped.
+	opts := ssmOpts("sh", "-c", `case "$AWS_CONTAINER_CREDENTIALS_FULL_URI" in http://127.0.0.1:*/v2/credentials/abc) ;; *) exit 11;; esac
+		if [ "${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI+set}" = set ]; then exit 12; fi
+		case "$ECS_CONTAINER_METADATA_URI_V4" in *169.254*) exit 13;; esac
+		case "$ECS_CONTAINER_METADATA_URI_V4" in http://127.0.0.1:*/v4/task) ;; *) exit 14;; esac
+		exit 0`)
+	var out strings.Builder
+	code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p))
+	if err != nil || code != 0 {
+		t.Fatalf("the child rejected its environment: code=%d err=%v log=%s", code, err, out.String())
+	}
+	if l := iamResultLine(t, out.String()); !strings.Contains(l, "127.0.0.1:") {
+		t.Errorf("the iam line must say where the child was pointed, got %q", l)
+	}
+}
+
+// TestRunRemovesTheRelativeURIEvenFromTheDevelopersOwnEnvironment: the
+// variable has to be gone from the child whatever its source. It is not in
+// env.LocalAWSCredentialVars (that list is about the developer's own
+// identity), so a copy exported in the shell would otherwise survive the
+// task's copy being excluded - and botocore would read it.
+func TestRunRemovesTheRelativeURIEvenFromTheDevelopersOwnEnvironment(t *testing.T) {
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/credentials/mine")
+	ag := startAgentFor(t, map[string]string{
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/abc",
+	}, nil, endpointReturning(t, http.StatusServiceUnavailable, "no credentials for you"))
+	p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+	opts := ssmOpts("sh", "-c", `if [ "${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI+set}" = set ]; then exit 12; fi
+		exit 0`)
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p)); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+}
+
+// TestRunProbesTheTaskRoleThroughTheLoopbackProxy pins which path the ✓ iam
+// probe takes. It has to be the child's own - loopback, then the session -
+// so that a broken listener is found by tetherd before the child's first
+// SDK call, and so the "via 127.0.0.1:<port>" the line prints is not a
+// claim about a path nothing tried.
+//
+// The session's dial fails on purpose, and the two paths fail differently: a
+// probe through the proxy gets the proxy's own 502 and leaves the
+// ErrorHandler's "through the agent" line behind, while a probe that dialed
+// the session directly would report the dial error itself and log nothing
+// from credproxy.go.
+func TestRunProbesTheTaskRoleThroughTheLoopbackProxy(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil,
+		func(context.Context, string) (net.Conn, error) {
+			return nil, errors.New("the task has no route to that address")
+		})
+	p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+	var out strings.Builder
+	code, err := RunWithDeps(context.Background(), ssmOpts("true"), &out, depsFor(p))
+	if err != nil || code != 0 {
+		t.Fatalf("a failed probe must not fail the run: code=%d err=%v log=%s", code, err, out.String())
+	}
+	if !strings.Contains(out.String(), "through the agent") {
+		t.Errorf("the probe must travel the loopback proxy (its ErrorHandler names the transport): %s", out.String())
+	}
+	if !strings.Contains(out.String(), "HTTP 502") {
+		t.Errorf("and the probe must see the proxy's answer, not the raw dial error: %s", out.String())
+	}
+}
+
+// TestRunServesTheTaskEndpointToTheChildOverLoopback is the other half: the
+// value in the child's environment has to be a live endpoint, not just a
+// well-formed URL. The child parks after dumping its environment so this
+// test can use that exact URL while the run is still up, and what comes back
+// has to be the task's own answer relayed through the session - a 503 from
+// the endpoint, not a 502 from the proxy.
+//
+// A unit test cannot cover this: the listener, the session's DialTCP and the
+// environment the child actually receives are wired together inside Run.
+func TestRunServesTheTaskEndpointToTheChildOverLoopback(t *testing.T) {
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v2/credentials/") {
+			http.Error(w, "no credentials for you", http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprintf(w, `{"Cluster":"relayed","Path":%q}`, r.URL.Path)
+	})}
+	cl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	go srv.Serve(cl)
+
+	ag := startAgentFor(t, map[string]string{
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/abc",
+		"ECS_CONTAINER_METADATA_URI_V4":          "http://169.254.170.2/v4/task",
+	}, nil, func(ctx context.Context, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", cl.Addr().String())
+	})
+	p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+
+	dir := t.TempDir()
+	dump, release := filepath.Join(dir, "env-dump"), filepath.Join(dir, "release")
+	script := filepath.Join(dir, "child.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nenv > "+dump+".tmp\nmv "+dump+".tmp "+dump+
+		"\nwhile [ ! -f "+release+" ]; do sleep 0.02; done\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	done := runInBackground(ssmOpts("/bin/sh", script), &out, depsFor(p))
+	t.Cleanup(func() { os.WriteFile(release, []byte("go"), 0o644) })
+	waitForFile(t, dump)
+	childEnv := map[string]string{}
+	for _, line := range strings.Split(strings.TrimRight(readFile(t, dump), "\n"), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			childEnv[k] = v
+		}
+	}
+
+	full := childEnv["AWS_CONTAINER_CREDENTIALS_FULL_URI"]
+	if !strings.HasPrefix(full, "http://127.0.0.1:") {
+		t.Fatalf("AWS_CONTAINER_CREDENTIALS_FULL_URI = %q: %s", full, out.String())
+	}
+	// `env` prints an empty variable as "NAME=", so the key being absent
+	// from this map is exactly the property botocore needs: not empty, gone.
+	if v, ok := childEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]; ok {
+		t.Fatalf("the relative URI reached the child as %q; botocore branches on its presence and would fetch http://169.254.170.2", v)
+	}
+	// The credential path: the task's own 503 has to arrive, which proves
+	// the request travelled endpoint-ward rather than failing at the proxy.
+	resp, err := http.Get(full)
+	if err != nil {
+		t.Fatalf("the child's credential URL is not served: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), "no credentials for you") {
+		t.Fatalf("status=%d body=%q, want the task's own answer relayed", resp.StatusCode, body)
+	}
+	// The metadata path goes through the same port, and its path survives.
+	resp, err = http.Get(childEnv["ECS_CONTAINER_METADATA_URI_V4"])
+	if err != nil {
+		t.Fatalf("the child's metadata URL is not served: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(body), `"Path":"/v4/task"`) {
+		t.Fatalf("status=%d body=%q, want the metadata path relayed intact", resp.StatusCode, body)
+	}
+
+	if err := os.WriteFile(release, []byte("go"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := <-done; r.err != nil || r.code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", r.code, r.err, out.String())
+	}
+	// And the port is gone once the run is over: it is the run's lifetime,
+	// not the machine's.
+	waitFor(t, func() bool {
+		c, err := net.DialTimeout("tcp", strings.TrimPrefix(full[:strings.LastIndex(full, "/v2")], "http://"), 200*time.Millisecond)
+		if err != nil {
+			return true
+		}
+		c.Close()
+		return false
+	}, "the credential proxy to stop listening after the run")
+}
+
+// endpointReturning is a fake 169.254.170.2 that answers every request with
+// the same status, for tests that only need the credential probe to fail
+// fast and locally: unserved, the agent would dial the real link-local
+// address and wait out its 10s dial timeout.
+func endpointReturning(t *testing.T, status int, body string) func(context.Context, string) (net.Conn, error) {
+	t.Helper()
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, body, status)
+	})}
+	cl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	go srv.Serve(cl)
+	return func(ctx context.Context, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", cl.Addr().String())
+	}
+}
+
+// credentialEndpoint is a fake 169.254.170.2 that serves usable-looking
+// container credentials, for the tests that need Run's probe to get past
+// FetchContainerCredentials and on to the STS leg.
+func credentialEndpoint(t *testing.T) func(context.Context, string) (net.Conn, error) {
+	t.Helper()
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"AccessKeyId":"AKIAEXAMPLE","SecretAccessKey":"s3cret","Token":"tok","Expiration":%q}`,
+			time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+	})}
+	cl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	go srv.Serve(cl)
+	return func(ctx context.Context, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", cl.Addr().String())
+	}
+}
+
+// TestRunSeparatesTheCredentialLegFromTheSTSLeg: the ✓ iam check has two
+// halves and only one of them is about the child. The credential fetch is
+// hermetic (loopback → the session → the task) and decides whether the child
+// has an AWS identity at all; sts:GetCallerIdentity leaves the laptop's own
+// network for sts.<region>.amazonaws.com and only names the role.
+//
+// Collapsing them - which is what this task's first round did - means a
+// developer offline, behind a proxy, or on --no-network with no
+// connectivity reads "the task role could not be verified; the child may
+// have no AWS identity" about a child that can sign perfectly well.
+func TestRunSeparatesTheCredentialLegFromTheSTSLeg(t *testing.T) {
+	// The developer's own credentials are in the environment, so the
+	// "removed so the task role applies" line is reached either way.
+	t.Setenv("AWS_PROFILE", "mine")
+
+	run := func(t *testing.T, identity func(context.Context, aws.Credentials, string) (string, error), dial func(context.Context, string) (net.Conn, error)) string {
+		t.Helper()
+		ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil, dial)
+		p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+		d := depsFor(p)
+		d.CallerIdentity = identity
+		var out strings.Builder
+		if code, err := RunWithDeps(context.Background(), ssmOpts("true"), &out, d); err != nil || code != 0 {
+			t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+		}
+		return out.String()
+	}
+
+	t.Run("both legs succeed", func(t *testing.T) {
+		out := run(t, func(context.Context, aws.Credentials, string) (string, error) {
+			return "arn:aws:sts::1:assumed-role/dev-task/abc", nil
+		}, credentialEndpoint(t))
+		l := iamResultLine(t, out)
+		if !strings.Contains(l, "✓ iam") || !strings.Contains(l, "assumed-role/dev-task") {
+			t.Errorf("want the ARN on a ✓ iam line, got %q", l)
+		}
+		// The successful line has to name the loopback port too: it is the
+		// line a developer reads to know where their child is pointed.
+		if !strings.Contains(l, "127.0.0.1:") {
+			t.Errorf("the ✓ iam line must name the loopback port, got %q", l)
+		}
+		if !strings.Contains(out, "✓ env      local AWS credentials") {
+			t.Errorf("the strip must be reported as good news: %s", out)
+		}
+	})
+
+	t.Run("the credentials arrive but STS cannot be reached", func(t *testing.T) {
+		out := run(t, func(context.Context, aws.Credentials, string) (string, error) {
+			return "", errors.New("dial tcp: lookup sts.ap-northeast-1.amazonaws.com: no such host")
+		}, credentialEndpoint(t))
+		line := iamResultLine(t, out)
+		if !strings.Contains(line, "could not confirm") || !strings.Contains(line, "no such host") {
+			t.Errorf("the line must say STS is what failed, got %q", line)
+		}
+		if strings.Contains(line, "127.0.0.1") == false {
+			t.Errorf("and still say where the credentials came from, got %q", line)
+		}
+		// The child can sign: the credentials reached tetherd over the same
+		// path the child uses. Warning that it "may have no AWS identity"
+		// would be a false alarm.
+		if !strings.Contains(out, "✓ env      local AWS credentials") {
+			t.Errorf("STS being unreachable must not be reported as the child having no identity: %s", out)
+		}
+	})
+
+	t.Run("the credentials do not arrive", func(t *testing.T) {
+		out := run(t, func(context.Context, aws.Credentials, string) (string, error) {
+			t.Error("sts must not be asked about credentials that never arrived")
+			return "", nil
+		}, endpointReturning(t, http.StatusServiceUnavailable, "no credentials for you"))
+		if l := iamResultLine(t, out); !strings.Contains(l, "HTTP 503") {
+			t.Errorf("want the endpoint's own failure, got %q", l)
+		}
+		if !strings.Contains(out, "⚠ env      local AWS credentials") {
+			t.Errorf("this is the case where the child may have no identity, and it must say so: %s", out)
+		}
+	})
+}
+
+// TestRunWarnsAboutATaskValueItCannotRewrite: a value that names
+// 169.254.170.2 in a shape tetherd does not rewrite (https, a stray space,
+// an application variable) reaches the child unroutable. Passing it through
+// is right; saying nothing is not - until v0.3a it resolved anyway, because
+// 169.254.170.0/24 was captured unconditionally.
+func TestRunWarnsAboutATaskValueItCannotRewrite(t *testing.T) {
+	taskEnv := map[string]string{
+		"APP_METADATA_URL":              "https://169.254.170.2/v4/app",
+		"ECS_CONTAINER_METADATA_URI_V4": "http://169.254.170.2/v4/task",
+	}
+	ag := startAgentFor(t, taskEnv, nil, nil)
+	p := &fakeProvider{
+		region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
 	d := depsFor(p)
 	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
 	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.ExecPath = "/usr/bin/true"
 
-	opts := RunOptions{
-		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
-		RemoteCIDRs: []string{"10.0.0.0/16"}, ExecPath: "/usr/bin/true", Command: []string{"true"},
-	}
 	var out strings.Builder
-	RunWithDeps(context.Background(), opts, &out, d)
-	if !strings.Contains(out.String(), "the task advertises a role but") {
-		t.Fatalf("the warning must fire when 169.254.170.0/24 is not captured: %s", out.String())
+	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if !strings.Contains(out.String(), "APP_METADATA_URL") || !strings.Contains(out.String(), "pin_credential_route") {
+		t.Errorf("the warning must name the variable and the way to make it work: %s", out.String())
+	}
+	// The rewritten one is not stuck and must not be named.
+	if strings.Contains(out.String(), "ECS_CONTAINER_METADATA_URI_V4") {
+		t.Errorf("a rewritten variable must not be warned about: %s", out.String())
+	}
+
+	// With the route pin on, the address *is* captured, so the value
+	// resolves and there is nothing to warn about.
+	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+	opts.PinCredentialRoute = true
+	var pinned strings.Builder
+	ag.waitDetached(t)
+	if code, err := RunWithDeps(context.Background(), opts, &pinned, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, pinned.String())
+	}
+	if strings.Contains(pinned.String(), "APP_METADATA_URL") {
+		t.Errorf("with the endpoint captured the value resolves; warning about it is noise: %s", pinned.String())
+	}
+}
+
+// TestRunKeepsTheDevelopersIdentityWhenTheTaskHasNoRole: the hardening that
+// hides ~/.aws and strips the developer's own AWS variables only makes sense
+// when there is a task role to replace them with. A task with no role (or
+// with metadata but no credentials) must leave the child its own identity -
+// hiding both would leave it with no AWS identity at all.
+func TestRunKeepsTheDevelopersIdentityWhenTheTaskHasNoRole(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		taskEnv map[string]string
+	}{
+		{"no role at all", map[string]string{"PORT": "8080"}},
+		{"metadata but no credentials", map[string]string{"ECS_CONTAINER_METADATA_URI_V4": "http://169.254.170.2/v4/task"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ag := startAgentFor(t, c.taskEnv, nil, nil)
+			p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+			t.Setenv("AWS_PROFILE", "mine")
+			t.Setenv("AWS_CONFIG_FILE", "/Users/dev/.aws/config")
+			opts := ssmOpts("sh", "-c", `[ "$AWS_PROFILE" = mine ] || exit 11
+				[ "$AWS_CONFIG_FILE" = /Users/dev/.aws/config ] || exit 12`)
+			var out strings.Builder
+			code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p))
+			if err != nil || code != 0 {
+				t.Fatalf("the child lost its own AWS identity: code=%d err=%v log=%s", code, err, out.String())
+			}
+			if strings.Contains(out.String(), "iam") {
+				t.Errorf("there is no task role to report: %s", out.String())
+			}
+		})
 	}
 }
 
@@ -1044,6 +1584,12 @@ type fakeHelperClient struct {
 	// after recording domains/port, so a test can learn the port without
 	// polling.
 	onResolverSet func()
+	// routes is what RouteSet was asked to pin, routeCleared whether
+	// RouteClear ran, and routeSetErr what RouteSet returns (a BusyError,
+	// for the second `tetherd run` on a machine).
+	routes       []netip.Addr
+	routeCleared bool
+	routeSetErr  error
 }
 
 func (f *fakeHelperClient) PfApply(helper.PfSpec) error { return nil }
@@ -1063,6 +1609,17 @@ func (f *fakeHelperClient) ResolverClear() error {
 	f.cleared = true
 	return nil
 }
+func (f *fakeHelperClient) RouteSet(hosts []netip.Addr) error {
+	if f.routeSetErr != nil {
+		return f.routeSetErr
+	}
+	f.routes = append(f.routes, hosts...)
+	return nil
+}
+func (f *fakeHelperClient) RouteClear() error {
+	f.routeCleared = true
+	return nil
+}
 func (f *fakeHelperClient) Close() error { return nil }
 
 type fakeCapturer struct {
@@ -1078,6 +1635,9 @@ type fakeCapturer struct {
 	// forwarder goroutine reads it while the test goroutine closes it.
 	accept chan capture.Conn
 	once   sync.Once
+	// startErr is what Start returns: pf.apply is where a second `tetherd
+	// run` on the machine finds out it is busy.
+	startErr error
 }
 
 func newFakeCapturer() *fakeCapturer {
@@ -1087,7 +1647,7 @@ func newFakeCapturer() *fakeCapturer {
 func (f *fakeCapturer) Start(_ context.Context, spec capture.Spec) error {
 	f.spec = spec
 	f.started = true
-	return nil
+	return f.startErr
 }
 func (f *fakeCapturer) Accept() (capture.Conn, error) {
 	cc, ok := <-f.accept
@@ -1106,3 +1666,716 @@ func (f *fakeCapturer) Close() error {
 	return nil
 }
 func (f *fakeCapturer) RedirectPort() int { return 15300 }
+
+// TestRunDoesNotPinTheRouteUnlessAsked: the child no longer dials
+// 169.254.170.2 at all - it is pointed at a loopback port instead - so the
+// machine-wide host route pf needed (see internal/helper/route.go) is an
+// opt-in escape hatch for a tool inside the child's tree that hardcodes the
+// address, not something every run installs. While it is pinned, every
+// process on the Mac reaches the dev task's credentials.
+func TestRunDoesNotPinTheRouteUnlessAsked(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/abc"}, nil,
+		endpointReturning(t, http.StatusServiceUnavailable, "no credentials for you"))
+	p := &fakeProvider{
+		region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
+	hc := &fakeHelperClient{}
+	cap := newFakeCapturer()
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return hc, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return cap }
+
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.ExecPath = "/usr/bin/true"
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if len(hc.routes) != 0 {
+		t.Fatalf("routes = %v: the machine-wide pin is opt-in now", hc.routes)
+	}
+	// And with no pin there is no reason to hold 169.254.170.0/24 in the
+	// captured set either: that floor existed only to keep the pinned route
+	// usable (v0.2b), and capturing the address costs every local ECS
+	// endpoint emulator on the machine its own address for the session.
+	if addrIn(cap.spec.RemoteCIDRs, "169.254.170.2") {
+		t.Fatalf("the endpoint must not be captured by default: %v", cap.spec.RemoteCIDRs)
+	}
+
+	// With the opt-in set it is pinned - the escape hatch for a tool inside
+	// the child's tree that hardcodes the address.
+	hc2, cap2 := &fakeHelperClient{}, newFakeCapturer()
+	d.DialHelper = func(string) (HelperClient, error) { return hc2, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return cap2 }
+	opts.PinCredentialRoute = true
+	ag.waitDetached(t)
+	if code, err := RunWithDeps(context.Background(), opts, io.Discard, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if len(hc2.routes) != 1 || hc2.routes[0].String() != "169.254.170.2" {
+		t.Fatalf("routes = %v, want the endpoint pinned when asked", hc2.routes)
+	}
+	if !hc2.routeCleared {
+		t.Error("the route must be cleared when the run ends: it outlives the session otherwise")
+	}
+}
+
+func TestRunDoesNotPinTheRouteWithoutCapture(t *testing.T) {
+	// --no-network never touches the helper, so it pins no route even when
+	// asked: there is no pf rule for the route to feed.
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+	hc := &fakeHelperClient{}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return hc, nil }
+	opts := ssmOpts("true")
+	opts.PinCredentialRoute = true
+	if code, err := RunWithDeps(context.Background(), opts, io.Discard, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if len(hc.routes) != 0 {
+		t.Fatalf("routes = %v, want none with --no-network", hc.routes)
+	}
+}
+
+// TestRunCapturesTheEndpointWheneverItPinsTheRoute is the boundary the pin
+// has to respect: the route is only correct while pf's `rdr pass on lo0`
+// covers that address - pinning it otherwise sends the credential endpoint
+// to lo0, where no rdr rule picks it up and nothing answers. Under
+// --transport direct the operator chooses the remote set by hand and
+// 169.254.170.0/24 is not in it, so asking for the pin has to add it: the
+// floor and the pin are one decision, not two that can disagree.
+func TestRunCapturesTheEndpointWheneverItPinsTheRoute(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	hc := &fakeHelperClient{}
+	cap := newFakeCapturer()
+	d := Deps{
+		DialHelper:  func(string) (HelperClient, error) { return hc, nil },
+		NewCapturer: func(HelperClient, func(string, ...any)) Capturer { return cap },
+	}
+	opts := RunOptions{
+		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester", NoIncoming: true,
+		RemoteCIDRs: []string{"10.9.0.0/16"}, PinCredentialRoute: true,
+		ExecPath: "/usr/bin/true", Command: []string{"true"},
+	}
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if len(hc.routes) != 1 || hc.routes[0] != ecsprov.TaskRoleAddr {
+		t.Fatalf("routes = %v, want the credential endpoint pinned when asked", hc.routes)
+	}
+	if !addrIn(cap.spec.RemoteCIDRs, "169.254.170.2") {
+		t.Fatalf("a pinned route with no rdr rule behind it is a dead end: %v", cap.spec.RemoteCIDRs)
+	}
+	// Without the opt-in, direct captures exactly what the operator asked
+	// for - so the assertion above is about the pin, not about direct
+	// always adding the range.
+	hc2, cap2 := &fakeHelperClient{}, newFakeCapturer()
+	d.DialHelper = func(string) (HelperClient, error) { return hc2, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return cap2 }
+	opts.PinCredentialRoute = false
+	ag.waitDetached(t)
+	if code, err := RunWithDeps(context.Background(), opts, io.Discard, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if addrIn(cap2.spec.RemoteCIDRs, "169.254.170.2") || len(hc2.routes) != 0 {
+		t.Fatalf("captured %v, routes %v: neither belongs here", cap2.spec.RemoteCIDRs, hc2.routes)
+	}
+}
+
+// TestRunExplainsABusyHelperFromRouteSet: with network.pin_credential_route
+// set, route.set is the first call that claims the machine-wide session, so
+// it is where a second `tetherd run` finds out. That must still be the
+// explanation a developer can act on, not a bare wrapped error.
+func TestRunExplainsABusyHelperFromRouteSet(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{
+		region: "ap-northeast-1", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
+	hc := &fakeHelperClient{routeSetErr: &helper.BusyError{PID: 4242, Since: time.Now()}}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return hc, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.ExecPath = "/usr/bin/true"
+	opts.PinCredentialRoute = true
+	code, err := RunWithDeps(context.Background(), opts, io.Discard, d)
+	if code != 1 || err == nil {
+		t.Fatalf("code=%d err=%v, want a failure", code, err)
+	}
+	var busy *helper.BusyError
+	if !errors.As(err, &busy) {
+		t.Fatalf("err = %v, want the BusyError to survive", err)
+	}
+	if !strings.Contains(err.Error(), "Stop the other") {
+		t.Errorf("err = %q, want the same next step pf.apply gives", err)
+	}
+}
+
+// TestRunExplainsABusyHelperFromPfApply is the same explanation from the
+// call that discovers it on a default run: with the route pin opt-in,
+// pf.apply is the first thing to claim the machine-wide session.
+func TestRunExplainsABusyHelperFromPfApply(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{
+		region: "ap-northeast-1", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
+	cap := newFakeCapturer()
+	cap.startErr = &helper.BusyError{PID: 4242, Since: time.Now()}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return cap }
+
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.ExecPath = "/usr/bin/true"
+	code, err := RunWithDeps(context.Background(), opts, io.Discard, d)
+	if code != 1 || err == nil {
+		t.Fatalf("code=%d err=%v, want a failure", code, err)
+	}
+	var busy *helper.BusyError
+	if !errors.As(err, &busy) {
+		t.Fatalf("err = %v, want the BusyError to survive", err)
+	}
+	if !strings.Contains(err.Error(), "Stop the other") {
+		t.Errorf("err = %q, want the next step a developer can act on", err)
+	}
+}
+
+// --- the steal receiver, over a real session -------------------------------
+//
+// The agent end of steal (its L7 proxy) is Task 4's; these tests stand in
+// for it with the one thing it will do that matters here - open a stream
+// toward this CLI, write the http header on it and speak HTTP/1.1 - so that
+// what is exercised is the real session, the real accept loop, the real
+// OnHTTP contract and the real receiver.
+
+// stealAgent is a session.Handler that records the hello it was sent and
+// keeps the Opener it was handed, which is how the agent pushes a stolen
+// request at a CLI.
+type stealAgent struct {
+	addr string
+
+	mu       sync.Mutex
+	hello    proto.Hello
+	open     session.Opener
+	attached chan struct{}
+	once     sync.Once
+}
+
+func startStealAgent(t *testing.T) *stealAgent {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &stealAgent{addr: ln.Addr().String(), attached: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go session.Serve(ctx, c, a, session.ServeOptions{})
+		}
+	}()
+	return a
+}
+
+func (a *stealAgent) Hello(h proto.Hello, _ string, open session.Opener) (proto.Welcome, *proto.Error) {
+	a.mu.Lock()
+	a.hello, a.open = h, open
+	a.mu.Unlock()
+	a.once.Do(func() { close(a.attached) })
+	return proto.Welcome{Version: proto.Version, TaskARN: "arn:test", Env: "dev", AppEnv: map[string]string{"A": "1"}}, nil
+}
+
+func (a *stealAgent) Dial(context.Context, string) (net.Conn, error) {
+	return nil, errors.New("this agent does not dial")
+}
+
+func (a *stealAgent) Resolve(context.Context, string) ([]string, int, error) {
+	return nil, 0, errors.New("this agent does not resolve")
+}
+
+func (a *stealAgent) Closed() {}
+
+// waitAttached blocks until a CLI has completed the handshake and returns
+// the hello it sent.
+func (a *stealAgent) waitAttached(t *testing.T) proto.Hello {
+	t.Helper()
+	select {
+	case <-a.attached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no CLI attached")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.hello
+}
+
+// steal opens an http stream at the attached CLI and returns the response,
+// or the proto error the CLI answered with instead.
+func (a *stealAgent) steal(t *testing.T, req *http.Request) (*http.Response, *proto.Error) {
+	t.Helper()
+	a.mu.Lock()
+	open := a.open
+	a.mu.Unlock()
+	if open == nil {
+		t.Fatal("the agent has no opener: no session")
+	}
+	s, err := open.OpenStream()
+	if err != nil {
+		t.Fatalf("open a stream toward the CLI: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := proto.NewEncoder(s).Encode(proto.TypeHTTP, proto.HTTPHeader{User: req.Header.Get("X-Dev-User")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := req.Write(s); err != nil {
+		t.Fatal(err)
+	}
+	s.SetReadDeadline(time.Now().Add(10 * time.Second))
+	br := bufio.NewReader(s)
+	// A CLI that is not taking requests answers with the proto error the
+	// session layer sends, not with an HTTP response. The first byte tells
+	// them apart: "{" is JSON Lines, "H" is HTTP/1.1.
+	first, err := br.Peek(1)
+	if err != nil {
+		t.Fatalf("the CLI answered nothing: %v", err)
+	}
+	if first[0] == '{' {
+		line, err := br.ReadBytes('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		var e proto.Error
+		if err := json.Unmarshal(line, &e); err != nil {
+			t.Fatalf("unparseable refusal %q: %v", line, err)
+		}
+		return nil, &e
+	}
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		t.Fatalf("reading the response off the stream: %v", err)
+	}
+	return resp, nil
+}
+
+// safeLog is Run's stderr for the tests below: Run writes to it from its own
+// goroutine while the test reads it, which a strings.Builder does not allow.
+type safeLog struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *safeLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *safeLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+func devRequest(method, path, user, token string) *http.Request {
+	r := httptest.NewRequest(method, "http://api.example.com"+path, nil)
+	r.Header.Set("X-Dev-User", user)
+	r.Header.Set("X-Dev-Token", token)
+	r.Header.Set("X-Forwarded-For", "203.0.113.5")
+	return r
+}
+
+func TestRunTakesAStolenRequestToTheDevelopersProcess(t *testing.T) {
+	port := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "LOCAL %s xff=%s", r.URL.Path, r.Header.Get("X-Forwarded-For"))
+	}))
+	ag := startStealAgent(t)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+
+	opts := ssmOpts("sleep", "30")
+	opts.NoIncoming = false
+	opts.LocalPort = port
+	opts.User = "shota"
+	opts.Token = "tok-shota"
+	var out safeLog
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() {
+		code, _ := RunWithDeps(ctx, opts, &out, depsFor(p))
+		done <- code
+	}()
+
+	// What the agent matches against has to arrive in the hello, all of it:
+	// the user name, the token, and both header names (config applies no
+	// defaults, and the agent reads an empty name as "matches nothing").
+	hello := ag.waitAttached(t)
+	if hello.User != "shota" || hello.Token != "tok-shota" {
+		t.Errorf("hello = user %q token %q, want both carried", hello.User, hello.Token)
+	}
+	if hello.Incoming != (proto.Incoming{Enabled: true, Header: "X-Dev-User", TokenHeader: "X-Dev-Token"}) {
+		t.Errorf("hello.Incoming = %+v", hello.Incoming)
+	}
+	waitFor(t, func() bool { return strings.Contains(out.String(), "✓ steal") }, "the steal line")
+	if l := out.String(); !strings.Contains(l, "X-Dev-User: shota") || !strings.Contains(l, fmt.Sprintf("localhost:%d", port)) {
+		t.Errorf("the steal line must say what is matched and where it goes: %s", l)
+	}
+
+	resp, perr := ag.steal(t, devRequest("GET", "/api/orders", "shota", "tok-shota"))
+	if perr != nil {
+		t.Fatalf("the CLI refused the stream: %+v", perr)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || !strings.Contains(string(b), "LOCAL /api/orders") {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, b)
+	}
+	if !strings.Contains(string(b), "xff=203.0.113.5") {
+		t.Errorf("the caller must reach the developer's process: %s", b)
+	}
+	waitFor(t, func() bool { return strings.Contains(out.String(), "/api/orders  200") }, "the request log line")
+	// The token must not be anywhere in what the developer's terminal saw.
+	if strings.Contains(out.String(), "tok-shota") {
+		t.Errorf("the token leaked into the log: %s", out.String())
+	}
+	cancel()
+	<-done
+}
+
+// Nothing in the repository configures steal: the agent must still be told
+// this session can take a request, on the default port and with the default
+// header names, because --no-incoming is the only way to turn steal off.
+func TestRunStealsOnTheDefaultPortWhenNothingConfiguresIt(t *testing.T) {
+	ag := startStealAgent(t)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+
+	opts := ssmOpts("sleep", "30")
+	opts.NoIncoming = false
+	opts.LocalPort = 0
+	opts.User = "shota"
+	opts.Token = "tok-shota"
+	var out safeLog
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() {
+		code, _ := RunWithDeps(ctx, opts, &out, depsFor(p))
+		done <- code
+	}()
+
+	if in := ag.waitAttached(t).Incoming; !in.Enabled {
+		t.Fatalf("incoming = %+v, want it enabled with no configuration at all", in)
+	}
+	waitFor(t, func() bool { return strings.Contains(out.String(), "✓ steal") }, "the steal line")
+	if l := out.String(); !strings.Contains(l, fmt.Sprintf("localhost:%d", DefaultLocalPort)) {
+		t.Errorf("the steal line must name the default port: %s", l)
+	}
+	cancel()
+	<-done
+}
+
+func TestRunWithNoIncomingTakesNothing(t *testing.T) {
+	port := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("the developer's process must not be reached at all: %s", r.URL.Path)
+	}))
+	ag := startStealAgent(t)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+
+	opts := ssmOpts("sleep", "30")
+	opts.NoIncoming = true
+	opts.LocalPort = port
+	opts.User = "shota"
+	opts.Token = "tok-shota"
+	var out safeLog
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() {
+		code, _ := RunWithDeps(ctx, opts, &out, depsFor(p))
+		done <- code
+	}()
+
+	hello := ag.waitAttached(t)
+	if hello.Incoming.Enabled {
+		t.Errorf("--no-incoming must not advertise incoming requests: %+v", hello.Incoming)
+	}
+	if hello.Token != "" {
+		t.Errorf("a session with nothing to match has no use for the token on the wire: %q", hello.Token)
+	}
+	waitFor(t, func() bool { return strings.Contains(out.String(), "✓ env") }, "the session to come up")
+	if strings.Contains(out.String(), "✓ steal") {
+		t.Errorf("--no-incoming must not print a steal line: %s", out.String())
+	}
+
+	// The backstop: an agent that steals anyway must be told why, so its
+	// proxy passes the request to the application instead of waiting on a
+	// stream nobody reads.
+	resp, perr := ag.steal(t, devRequest("GET", "/api/orders", "shota", "tok-shota"))
+	if perr == nil {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("the stream must be refused, got an HTTP response: %s", b)
+	}
+	if perr.Code != proto.CodeNoIncoming {
+		t.Errorf("refusal code = %q, want %q so the proxy knows to serve from the app", perr.Code, proto.CodeNoIncoming)
+	}
+	cancel()
+	<-done
+}
+
+// A session that advertises incoming requests with no token is one the
+// agent can never match: it would attach, print a green line, and leave
+// every request with the application forever. That has to be a startup
+// failure, before any AWS call and before the agent is dialled at all.
+func TestRunRefusesToTakeRequestsWithNoToken(t *testing.T) {
+	ag := startStealAgent(t)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+
+	opts := ssmOpts("true")
+	opts.NoIncoming = false
+	opts.LocalPort = 3000
+	opts.User = "shota"
+	opts.Token = ""
+	var out safeLog
+	code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p))
+	if code != 2 || err == nil {
+		t.Fatalf("code=%d err=%v, want exit 2 and a refusal", code, err)
+	}
+	if !strings.Contains(err.Error(), "token") {
+		t.Errorf("err = %q, want it to name the token", err)
+	}
+	select {
+	case <-ag.attached:
+		t.Error("the agent was dialled anyway; a value the developer gave must be checked first")
+	default:
+	}
+}
+
+// `tetherd env` and `tetherd doctor` attach to read the task and then exit.
+// A session either of them opened that advertised incoming requests would
+// have the agent steal them into a process that is about to be gone, and
+// would put the token on the wire for no reason - so both must attach with
+// incoming off no matter what the steal settings in RunOptions say. They
+// register no steal flags at all, which is why RunOptions can still carry
+// a port and a token here.
+func TestEnvAndDoctorAttachWithoutTakingRequests(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		run  func(t *testing.T, ag *stealAgent, p *fakeProvider)
+	}{
+		{"env", func(t *testing.T, ag *stealAgent, p *fakeProvider) {
+			opts := EnvOptions{RunOptions: ssmOpts(), Format: "dotenv"}
+			opts.NoIncoming = false
+			opts.LocalPort = 3000
+			opts.User = "shota"
+			opts.Token = "tok-shota"
+			var out, logs strings.Builder
+			if code, err := EnvRunWithDeps(context.Background(), opts, &out, &logs, depsFor(p)); err != nil || code != 0 {
+				t.Fatalf("code=%d err=%v logs=%s", code, err, logs.String())
+			}
+		}},
+		{"doctor", func(t *testing.T, ag *stealAgent, p *fakeProvider) {
+			opts := DoctorOptions{RunOptions: ssmOpts()}
+			opts.NoIncoming = false
+			opts.LocalPort = 3000
+			opts.User = "shota"
+			opts.Token = "tok-shota"
+			var out strings.Builder
+			DoctorRunWithDeps(context.Background(), opts, &out, depsFor(p))
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ag := startStealAgent(t)
+			p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a", DefinitionARN: "arn:def"}, agentAddr: ag.addr}
+			c.run(t, ag, p)
+			hello := ag.waitAttached(t)
+			if hello.Incoming != (proto.Incoming{}) {
+				t.Errorf("hello.Incoming = %+v, want nothing advertised", hello.Incoming)
+			}
+			if hello.Token != "" {
+				t.Errorf("hello.Token = %q, want no token on the wire for a session that takes nothing", hello.Token)
+			}
+		})
+	}
+}
+
+// --- the whole hop: the agent's real proxy in front of the CLI's real receiver
+
+// pairedRun stands up everything a stolen request actually passes through:
+// the application container, a real agent with its real reverse proxy in
+// front of it, and a real `tetherd run` attached with a real StealServer.
+// Requests go in at the agent's proxy address, which is where the ALB puts
+// them.
+//
+// Each side is already pinned in isolation - internal/agent/proxy_test.go
+// for the agent's half, steal_test.go for this one - and both read
+// proto.NoListenerHeader, so the spelling cannot drift. What only this can
+// check is the wire-level agreement: that what the CLI actually emits is
+// what the agent actually keys on.
+type pairedRun struct {
+	proxyAddr string
+	appHits   func() int
+	out       *safeLog
+}
+
+func startPair(t *testing.T, localPort int, app http.HandlerFunc) *pairedRun {
+	t.Helper()
+	var mu sync.Mutex
+	hits := 0
+	appSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		app(w, r)
+	}))
+	t.Cleanup(appSrv.Close)
+
+	ag := startAgentForWithApp(t, map[string]string{"A": "1"}, appSrv.Listener.Addr().String())
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+
+	opts := ssmOpts("sleep", "30")
+	opts.NoIncoming = false
+	opts.LocalPort = localPort
+	opts.User = "shota"
+	opts.Token = "tok-shota"
+	out := &safeLog{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() {
+		code, _ := RunWithDeps(ctx, opts, out, depsFor(p))
+		done <- code
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	waitFor(t, func() bool { return strings.Contains(out.String(), "✓ steal") }, "the steal line")
+	return &pairedRun{
+		proxyAddr: ag.proxyAddr,
+		appHits:   func() int { mu.Lock(); defer mu.Unlock(); return hits },
+		out:       out,
+	}
+}
+
+// do sends one request the way the ALB would and returns the response the
+// public caller sees.
+func (p *pairedRun) do(t *testing.T, method, path string, hdrs map[string]string) (*http.Response, string) {
+	t.Helper()
+	r, err := http.NewRequest(method, "http://"+p.proxyAddr+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Host = "api.example.com"
+	r.Header.Set("X-Forwarded-For", "203.0.113.5")
+	for k, v := range hdrs {
+		r.Header.Set(k, v)
+	}
+	// No keep-alives: each request is its own connection, so one case
+	// cannot inherit a pooled connection from the previous one.
+	c := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := c.Do(r)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp, string(b)
+}
+
+func devHeaders(user, token string) map[string]string {
+	return map[string]string{"X-Dev-User": user, "X-Dev-Token": token}
+}
+
+// The brief's integration case, against the agent's real matching rather
+// than a stand-in's: a request carrying this developer's name and token
+// reaches their laptop, and everything else stays with the application.
+func TestRunStealsThroughTheRealAgentProxy(t *testing.T) {
+	local := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "LOCAL %s xff=%s host=%s", r.URL.Path, r.Header.Get("X-Forwarded-For"), r.Host)
+	}))
+	pair := startPair(t, local, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "APP %s", r.URL.Path)
+	})
+
+	_, body := pair.do(t, "GET", "/api/orders", devHeaders("shota", "tok-shota"))
+	if !strings.Contains(body, "LOCAL /api/orders") {
+		t.Errorf("a matching request must reach the laptop, got %q", body)
+	} else if !strings.Contains(body, "xff=203.0.113.5") || !strings.Contains(body, "host=api.example.com") {
+		t.Errorf("the caller and the host must survive both hops, got %q", body)
+	}
+	if _, body := pair.do(t, "GET", "/api/orders", nil); !strings.Contains(body, "APP /api/orders") {
+		t.Errorf("an unmatched request must reach the app, got %q", body)
+	}
+	if _, body := pair.do(t, "GET", "/api/orders", devHeaders("shota", "wrong")); !strings.Contains(body, "APP /api/orders") {
+		t.Errorf("a wrong token must reach the app, got %q", body)
+	}
+	if _, body := pair.do(t, "GET", "/api/orders", devHeaders("someone-else", "tok-shota")); !strings.Contains(body, "APP /api/orders") {
+		t.Errorf("another developer's name must reach the app, got %q", body)
+	}
+	// The token must not be anywhere in what this developer's terminal saw.
+	if strings.Contains(pair.out.String(), "tok-shota") {
+		t.Errorf("the token leaked into the log: %s", pair.out.String())
+	}
+}
+
+// docs/e2e-aws.md row 24, end to end, across the one thing neither side can
+// check alone: that the 502 the CLI emits for a failed dial is the 502 the
+// agent keys on, and that a 502 which is not that one is relayed untouched.
+func TestRunRow24FallsBackToTheAppOnlyWhenNothingIsListening(t *testing.T) {
+	t.Run("nothing listening on the laptop: the caller gets the app's answer", func(t *testing.T) {
+		// Port 1 needs no listener of its own to be refused.
+		pair := startPair(t, 1, func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			fmt.Fprintf(w, "APP %s body=%q", r.URL.Path, string(b))
+		})
+		resp, body := pair.do(t, "GET", "/api/orders", devHeaders("shota", "tok-shota"))
+
+		// 1. the application's answer, body intact.
+		if resp.StatusCode != 200 || !strings.Contains(body, `APP /api/orders body=""`) {
+			t.Fatalf("status=%d body=%q, want the application's own answer", resp.StatusCode, body)
+		}
+		// 2. the hop's header must not reach the public caller.
+		if got := resp.Header.Get("X-Tetherd-No-Listener"); got != "" {
+			t.Errorf("X-Tetherd-No-Listener = %q on a response out of a public ALB", got)
+		}
+		// 3. exactly once - a fallback that ran the request twice would be
+		//    the bug the narrowness exists to prevent.
+		if n := pair.appHits(); n != 1 {
+			t.Errorf("the application handled the request %d times, want exactly 1", n)
+		}
+		// 4. and the developer is told, on their own terminal, why.
+		waitFor(t, func() bool {
+			return strings.Contains(pair.out.String(), "nothing is listening on 127.0.0.1:1")
+		}, "the CLI to name the port nothing is listening on")
+	})
+
+	t.Run("the laptop's own 502 is relayed, not replayed", func(t *testing.T) {
+		local := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The developer's own application answering 502: it has the
+			// request and may have acted on it.
+			w.WriteHeader(http.StatusBadGateway)
+			fmt.Fprint(w, "LOCAL 502 from my own app")
+		}))
+		pair := startPair(t, local, func(w http.ResponseWriter, r *http.Request) {
+			t.Errorf("the application must not be reached at all: %s", r.URL.Path)
+		})
+		resp, body := pair.do(t, "POST", "/api/orders", devHeaders("shota", "tok-shota"))
+		if resp.StatusCode != http.StatusBadGateway || !strings.Contains(body, "LOCAL 502 from my own app") {
+			t.Fatalf("status=%d body=%q, want the laptop's own 502 relayed", resp.StatusCode, body)
+		}
+		if n := pair.appHits(); n != 0 {
+			t.Errorf("the application handled the request %d times, want 0: replaying a POST that already ran is worse than relaying the 502", n)
+		}
+	})
+}

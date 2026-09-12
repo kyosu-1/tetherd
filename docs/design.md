@@ -33,7 +33,7 @@ $ tetherd run -- go run ./cmd/api
 
 - app コンテナの **実行中の環境変数**（secrets 解決済み）を agent が読み取り、ローカルプロセスに注入する。開発者に Secrets Manager の権限は不要
 - 子プロセス（と子孫）の VPC 内宛ての TCP をカーネル層で捕まえ、タスクの ENI から出す（透過 outgoing）。DNS は VPC 内ドメインだけ agent 側で解決する
-- タスクロールの認証情報エンドポイント（169.254.170.2）もそのまま通し、SDK をタスクロールとして動かす
+- タスクロールの認証情報を `127.0.0.1` の口から配り（env で教える）、ローカルの SDK をタスクロールとして動かす
 - ALB → サイドカー経由で、ユーザー名 + トークンが一致する HTTP リクエストを手元に引き込む（steal）
 - 以上を 1 本の制御チャネル（ECS Exec / SSM）に多重化する。タスクが複数あれば全部に繋ぐ
 
@@ -157,8 +157,8 @@ SG の変更は sg-app のインバウンド 8081 → 8080 の 1 点だけ。RDS
 $ tetherd run -- go run ./cmd/api
 tetherd  dev/api  2 tasks (3f9c… primary, a17e…)  (started 12m ago)
   ✓ env      41 vars, 6 secrets resolved
-  ✓ network  transparent (pf rdr, gid tetherd) · remote: 10.0.0.0/16, 169.254.170.0/24 · DNS: local (+ myapp.internal via VPC)
-  ✓ iam      arn:aws:sts::…:assumed-role/myapp-dev-api-task/…  (via 169.254.170.2)
+  ✓ network  transparent (pf rdr, gid tetherd) · remote: 10.0.0.0/16 · DNS: local (+ myapp.internal via the VPC resolver on 127.0.0.1:15353)
+  ✓ iam      arn:aws:sts::…:assumed-role/myapp-dev-api-task/…  (via 127.0.0.1:53821 → the task)
   ✓ steal    X-Dev-User: shota (+ X-Dev-Token)  → localhost:8080
   ▶ go run ./cmd/api
 2026/09/11 10:12:03 listening on :8080
@@ -249,7 +249,7 @@ tetherd  ✗ Refusing to attach: agent reports TETHERD_ENV=prod
 **pf ルール**（ヘルパーが `com.apple/900.tetherd` 子アンカーにメモリ上でロード。ディスクには書かない）
 
 ```
-table <tetherd_remote> { 10.0.0.0/16, 169.254.170.0/24 }
+table <tetherd_remote> { 10.0.0.0/16 }
 rdr pass on lo0 inet proto tcp from any to <tetherd_remote> -> 127.0.0.1 port 15300
 pass out route-to lo0 inet proto tcp from any to <tetherd_remote> group tetherd keep state
 ```
@@ -270,7 +270,7 @@ utun に `route-to` してユーザー空間スタックで終端する案は、
 - pf の唯一の罠は `/etc/pf.conf` にアンカー参照を書くと OS 更新で消えること。そこで **ディスクには触らず**、既定の `/etc/pf.conf` がすでに持つワイルドカード参照 `rdr-anchor "com.apple/*"` / `anchor "com.apple/*"` に乗る子アンカー `com.apple/900.tetherd` にルールをロードする。メインルールセットには一切手を入れない。`pfctl -E` / `-X` の参照カウントで有効化する（`/etc/pf.conf` のコメントに書かれている作法）
 - Ventura 以降は LaunchDaemon 追加時に「バックグラウンド項目が追加されました」と通知が出てユーザーが無効化できるので、`doctor` がヘルパー無応答を検出して「システム設定 → 一般 → ログイン項目」を案内する
 - 新 macOS の初期リリースでファイアウォール周りが変わることがある（Sequoia 15.0 で一部 VPN が数週間通信不能になった例）ので、毎年夏のベータで動作確認する
-- ヘルパーが受け付ける操作は `pf.apply` / `pf.clear` / `resolver.set` / `resolver.clear` / `natlook` の 5 つだけ。コマンドを起動する操作は無い。接続元は `admin` グループのユーザーに限定（UNIX ソケット + peer credential）
+- ヘルパーが受け付ける操作は `pf.apply` / `pf.clear` / `resolver.set` / `resolver.clear` / `natlook` / `route.set` / `route.clear` の 7 つだけ。コマンドを起動する操作は無い。接続元は `admin` グループのユーザーに限定（UNIX ソケット + peer credential）
 - 同一マシンでの同時セッションは 1 つ（gid を共有する以上 pf が区別できない）。複数サービス同時接続は v2 でセッションごとに gid を分ける
 - ヘルパーを入れられない端末向けには、OrbStack / Docker Desktop の Linux VM 内で v2 の netns 方式を使う逃げ道を想定する
 
@@ -279,17 +279,17 @@ utun に `route-to` してユーザー空間スタックで終端する案は、
 **宛先 IP で決める。既定は「VPC の中だけリモート、それ以外は全部ラップトップから」。** `<tetherd_remote>` の中身:
 
 1. 対象タスクが属する VPC の CIDR（`DescribeTasks` → ENI の subnet → `DescribeSubnets` → `DescribeVpcs`。セカンダリ含む。自動）
-2. `169.254.170.0/24`（タスクロールの認証情報 + タスクメタデータ）
-3. `network.remote_cidrs`（ピアリング先 VPC、Transit Gateway 越しのオンプレなど）
-4. `network.remote_services` に書いた AWS サービスの managed prefix list（S3 / DynamoDB）
+2. `network.remote_cidrs`（ピアリング先 VPC、Transit Gateway 越しのオンプレなど）
+3. `network.remote_services` に書いた AWS サービスの managed prefix list（S3 / DynamoDB）
+4. `network.pin_credential_route: true` のときだけ `169.254.170.0/24`（既定では**入らない**。下記）
 
-から `network.local_cidrs` を除く。引き算は範囲を分割する正確なもので、`10.0.0.0/16` から `10.0.5.0/24` を除けば残りは 8 個のプレフィックスになる（pf は 1 つのテーブルに集合として持つ）。ただし 2 の `169.254.170.0/24` だけは引かれない床で、`local_cidrs` に何を書いても残る — ここが捕捉から外れると子プロセスはタスクロールを失い、開発者自身の身元で動いてしまうため。`local_cidrs` が床以外のすべてを消した場合は、起動時にエラーにして `local_cidrs` を名指しする（`10.0.0.0/8` と書いて `10.0.0.0/16` の VPC を丸ごと消す、が現実的な失敗）。インターネット、localhost、LAN は子プロセスからそのまま出る。`go run` のモジュール取得や `npm install`、外部 API はラップトップの回線で、dev タスクの ENI を踏み台にした egress は既定で存在しない。mirrord の「egress IP まで Pod」とは逆の側を取る。
+から `network.local_cidrs` を除く。引き算は範囲を分割する正確なもので、`10.0.0.0/16` から `10.0.5.0/24` を除けば残りは 8 個のプレフィックスになる（pf は 1 つのテーブルに集合として持つ）。`pin_credential_route` を有効にしたときだけ `169.254.170.0/24` が引かれない床になり、`local_cidrs` に何を書いても残る — 固定しておきながら捕捉から外すと、そのアドレスが lo0 に吸い込まれたまま誰も応答しない状態になるため。`local_cidrs` が（床以外の）すべてを消した場合は、起動時にエラーにして `local_cidrs` を名指しする（`10.0.0.0/8` と書いて `10.0.0.0/16` の VPC を丸ごと消す、が現実的な失敗）。インターネット、localhost、LAN は子プロセスからそのまま出る。`go run` のモジュール取得や `npm install`、外部 API はラップトップの回線で、dev タスクの ENI を踏み台にした egress は既定で存在しない。mirrord の「egress IP まで Pod」とは逆の側を取る。
 
 macOS の DNS は `mDNSResponder` が出すので pf の group マッチでは見えず、**ホスト名での振り分けは不可**。これが CIDR ベースにする理由でもある。VPC CIDR とラップトップの LAN が重なると、その範囲の LAN 宛通信（子プロセスのものだけ）がリモートに回るので、`run` が起動時に警告して `local_cidrs` を案内する。
 
 ### VPC 外の AWS サービスとタスクロール
 
-S3 / DynamoDB / SQS / Secrets Manager / Bedrock など VPC 外のサービスは既定のままで動く。SDK は `169.254.170.2`（トンネル経由）から一時クレデンシャルを取り、以降は SigV4 署名でパブリックエンドポイントに直接送る。署名が正しければ送信元 IP がラップトップでも受け付けられる。
+S3 / DynamoDB / SQS / Secrets Manager / Bedrock など VPC 外のサービスは既定のままで動く。SDK は tetherd が開くループバック口（そこからトンネル経由でタスクの `169.254.170.2` へ）から一時クレデンシャルを取り、以降は SigV4 署名でパブリックエンドポイントに直接送る。署名が正しければ送信元 IP がラップトップでも受け付けられる。
 
 動かないのは IAM / バケット / SCP / エンドポイントポリシーに **ネットワーク条件**（`aws:SourceVpc` / `aws:SourceVpce` / `aws:SourceIp`）がある場合。Interface endpoint（private DNS 有効）なら `remote_domains` にサービスのドメインを書けば agent 側でプライベート IP に解けて VPC CIDR に入る。Gateway endpoint（S3 / DynamoDB）は `remote_services` で prefix list をリモート集合に足す。条件が無い環境ではラップトップ経路のほうが緩く（NAT の無い VPC でもラップトップは自前で出られる）、CloudTrail の `sourceIPAddress` はラップトップの IP になる。
 
@@ -299,9 +299,21 @@ S3 / DynamoDB / SQS / Secrets Manager / Bedrock など VPC 外のサービスは
 
 **Linux（v2、netns）**: 名前空間内の `/etc/resolv.conf`（mount namespace も必要）をリゾルバに差し替え、既定で全部 agent 側で解決する。
 
-### 副産物: タスクロールが自動で効く
+### タスクロールの届け方（v0.3a で設計変更）
 
-タスクの env には `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` が入っていて、SDK はそれを見て `169.254.170.2` に認証情報を取りに行く。透過モードではこの通信も捕まって agent 経由でタスク内の本物のエンドポイントに届くので、**追加実装なしで SDK がタスクロールとして振る舞う**。`ECS_CONTAINER_METADATA_URI_V4` も同様。`run` は起動時に同じ経路でクレデンシャルを取り `sts:GetCallerIdentity` で確認して表示する。ただし「自動で効く」ためには、開発者の `~/.aws/config` の `default` プロファイルがコンテナクレデンシャルを覆い隠さないようにする必要がある（SDK のチェーンは共有設定のほうが先）。tetherd は透過モードでタスクロールが使えるとき、子プロセスの `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` を空ファイルに向けてこの層を外し、リージョンを明示注入する。
+タスクの env には `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` が入っていて、SDK はそれを見て `169.254.170.2` に認証情報を取りに行く。このアドレスはタスクの中にしか存在しない。
+
+**当初の設計（透過）と、実機で壊れた理由。** `169.254.170.0/24` を捕捉範囲に入れて pf で agent に流せば「追加実装なしで SDK がタスクロールとして振る舞う」はずだった。実際には `connect()` のルート探索が pf の出力ルールより**先**に走る。macOS はこのアドレスへの ARP を LAN に投げて失敗し、en0 上に使えないホストルートを残す（`route -n get` で `LLINFO` と負の `expire`、`netstat -rn` では末尾に `!`）。そのエントリが生きている間はカーネルが `EHOSTUNREACH` を即返し、**pf はパケットを一度も見ない**。v0.2b の実機検証で、同じ子プロセス・同じ gid なのに `curl` は 200 を得て AWS CLI 同梱の python は `Errno 65` で落ちた。ARP エントリの期限で成否が変わるので、間欠的に壊れる。
+
+lo0 への host route を張れば探索は必ず成功する。しかしその固定は**マシン全体**に効き、pf の `rdr`（変換ルール）は `group` 句を受け付けないので gid で絞れない（filter ルールは受け付ける）。つまりセッション中は `tetherd` グループ以外のプロセスも `169.254.170.2` で dev タスクの認証情報に到達する。§17 の比較表に載っている `amazon-ecs-local-container-endpoints` はこのアドレスを lo0 に alias して使うので、衝突相手が実在し、しかも「相手のツールが壊れる」だけでなく「相手がタスクのロールを掴む」という形になる。
+
+**現在の設計（ループバック）。** CLI が `127.0.0.1` の空きポートに小さな HTTP 口を開き、来たリクエストを既存のセッション経由で `169.254.170.2` に転送する。子プロセスには env でそこを教える — `AWS_CONTAINER_CREDENTIALS_FULL_URI` と、メタデータの 3 変数のホストを書き換える（パスはそのまま転送されるので 1 ポートで足りる）。AWS SDK は `FULL_URI` のホストがループバックなら平文 HTTP をトークンなしで受理する（aws-sdk-go-v2 の `isAllowedHost` が `ip.IsLoopback()` を許可）。
+
+これで root 操作が要らなくなり、拒否ルートの問題そのものが消える（誰も `169.254.170.2` に接続しない）。pf の捕捉範囲にも依存しない。
+
+代償は 2 つある。第一に「透過ではなくなる」こと — env を読まずにアドレスを直書きしているツールには届かない。そのために `network.pin_credential_route: true` を残してある（元の固定方式に戻す逃げ道。影響範囲は上記のまま、既定は無効）。第二に、この口は**無認証**で、ループバックの listener は同一マシンの全プロセスから到達可能だということ。uid でもプロセスツリーでも絞られない — セッション中は同じマシンのどのプロセスでもタスクロールの認証情報を取れる。固定方式より狭いのは「毎回変わるポートで、広告もされない」点だけで、「子プロセスに閉じている」わけではない。信頼境界は既存の SSM ローカルフォワード（`127.0.0.1:9900`）と同じ「同一マシンに閉じるが、それ自体が境界」で、§11 に記載する。
+
+なお、どちらの方式でも必要なことが 1 つある。開発者の `~/.aws/config` の `default` プロファイルと、環境変数のローカル認証情報は、SDK のチェーンでコンテナ認証情報より**先**に解決されるので、放っておくとタスクロールを覆い隠す（これも実機で踏んだ）。tetherd は子プロセスの `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` を空ファイルに向けてこの層を外し、ローカルの認証情報変数 15 個を子の env から取り除き、リージョンを明示注入する。`run` は起動時に同じ経路でクレデンシャルを取り `sts:GetCallerIdentity` で確認して表示する。
 
 ### v2 で扱うもの
 
@@ -461,7 +473,7 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 
 - 認証は AWS SDK の標準チェーン（SSO プロファイル、アクセスキー、AssumeRole）をそのまま使う。tetherd が `ssm:StartSession` を呼んでストリーム URL とトークンを得て session-manager-plugin に渡す（AWS CLI と同じ手順だが AWS CLI 自体は不要）
 - IAM Identity Center（SSO）では `${aws:username}` が無いので `OwnSessions` の Resource は `arn:aws:ssm:*:*:session/*` にする
-- 透過モードでは 169.254.170.2 が素通しになるので、開発者はローカルからタスクロールの権限を実質的に使える。「dev タスクができることは開発者もできる」という意味で dev では通常許容範囲だが、タスクロールが必要以上に広くないかは一度見ておく
+- タスクロールの認証情報は CLI のループバック口から（`pin_credential_route` を有効にしたときは `169.254.170.2` の固定経路からも）ラップトップに届くので、開発者はローカルからタスクロールの権限を実質的に使える。「dev タスクができることは開発者もできる」という意味で dev では通常許容範囲だが、タスクロールが必要以上に広くないかは一度見ておく
 
 ---
 
@@ -483,7 +495,7 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 
 **特権ヘルパー（macOS）**
 
-- 受け付ける操作は `pf.apply` / `pf.clear` / `resolver.set` / `resolver.clear` / `natlook` の 5 つだけ。任意コマンドの root 実行はできず、コマンドを起動する操作も無い
+- 受け付ける操作は `pf.apply` / `pf.clear` / `resolver.set` / `resolver.clear` / `natlook` / `route.set` / `route.clear` の 7 つだけ。任意コマンドの root 実行はできず、コマンドを起動する操作も無い。`route.set` は `pin_credential_route` を有効にしたときだけ使われ、既定では呼ばれない
 - 接続元は `admin` グループのユーザーの tetherd CLI に限定（UNIX ソケット + peer credential 検証）
 - CLI が異常終了しても pf ルールや resolver ファイルが残らないよう、ヘルパーが CLI の接続断で掃除する
 - setgid `tetherd` のラッパーで増える権限は「pf に捕まる」ことだけ
@@ -513,7 +525,7 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 | env / secrets | agent が Pod 内プロセスの /proc/pid/environ を読む | 同じ。agent が app の /proc/pid/environ を読む（pidMode: task）。開発者に Secrets Manager 権限は不要 |
 | 受信の取り方 | L4（iptables / raw socket）。任意 TCP | L7 リバースプロキシ。HTTP/1.1 中心、gRPC / WS は個別対応 |
 | 振り分けの粒度 | `connect()` 単位。`getaddrinfo` も見ているのでホスト名で local / remote を選べる | 宛先 CIDR。macOS の DNS は mDNSResponder が出すのでホスト名では見えない |
-| IAM の身元 | Pod の SA トークンが env / ファイル経由で効く | 169.254.170.2 が透過で通り、タスクロールが自動で効く |
+| IAM の身元 | Pod の SA トークンが env / ファイル経由で効く | CLI がループバック口を開き、env（`AWS_CONTAINER_CREDENTIALS_FULL_URI` とメタデータ 3 変数）でそこを指すのでタスクロールが自動で効く。透過ではないため、env を読まずに `169.254.170.2` を直書きするツールには届かない（`pin_credential_route` が逃げ道） |
 | 接続体験 | kube port-forward、1 秒未満 | SSM 中継、2〜3 秒。VPN 不要。運ぶ層は Tailscale に差し替え可 |
 | 複数人 | OSS 版は弱く、Operator（有償）で解決 | ユーザー名単位の多重接続とヘッダー振り分けが中核 |
 | 本番観察 | 読み取り専用で可能 | 意図的に禁止 |
@@ -536,7 +548,7 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 | AWS Copilot `run local --proxy` | ECS（Copilot 管理下） | Service Connect のサービスと RDS のみ。Docker の pause コンテナ内で宛先ごとに SSM ポートフォワード + iptables REDIRECT + /etc/hosts | なし | タスク定義の env/secrets を注入。IAM はラップトップの資格情報 | コンセプトの先行例。Docker 内実行・既知ホスト限定・受信なし。**2026-06-12 サポート終了** |
 | ecsta（fujiwara） | ECS | 1 ポートの SSM フォワード | なし | なし | ③運ぶ層の部品として同じ API を使う。`doctor` / タスク選択 UX の参考 |
 | Tailscale subnet router on Fargate | VPC 全体 | マシン単位で VPC に透過到達 | なし | なし | ネットワークだけなら最短の代替。プロセス単位でなく、env・IAM・steal は別途必要。将来の③の選択肢 |
-| amazon-ecs-local-container-endpoints | ローカル Docker | なし | なし | 169.254.170.2 をローカルで模倣（資格情報はラップトップのもの） | tetherd は透過経路で本物に届くので模倣が不要 |
+| amazon-ecs-local-container-endpoints | ローカル Docker | なし | なし | 169.254.170.2 を lo0 に alias してローカルで模倣（資格情報はラップトップのもの） | 模倣が不要なのは同じだが、関係はそれより強い: このツールとの衝突が、tetherd が透過方式をやめてループバック口に替えた理由の 1 つ（§6「タスクロールの届け方」）。透過だと衝突相手が壊れるだけでなく**タスクの**ロールを掴むことになる。既定のループバック口なら衝突しない。衝突するのは `pin_credential_route` を有効にしたときだけ |
 | sshuttle / tun2socks / gvisor-tap-vsock | 汎用 | 透過（pf/iptables + ユーザー空間スタック） | — | — | §6 の技術的前例。v1 の pf rdr + `DIOCNATLOOK` は sshuttle の macOS 実装そのもの |
 | Cloud Code / `gcloud beta code dev`（Cloud Run） | ローカル Docker | なし | なし | ADC or SA 鍵 | Cloud Run 側には Copilot 相当の先行例すら無い |
 
@@ -557,7 +569,7 @@ tetherd は「Kubernetes を使わないサーバーレスコンテナのため�
 | 複数インスタンス | RUNNING な全タスクに繋ぐ | リクエストの着地インスタンスを制御できない。dev は min=max=1 なら (a) で足りる。それ以外は (b) のリレーが必要 |
 | CPU / スケール | 常時割り当て | リクエスト外は CPU スロットリング。(a) は WebSocket がリクエスト扱いで CPU が付くが 60 分で切れるので再接続。(b) は CPU 常時割り当てが必要。scale-to-zero を避けるため min=1 |
 | env | agent が /proc から | 同じ（マルチコンテナで PID 共有可否は要確認。不可なら Secret Manager 経由のフォールバック） |
-| IAM の透過 | 169.254.170.2（タスクロール） | metadata.google.internal（サービスアカウント） |
+| IAM エンドポイントのアドレス | 169.254.170.2（タスクロール）。透過では届かないので CLI のループバック口がここへ転送する | metadata.google.internal（サービスアカウント） |
 | 認証 | IAM（ssm:StartSession） | Cloud Run IAM（invoker）+ ID トークン |
 
 **実装方針**: v1 ではプロバイダのインターフェースを切らず、ECS 固有部分を `internal/provider/ecs` に寄せるだけにする（実装が 1 つの段階で抽象を切ると ECS の都合に歪む）。ただし③運ぶ層（`Transport`）と①捕まえる層（`Capturer`）は v1 から インターフェースを持つ。Cloud Run を足すときに `provider/cloudrun` を書きながら共通インターフェースを抽出する。リレーサービスが必要になれば同じリポジトリのオプションコンポーネントとして置く。

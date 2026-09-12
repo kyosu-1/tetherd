@@ -13,6 +13,7 @@ import (
 type DarwinPlatform struct {
 	pf       pf.Pfctl
 	resolver Resolver
+	route    Router
 	logf     func(string, ...any)
 
 	mu    sync.Mutex
@@ -28,7 +29,16 @@ func NewDarwinPlatform(run pf.Runner, resolverDir string, logf func(string, ...a
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &DarwinPlatform{pf: pf.Pfctl{Run: run}, resolver: Resolver{Dir: resolverDir}, logf: logf}
+	return &DarwinPlatform{
+		pf:       pf.Pfctl{Run: run},
+		resolver: Resolver{Dir: resolverDir},
+		// The Router logs every route(8) delete through the helper's log:
+		// it can remove an entry it did not create, and that has to be
+		// findable afterwards. PinFile is how a helper that was killed
+		// leaves a record of its own pins for the next one.
+		route: Router{Logf: logf, PinFile: DefaultPinFile},
+		logf:  logf,
+	}
 }
 
 // PfApply enables pf (once) and loads the session rules into the anchor.
@@ -73,21 +83,57 @@ func (p *DarwinPlatform) ResolverSet(domains []string, port int) error {
 // ResolverClear removes them.
 func (p *DarwinPlatform) ResolverClear() error { return p.resolver.Clear() }
 
+// RouteSet pins the hosts to lo0 with route(8). The lock is the same one
+// Shutdown takes, so a helper exiting mid-session cannot race the pin.
+func (p *DarwinPlatform) RouteSet(hosts []netip.Addr) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.route.Set(hosts)
+}
+
+// RouteClear removes the routes this helper pinned.
+func (p *DarwinPlatform) RouteClear() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.route.Clear()
+}
+
 // NatLook queries /dev/pf.
 func (p *DarwinPlatform) NatLook(proto string, src, dst netip.AddrPort) (netip.AddrPort, error) {
 	return NatLookPF(proto, src, dst)
 }
 
-// Shutdown clears everything and releases the pf reference. Called when the
-// helper exits, and at startup to remove leftovers from a crashed run.
-func (p *DarwinPlatform) Shutdown() error {
+// Shutdown clears what this helper installed and releases the pf reference.
+// Called when the helper exits.
+func (p *DarwinPlatform) Shutdown() error { return p.teardown(false) }
+
+// ClearLeftovers is Shutdown plus the state a *previous* helper process may
+// have left on this machine, and belongs at startup only. Router.set lives
+// in memory, so a helper killed with SIGKILL leaves 169.254.170.2 pointing
+// at lo0 with nothing listening, and from then on every AWS SDK on the
+// machine hangs on the credential endpoint instead of failing fast. The pin
+// record (Router.PinFile) is what survives that process, and it is the only
+// thing consulted here: a route tetherd did not write down is somebody
+// else's.
+func (p *DarwinPlatform) ClearLeftovers() error { return p.teardown(true) }
+
+func (p *DarwinPlatform) teardown(leftovers bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var firstErr error
-	if err := p.pf.FlushAnchor(pf.Anchor); err != nil {
+	// resolver, then route, then pf: the reverse of what depends on what.
+	// The resolver files are useless without the route and the rules, and a
+	// route pinned to lo0 after the rdr rule is gone is a black hole, since
+	// a packet to a non-local address on lo0 is dropped.
+	if err := p.resolver.Clear(); err != nil {
 		firstErr = err
 	}
-	if err := p.resolver.Clear(); err != nil && firstErr == nil {
+	if leftovers {
+		p.route.ClearRecorded()
+	} else if err := p.route.Clear(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := p.pf.FlushAnchor(pf.Anchor); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if p.token != "" {

@@ -92,9 +92,12 @@ func newRunCommand() *cobra.Command {
 			opts.Command = args
 			// Fill in what the flags did not set: personal file, then the
 			// shared file, then the defaults already on the flags (spec §6.7).
-			if err := applyConfig(cmd, &opts); err != nil {
+			cfg, err := applyConfig(cmd, &opts)
+			if err != nil {
 				return err
 			}
+			// The steal settings, whose flags only this command has.
+			applyIncoming(cmd, cfg, &opts)
 			code, err := runFn(opts)
 			if err != nil {
 				if code == 0 {
@@ -115,6 +118,28 @@ func newRunCommand() *cobra.Command {
 	f.StringVar(&opts.ExecPath, "exec-path", helper.ExecInstallDir+"/"+helper.ExecName, "path of the setgid tetherd-exec")
 	f.BoolVar(&opts.NoNetwork, "no-network", false, "do not capture traffic (only connect to the agent)")
 	f.BoolVar(&opts.NoEnv, "no-env", false, "do not inject the task's environment into the command")
+	// The steal flags. They are registered here and not in addTargetFlags
+	// because `env` and `doctor` attach to read the task, never to take a
+	// request off it - and applyIncoming's changed() guards look these
+	// names up, so registering them on a command that does not want them
+	// would be how they arrive there.
+	f.BoolVar(&opts.NoIncoming, "no-incoming", false, "do not take any incoming request, whatever incoming.local_port says")
+	f.IntVar(&opts.LocalPort, "local-port", 0, fmt.Sprintf("port your own process listens on; requests matching your name and token are proxied there (overrides incoming.local_port; default: %d)", DefaultLocalPort))
+	f.StringVar(&opts.As, "as", "", "the name the agent matches the request's user header against (default: your configured user)")
+	// --as is the spec's name for this (§6.5) and --user was v0.2b
+	// diverging from it. Two visible flags for one field is a wart that
+	// gets permanent the moment someone scripts it, so --user keeps
+	// working (nothing already written breaks) but is warned about and
+	// dropped from the help. MarkDeprecated sets Hidden itself, and leaves
+	// Changed alone - which is what applyConfig's guard on "user" reads.
+	//
+	// Deprecated here and not in addTargetFlags: `env` and `doctor` have no
+	// --as to move to, so --user is still their only way to name the user.
+	if err := f.MarkDeprecated("user", "use --as instead"); err != nil {
+		// Only reachable by renaming the flag out from under this line,
+		// which is exactly the silent no-op worth crashing over.
+		panic("tetherd: cannot deprecate --user: " + err.Error())
+	}
 	return cmd
 }
 
@@ -131,7 +156,7 @@ func newEnvCommand() *cobra.Command {
 			"unless --reveal is given.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := applyConfig(cmd, &opts.RunOptions); err != nil {
+			if _, err := applyConfig(cmd, &opts.RunOptions); err != nil {
 				return err
 			}
 			code, err := envFn(opts)
@@ -158,7 +183,7 @@ func newDoctorCommand() *cobra.Command {
 		Short: "Check that this machine and the dev service are set up for tetherd",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := applyConfig(cmd, &opts.RunOptions); err != nil {
+			if _, err := applyConfig(cmd, &opts.RunOptions); err != nil {
 				return err
 			}
 			// A bound the operator did not type must reach DoctorRun as

@@ -2,8 +2,8 @@ resource "aws_security_group" "app" {
   name   = "${var.name}-app"
   vpc_id = aws_vpc.this.id
   ingress {
-    from_port       = 8081
-    to_port         = 8081
+    from_port       = 8080
+    to_port         = 8080
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
   }

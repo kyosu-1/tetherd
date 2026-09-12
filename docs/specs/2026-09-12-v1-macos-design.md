@@ -12,7 +12,7 @@
 | 成果物 | チームに `brew install` で配れる v1 | — |
 | 捕まえる層 | pf `rdr` + `DIOCNATLOOK`（sshuttle 方式）。終端はカーネルの TCP | utun + gVisor netstack → 不採用（v2 で Linux netns と共に検討） |
 | プロセスのスコープ | primary gid = `tetherd`。setgid ラッパー `tetherd-exec` で起動 | 補助グループ → primary gid（pf は effective gid しか見ない）。helper が spawn → CLI の子のまま |
-| ルーティング | 宛先 IP。VPC CIDR + `169.254.170.0/24` + 追加 CIDR + prefix list だけリモート | 「全部リモート」「ホスト名で local 指定」→ CIDR ベース。§14 未決の第 1 項を決着 |
+| ルーティング | 宛先 IP。VPC CIDR + 追加 CIDR + prefix list だけリモート（`169.254.170.0/24` は `pin_credential_route` のときだけ） | 「全部リモート」「ホスト名で local 指定」→ CIDR ベース。§14 未決の第 1 項を決着 |
 | steal の一致 | `X-Dev-User` + `X-Dev-Token`（ユーザー固定トークン） | ヘッダー 1 つ → 2 つ |
 | 複数タスク | RUNNING な全タスクに接続 | 1 タスク → 全タスク |
 | トランスポート | `ssm:StartSession` を SDK で呼び `session-manager-plugin` を子プロセスで起動 | AWS CLI 依存を削除 |
@@ -93,7 +93,7 @@ design.md の 4 層で言うと、②「終端する層」がカーネル TCP �
 実機検証は `make e2e-local` の結果で確定。helper は `/etc/pf.conf` に一切触れず、既定の `/etc/pf.conf` が持つワイルドカード参照 `rdr-anchor "com.apple/*"` / `anchor "com.apple/*"` に乗る**子アンカー** `com.apple/900.tetherd` にルールをロードする（`set skip on lo0` が無いことも含め、手元の macOS 26 で確認済み）。ディスクには書かない。
 
 ```
-table <tetherd_remote> { 10.0.0.0/16, 169.254.170.0/24, ... }
+table <tetherd_remote> { 10.0.0.0/16, ... }
 rdr pass on lo0 inet proto tcp from any to <tetherd_remote> -> 127.0.0.1 port <redirect_port>
 pass out route-to lo0 inet proto tcp from any to <tetherd_remote> group tetherd keep state
 ```
@@ -107,7 +107,7 @@ pass out route-to lo0 inet proto tcp from any to <tetherd_remote> group tetherd 
 
 ### 3.3 元の宛先の復元
 
-CLI が `127.0.0.1:<redirect_port>` で accept したら、helper に `natlook{proto, src, dst}` を送り、helper が `/dev/pf` に `DIOCNATLOOK`（direction `PF_OUT`）を発行して rdr 前の宛先を返す。UNIX ソケット 1 往復（< 1 ms）で、SSM の RTT（数十 ms）に対して無視できる。`/dev/pf` の fd を CLI に渡す最適化は取らない（helper の操作を 5 つに閉じるため）。
+CLI が `127.0.0.1:<redirect_port>` で accept したら、helper に `natlook{proto, src, dst}` を送り、helper が `/dev/pf` に `DIOCNATLOOK`（direction `PF_OUT`）を発行して rdr 前の宛先を返す。UNIX ソケット 1 往復（< 1 ms）で、SSM の RTT（数十 ms）に対して無視できる。`/dev/pf` の fd を CLI に渡す最適化は取らない（helper の操作を数えられる範囲に閉じるため）。
 
 ### 3.4 DNS
 
@@ -127,9 +127,9 @@ CLI が `127.0.0.1:<redirect_port>` で accept したら、helper に `natlook{p
 
 - `/var/run/tetherd.sock`、mode `0666`、JSON Lines、リクエストに `id`
 - 接続時に peer credential（`LOCAL_PEERCRED`）を取り、uid が **`admin` グループのメンバー**であることを要求（`resolver.set` はマシン全体の名前解決に影響するため）
-- 1 接続 = 1 セッション。`pf.apply` は接続ごとに 1 回。接続が切れたら（CLI の異常終了含む）helper がそのセッションの pf ルールと resolver ファイルを消す
+- 1 接続 = 1 セッション。`pf.apply` は接続ごとに 1 回。接続が切れたら（CLI の異常終了含む）helper がそのセッションの pf ルール・resolver ファイル・host route を消す（消す順は resolver → route → pf）
 - 同時セッションは 1 つ。2 つ目の `pf.apply` は `busy{pid, command, since}` で拒否
-- 最初に `version` を交換。プロトコルバージョン不一致なら CLI が `brew upgrade tetherd && sudo brew services restart tetherd` を案内
+- 最初に `version` を交換。プロトコルバージョン不一致なら CLI が `brew upgrade tetherd && sudo tetherd-helper install`（その後 `sudo launchctl kickstart -k system/dev.tetherd.helper`）を案内する。helper は `/Library/LaunchDaemons/dev.tetherd.helper.plist` で launchd が持つので brew の service ではなく、`brew services restart tetherd` では再起動できない（§7）
 
 | 操作 | 引数 | 内容 |
 |---|---|---|
@@ -138,6 +138,8 @@ CLI が `127.0.0.1:<redirect_port>` で accept したら、helper に `natlook{p
 | `resolver.set` | `domains[]`, `port` | `/etc/resolver/<domain>` を作成 |
 | `resolver.clear` | — | tetherd 管理のファイルを削除 |
 | `natlook` | `proto`, `src`, `dst` | 元の宛先を返す |
+| `route.set` | `hosts[]` | host route を lo0 に張る（`pin_credential_route` のときだけ使う。§4.2） |
+| `route.clear` | — | そのセッションが張ったルートを消す |
 
 ---
 
@@ -148,17 +150,50 @@ CLI が `127.0.0.1:<redirect_port>` で accept したら、helper に `natlook{p
 `<tetherd_remote>` の中身。**宛先 IP で決める。既定は「VPC の中だけリモート」**。
 
 1. 対象タスクの VPC の CIDR（セカンダリ含む）。`DescribeTasks` → attachments の subnetId → `DescribeSubnets` → `DescribeVpcs` の `CidrBlockAssociationSet`（state = associated）
-2. `169.254.170.0/24`。タスクロールの認証情報とタスクメタデータ v4。これで AWS SDK がタスクロールとして動く
-3. `network.remote_cidrs`。ピアリング先 VPC、Transit Gateway 越しのオンプレなど
-4. `network.remote_services` に書いた AWS サービスの managed prefix list（`com.amazonaws.<region>.s3` / `.dynamodb`）。`DescribeManagedPrefixLists` → `GetManagedPrefixListEntries`
+2. `network.remote_cidrs`。ピアリング先 VPC、Transit Gateway 越しのオンプレなど
+3. `network.remote_services` に書いた AWS サービスの managed prefix list（`com.amazonaws.<region>.s3` / `.dynamodb`）。`DescribeManagedPrefixLists` → `GetManagedPrefixListEntries`
+4. `network.pin_credential_route: true` のときだけ `169.254.170.0/24`（§4.2 の逃げ道。既定では**入らない**）
 
-から `network.local_cidrs` を除く。引き算は範囲を分割する正確なもので、`10.0.0.0/16` から `10.0.5.0/24` を除けば残りは 8 個のプレフィックスになる（pf は 1 つのテーブルに集合として持つ）。ただし 2 の `169.254.170.0/24` だけは引かれない床で、`local_cidrs` に何を書いても残る — ここが捕捉から外れると子プロセスはタスクロールを失い、開発者自身の身元で動いてしまうため。`local_cidrs` が床以外のすべてを消した場合は、起動時にエラーにして `local_cidrs` を名指しする（`10.0.0.0/8` と書いて `10.0.0.0/16` の VPC を丸ごと消す、が現実的な失敗）。
+から `network.local_cidrs` を除く。引き算は範囲を分割する正確なもので、`10.0.0.0/16` から `10.0.5.0/24` を除けば残りは 8 個のプレフィックスになる（pf は 1 つのテーブルに集合として持つ）。`pin_credential_route` が有効なときは `169.254.170.0/24` が引かれない床になり、`local_cidrs` に何を書いても残る — 固定しておきながら捕捉から外すと、そのアドレスが lo0 に吸い込まれたまま誰も応答しない状態になるため。`local_cidrs` が（床以外の）すべてを消した場合は、起動時にエラーにして `local_cidrs` を名指しする（`10.0.0.0/8` と書いて `10.0.0.0/16` の VPC を丸ごと消す、が現実的な失敗）。
+
+v0.2b までは 2 番目が `169.254.170.0/24` で、タスクロールを「透過で通す」設計だった。実機でそれが**間欠的に壊れる**ことが分かったため（§4.2）、v0.3a でループバック方式に変えた。
 
 それ以外（インターネット、localhost、LAN）は子プロセスからそのまま出る。`go run` のモジュール取得、`npm install`、外部 API はラップトップの回線。dev タスクの ENI を踏み台にインターネットへ出る経路は既定で無い。`remote_cidrs: [0.0.0.0/0]` を書けば可能だが `doctor` が警告する。
 
 起動時にラップトップの IF アドレスとリモート集合の重なりを検査し、重なっていれば警告して `local_cidrs` を案内する。
 
-### 4.2 VPC 外の AWS サービスとタスクロール
+### 4.2 タスクロールの届け方（v0.3a で変更）
+
+タスクの env には `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` が入っていて、SDK はそれを見て `169.254.170.2` に認証情報を取りに行く。このアドレスはタスクの中にしか存在しない。
+
+**v0.2b の方式（透過）と、それが壊れた理由**: `169.254.170.0/24` を捕捉範囲に入れて pf で agent へ流していた。ところが `connect()` のルート探索は pf の出力ルールより**先**に走る。macOS はこのアドレスへの ARP を LAN に投げて失敗し、en0 上に拒否ルートを残す（`netstat -rn` の `!`、`route -n get` の `LLINFO` と負の `expire`）。その拒否エントリが生きている間はカーネルが `EHOSTUNREACH` を即返し、**pf はパケットを一度も見ない**。実機で、同じ子プロセス・同じ gid なのに `curl` は 200 を得て AWS CLI 同梱の python は `Errno 65` で落ちた。ARP エントリの期限で成否が変わるので間欠的に壊れる。
+
+lo0 への host route を張れば探索は必ず成功するが、**その固定はマシン全体に効く**。しかも pf の `rdr`（変換ルール）は `group` 句を受け付けないので（filter ルールは受け付ける）、gid で絞れない。つまりセッション中は `tetherd` グループ以外のプロセスも `169.254.170.2` で dev タスクの認証情報に到達する。`amazon-ecs-local-container-endpoints` はこのアドレスを lo0 に alias して使うので、衝突相手が実在する。
+
+**v0.3a の方式（ループバック）**: CLI が `127.0.0.1` の空きポートに小さな HTTP 口を開き、来たリクエストを既存のセッション経由で `169.254.170.2` に転送する。子プロセスには env でそこを教える:
+
+```
+AWS_CONTAINER_CREDENTIALS_FULL_URI=http://127.0.0.1:<port>/v2/credentials/<uuid>
+（AWS_CONTAINER_CREDENTIALS_RELATIVE_URI は子の env から取り除く。下記）
+ECS_CONTAINER_METADATA_URI_V4=http://127.0.0.1:<port>/v4/<task>
+ECS_CONTAINER_METADATA_URI=http://127.0.0.1:<port>/v3/<task>
+ECS_AGENT_URI=http://127.0.0.1:<port>/v1
+```
+
+1 つのポートで 4 変数すべてを賄う（パスがそのまま転送されるため）。AWS SDK は `FULL_URI` のホストがループバックなら平文 HTTP をトークンなしで受理する（aws-sdk-go-v2 の `config/resolve_credentials.go` の `isAllowedHost` が `ip.IsLoopback()` を許可。他言語の SDK も同じ規則）。
+
+`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` は**空にするのではなく取り除く**。理由が 2 段ある。第一に、aws-sdk-go-v2 の解決順は `case len(envConfig.ContainerCredentialsRelativePath) != 0` が `ContainerCredentialsEndpoint`（= `FULL_URI`）より**先**なので、両方セットされていれば relative が勝ち、SDK は `169.254.170.2` に行く。第二に、**botocore は値の有無ではなく変数の存在で分岐する** — `ContainerProvider._provided_relative_uri()` は `return self.ENV_VAR in self._environ` で、空文字でも「ある」と判定して `http://169.254.170.2` + `""` を取りに行く。つまり空にするだけでは Go の子プロセスは救われても、`aws` CLI と boto3 のプログラム（現実には大多数）は誰もルーティングしていないアドレスに行って認証情報を得られない。実機の botocore 1.43.89 で確認した。
+
+これで:
+
+- **root 操作が要らない**。helper に頼む必要が無い
+- **アドレスが毎回変わり、広告もされない**。`169.254.170.2` のように「ECS を知っているツールが必ず試す先」ではなくなる。ただし**ループバックの listener は同一マシンの全プロセスから到達可能**で、uid やプロセスツリーによる絞り込みは無い（§11）
+- **拒否ルートの問題が消える**。誰も `169.254.170.2` に接続しないため
+- **pf に依存しない**。捕捉範囲に何が入っているかと無関係に動く
+
+代償は 2 つ。第一に、これは env の書き換えなので「透過」ではない — env を読まずにアドレスを直書きしているツールには届かない。そのために `network.pin_credential_route: true` を残す（v0.2b の固定方式に戻す逃げ道。影響範囲は上記のまま）。第二に、ループバック口は無認証で、**同じマシンのどのプロセスからでも**（uid を問わず）叩けばタスクロールの認証情報を得られる。信頼境界は既存の SSM ローカルフォワード（`127.0.0.1:9900`）と同じで、§11 に記載する。固定方式より狭いのは「アドレスが予測できない」点だけで、「プロセス単位に閉じている」わけではない。
+
+### 4.3 VPC 外の AWS サービス
 
 S3 / DynamoDB / SQS / Secrets Manager / Bedrock など VPC 外のサービスは**既定のままで動く**。SDK は `169.254.170.2`（トンネル経由）から一時クレデンシャルを取り、以降は SigV4 署名でパブリックエンドポイントに直接送る。署名が正しければ送信元 IP がラップトップでも受け付けられる。
 
@@ -257,12 +292,12 @@ type Transport interface {
 2. helper に接続、バージョン確認
 3. 全タスクへ接続、primary の `welcome` から env と `TETHERD_ENV` を取得。`target.env` と不一致なら切断して終了
 4. VPC CIDR / prefix list を取得 → リモート集合を組む → ローカル IF との重なりを警告
-5. helper に `pf.apply` と（必要なら）`resolver.set`
-6. 透過プロキシ（`127.0.0.1:<空きポート>`）、DNS リゾルバ（`127.0.0.1:53530`）、steal の `http.Serve` を起動
-7. IAM 確認: `dial` ストリームで `169.254.170.2` からクレデンシャルを取り、`sts:GetCallerIdentity` を呼んで表示
+5. helper に `pf.apply` と（必要なら）`resolver.set` と（`pin_credential_route` のときだけ）`route.set`
+6. 透過プロキシ（`127.0.0.1:<空きポート>`）、DNS リゾルバ（`127.0.0.1:53530`）、認証情報の口（`127.0.0.1:<空きポート>`。§4.2）、steal の `http.Serve` を起動
+7. IAM 確認: 認証情報の口を自分で叩いて（そこから `dial` ストリームでタスクの `169.254.170.2` へ）クレデンシャルを取り、`sts:GetCallerIdentity` を呼んで表示。子プロセスと同じ経路を通るので、この行が出れば子でも動く
 8. ステータス行を出す
 9. `/usr/local/libexec/tetherd/tetherd-exec -- <command>` を子プロセスとして起動。同じプロセスグループ、stdio 素通し、合成した env
-10. 子の終了またはシグナルで: `bye` → `pf.clear` / `resolver.clear` → plugin 終了 → 子の終了コードで exit
+10. 子の終了またはシグナルで: `bye` → `resolver.clear` → `route.clear` → `pf.clear` → plugin 終了 → 子の終了コードで exit
 
 Ctrl-C は端末がプロセスグループ全体に SIGINT を送るので、CLI は子の終了を待ってから片付ける。CLI が異常終了しても helper がソケット切断で掃除する。
 
@@ -274,11 +309,11 @@ Ctrl-C は端末がプロセスグループ全体に SIGINT を送るので、CL
 
 これに加えて、**コンテナのファイルシステムを指し、ランタイムの信頼やコード解決を黙って変えてしまう変数**も既定で除外する: `SSL_CERT_FILE` `SSL_CERT_DIR` `AWS_CA_BUNDLE` `REQUESTS_CA_BUNDLE` `CURL_CA_BUNDLE` `NODE_EXTRA_CA_CERTS` `LD_LIBRARY_PATH` `LD_PRELOAD` `DYLD_LIBRARY_PATH` `DYLD_INSERT_LIBRARIES` `JAVA_HOME` `GOROOT` `PYTHONHOME` `PYTHONPATH`。実機で確認した例: distroless イメージは `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` を設定しており、macOS にこのパスは無いため、これを尊重する子プロセス（Go の `crypto/x509` など）の TLS が全部 `certificate signed by unknown authority` で落ちた（独自の CA バンドルを持つ `aws` CLI は影響を受けなかった）。
 
-`169.254.170.2` を指すエンドポイント変数（`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`、`ECS_CONTAINER_METADATA_URI_V4`、`ECS_CONTAINER_METADATA_URI`、`ECS_AGENT_URI`）は透過モードでは残し（これがタスクロールとタスクメタデータを効かせる）、`--no-network` では 4 つとも落とす。
+`169.254.170.2` を指すエンドポイント変数のうち、`ECS_CONTAINER_METADATA_URI_V4` / `ECS_CONTAINER_METADATA_URI` / `ECS_AGENT_URI` の 3 つは透過モードではホストをループバック口に**書き換えて**渡し（パスはそのまま転送される）、`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` は**取り除いて** `AWS_CONTAINER_CREDENTIALS_FULL_URI` をループバック口で与える（§4.2 の理由）。`--no-network` では 4 つとも落とす。
 
-透過モードでタスクの env が `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` を持つときは、それだけでは子プロセスがタスクロールにならない。どの SDK も**共有設定プロファイルをコンテナクレデンシャルより先に**評価するので、開発者の `~/.aws/config` の `default` プロファイルが認証ソース（SSO、login session、`credential_process` など）を持っていると、そちらが勝つ（実機で確認: 子プロセスの `aws sts get-caller-identity` が「session has expired」を返し、共有設定を隠すと即座にタスクロールを返した）。そこで tetherd は静的キーと `AWS_PROFILE` を除去するだけでなく、`AWS_CONFIG_FILE` と `AWS_SHARED_CREDENTIALS_FILE` をセッション用の空ファイルに向け、`AWS_REGION` / `AWS_DEFAULT_REGION` をタスクのリージョンで明示する。`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` は残すので、認証情報の自動更新は SDK 任せのまま。共有設定を隠すことは `✓ iam` の次の行に明示する。
+透過モードでタスクの env が `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` を持つときは、それだけでは子プロセスがタスクロールにならない。どの SDK も**共有設定プロファイルをコンテナクレデンシャルより先に**評価するので、開発者の `~/.aws/config` の `default` プロファイルが認証ソース（SSO、login session、`credential_process` など）を持っていると、そちらが勝つ（実機で確認: 子プロセスの `aws sts get-caller-identity` が「session has expired」を返し、共有設定を隠すと即座にタスクロールを返した）。そこで tetherd は静的キーと `AWS_PROFILE` を除去するだけでなく、`AWS_CONFIG_FILE` と `AWS_SHARED_CREDENTIALS_FILE` をセッション用の空ファイルに向け、`AWS_REGION` / `AWS_DEFAULT_REGION` をタスクのリージョンで明示する。認証情報そのものは `AWS_CONTAINER_CREDENTIALS_FULL_URI` で与えるので、自動更新は SDK 任せのまま。共有設定を隠すことは `✓ iam` の次の行に明示する。
 
-`--no-network` では tetherd は認証情報に一切触らない（開発者自身の身元のまま）。タスクの `AWS_REGION` は注入されるが、`169.254.170.2` を指す 4 つの変数は落とす。セッションの中で自分のプロファイルを使いたい場合は `--no-env`（タスクの env を注入しない）か `--no-network`（捕捉しない）を使う。
+`--no-network` では tetherd は認証情報に一切触らない（開発者自身の身元のまま）。タスクの `AWS_REGION` は注入されるが、`169.254.170.2` を指す 4 つの変数は落とす（ループバック口も開かない）。セッションの中で自分のプロファイルを使いたい場合は `--no-env`（タスクの env を注入しない）か `--no-network`（捕捉しない）を使う。
 
 ### 6.5 コマンド
 
@@ -481,10 +516,12 @@ design.md §10 に加えて:
 
 - steal はトークン一致が必須。公開 ALB でもユーザー名だけでは届かない
 - 外向きの既定は「VPC 内だけリモート」。dev タスクを踏み台にした egress は既定で存在しない
-- helper は `admin` グループのユーザーからのみ受け付け、操作は 5 つに固定。コマンド起動の操作は無い
+- helper は `admin` グループのユーザーからのみ受け付け、操作は 7 つに固定。コマンド起動の操作は無い
 - setgid `tetherd` の権限は pf に捕まることだけ
 - `:9900` は無認証だが lo にしか bind せず、信頼境界は「タスク内」。design.md に明記する
 - `.tetherd.yml` は**信頼された入力**として扱う。`env.override` は子プロセスの `PATH` や `DYLD_INSERT_LIBRARIES` も設定できるので、悪意ある `.tetherd.yml` を含むリポジトリで `tetherd run` すれば任意コード実行になる。ただし `tetherd run -- go run ./cmd/api` はそもそもそのリポジトリのコードを実行するので、これは `env.override` があること自体に内在する性質であり tetherd が新たに作った経路ではない。「信頼していないリポジトリのコードを実行しない」という通常の前提がそのまま当てはまる
+- タスクロールを配るループバック口（`127.0.0.1:<空きポート>`）は無認証。同じマシンの他のローカルプロセスが叩けばタスクロールの認証情報を得られる。信頼境界は既存の SSM ローカルフォワード（`127.0.0.1:9900`）と同じ「同一マシンに閉じるが、それ自体が境界」。ポートは毎回変わり広告もされないが、秘密ではない。`hello` にユーザー単位のトークンを載せる v0.3 でも、この口は別経路なので閉じない
+- `network.pin_credential_route: true` は**マシン全体**に効く host route を張る。セッション中は `tetherd` グループ以外のプロセスも `169.254.170.2` で dev タスクの認証情報に到達する（pf の `rdr` は `group` 句を受け付けないため gid で絞れない）。`amazon-ecs-local-container-endpoints` のようにこのアドレスをローカルで使うツールと衝突し、そちらが**タスクの**ロールを掴む。既定で無効。有効時に `doctor` が警告する行は v0.3b で追加する（v0.3a には無い）
 - ローカルアプリは共有 dev DB に書く。ローカルブランチの auto-migrate が dev DB を変えうることを README で注意する
 - セッション中は `tetherd-exec` が誰でも実行可能（mode `2755`、setgid `tetherd`）なので、同じマシンの他のローカルユーザーも gid `tetherd` でコマンドを起動しトンネルに到達できる。シングルユーザーのラップトップでは許容するが、その前提であることを明記する
 - セッション中、ラップトップ上の SSM ローカルフォワードのポート（`127.0.0.1:9900`）は無認証で agent に届く経路になる: 同じマシンの他のローカルプロセスがそのポートに直接繋いで `welcome.app_env` を読んだり、VPC 内へ dial したりできる。lo にしか bind しないので同一マシンには閉じるが、それ自体が信頼境界。`hello` にユーザー単位のトークンを載せる（v0.3）までこの経路が開いていることを明記する
@@ -569,11 +606,42 @@ design.md §10 に加えて:
 
 1. **`doctor` の `remote domains` が健全な環境で偽陰性を出す**（修正済み）。設定されたドメインそのものを名前として解決していたが、Cloud Map の名前空間は apex に A レコードを持たないので `name not found` になる。検査の本当の問いは「このドメインの問い合わせが VPC リゾルバに届くか」であり、**not found という応答自体が到達の証明**。存在しないことが保証された名前を引いて、not found を成功として扱う形に変更。
 2. **macOS の負の DNS キャッシュ**。agent が resolve に対応する前に引いた名前は `mDNSResponder` に NXDOMAIN としてキャッシュされ、TTL の間 `getaddrinfo` が失敗し続ける（`dig` で直接引くと正しく答える）。`sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder` で解消。docs/config.md に記載。
-3. **`169.254.170.2` のルートが pf より先に評価される**（v0.3 送り、v0.2b の回帰ではない）。macOS がこのアドレスへの ARP に失敗して en0 上に拒否ルート（`UHLSW` + `LLINFO`、`netstat` の `!`）を残すため、`connect()` のルート探索が pf の `pass out route-to lo0` より先に `EHOSTUNREACH` を返すことがある。同じ子プロセス・同じ gid 309 で、curl と system python 3.9 は 200 を得るのに AWS CLI 2.34.49 が同梱する Homebrew python 3.14 は `Errno 65` で失敗し、同じ interpreter でも VPC 宛（RFC1918）は通る。ARP エントリの期限で成否が変わるので間欠的。修正はセッション中だけ `169.254.170.2` の host route を lo0 に向けること（helper に新操作が必要なため v0.3）。
+3. **`169.254.170.2` のルートが pf より先に評価される**（v0.3a で設計変更により解消）。macOS がこのアドレスへの ARP に失敗して en0 上に拒否ルート（`UHLSW` + `LLINFO`、`netstat` の `!`）を残すため、`connect()` のルート探索が pf の `pass out route-to lo0` より先に `EHOSTUNREACH` を返すことがある。同じ子プロセス・同じ gid 309 で、curl と system python 3.9 は 200 を得るのに AWS CLI 2.34.49 が同梱する Homebrew python 3.14 は `Errno 65` で失敗し、同じ interpreter でも VPC 宛（RFC1918）は通る。ARP エントリの期限で成否が変わるので間欠的。当初は「セッション中だけ `169.254.170.2` の host route を lo0 に向ける」で直すつもりだったが、その固定はマシン全体に効き pf の `rdr` では gid で絞れないと分かったため、v0.3a では**このアドレスを使わない**方式（ループバック口 + env 書き換え、§4.2）に変えた。host route の固定は `pin_credential_route` として残してある。
 
 実機で 1 件見つかった（修正済み）:
 
 `tetherd env` がタスクの env を**そのまま**出していたため、`eval "$(tetherd env --format shell)"` が開発者のシェルを壊した。実測で `HOME` が `/home/nonroot`、`PATH` がコンテナの `PATH` に置き換わり、v0.2a で Go の子プロセスの TLS を全部壊した `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` もそのまま出ていた。`tetherd run` は同じ変数を除外して注入しているので、**`env` と `run` が違う env を作っていた** — `env` の存在理由（run が注入するものを見る・シェルに取り込む）に反する。`env` も §6.4 の除外・上書きを通すように修正。
+
+### v0.3a（ルート固定と steal）
+
+配線: ALB のターゲットグループを app の `:8081` から agent の `:8080` に移した（`deploy/dev-env/alb.tf` / `ecs.tf` / `rds.tf` の sg-app）。agent は `TETHERD_APP_ADDR=127.0.0.1:8081` で app へリバースプロキシし（§5.1）、`X-Dev-User` / `X-Dev-Token` が一致するリクエストだけを steal してラップトップへ転送する（§5.2）。ヘルスチェックは `/healthz`・matcher `200` のまま。agent はヘルスチェックを特別扱いしない（一致ヘッダーを持たないリクエストが app に行くだけ）ので、パスを変える必要は無かった。`healthy_threshold` だけ 3 → 2 に下げた（ターゲットグループ置き換え中の窓を短くするため）。
+
+検証手順は `docs/e2e-aws.md` の 20〜26 行。**20〜26 すべて成功**（2026-09-12、ap-northeast-1、ALB `tetherd-dev-1301575947`）。
+
+| # | 結果 |
+|---|---|
+| 20 | ラップトップが応答。CLI に `← GET /hello 200 1ms (from 124.35.91.195)`。転送先に `X-Forwarded-For: 124.35.91.195`、`X-Forwarded-Proto: http`、`Host` は ALB のホスト名のまま届いた |
+| 21 | タスクの応答。`from 127.0.0.1:57164` — app が見る接続元が同一タスク内の agent になっており、経路が ALB → agent → app であることの証拠 |
+| 22 | トークンを 1 文字変えた場合・トークン無しの場合ともタスクの応答。**ラップトップ側の受信数は 0**（応答の出どころだけでなく受信側でも確認した） |
+| 23 | セッション断の直後に一致ヘッダーで叩いて 200・タスクの応答。502 ではない |
+| 24 | タスクの応答 + CLI に `✗ steal  GET /row24  502  nothing is listening on 127.0.0.1:9321`。クライアントのレスポンスヘッダーに `X-Tetherd-No-Listener` は**出ない** |
+| 25 | `--no-incoming` 中は一致ヘッダーでもタスクの応答。`✓ steal` 行は出ず、ラップトップ側の受信数は 0 |
+| 26 | 20 秒間隔 9 サンプル（約 3 分）すべて `healthy` |
+
+**手順に罠が 1 つあった。** 既定の `local_port: 8080` は現実の開発機で埋まっている。この Mac では無関係な Docker コンテナ（nginx）が `*:8080` を IPv6 で保持していて、ローカルサーバ（IPv4 の `127.0.0.1:8080`）と共存していた。そのため**ローカルサーバを落としても 8080 は 200 を返し続け**、24 行をそのまま実行すればダイヤルは nginx に成功して「何も listen していない」経路を一度も通らずに合格していた。24 行は `--local-port` で確実に空いているポート（9321）に移して実施した。24 行を再実施する者は、まずそのポートが**接続拒否を返すこと**を確認すること。
+
+あわせて確認できたこと（v0.3a の設計変更の本体）:
+
+```
+✓ endpoint 127.0.0.1:58066 → the task's credential and metadata endpoint
+           (the child is pointed here; 169.254.170.2 is never dialed)
+✓ iam      arn:aws:sts::…:assumed-role/tetherd-dev-api-task/…  (via 127.0.0.1:58066 → the task)
+✓ network  transparent (pf rdr, gid tetherd) · remote: 10.0.0.0/16
+```
+
+`remote:` に `169.254.170.0/24` が入らないこと（既定ではループバック口から配るため）、そして §12 の既知の穴 3 番（ARP 失敗の拒否ルートで間欠的に壊れる）の原因アドレスに**もう誰も接続しない**ことが実機で確認できた。
+
+**`terraform apply` で 1 回失敗した。** ターゲットグループの `port` 変更は置き換えを強制するが、リスナが転送先にしている間は削除できないため `ResourceInUse` になる。しかも失敗が綺麗ではなく、セキュリティグループの更新だけ先に適用済みで、ALB からのインバウンドが 8080 のみ許可・ターゲットグループはまだ 8081 をヘルスチェック、という状態で止まり、dev 環境が一時的に 5xx になった。`create_before_destroy` と `name_prefix`（ターゲットグループは 6 文字まで）で解決（`f099788`）。次に同種の置き換えを含む変更を当てる者は、plan の `# forces replacement` を見た時点でこれを疑うこと。
 
 ---
 

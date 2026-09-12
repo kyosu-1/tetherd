@@ -40,7 +40,7 @@ type VersionError struct {
 }
 
 func (e *VersionError) Error() string {
-	return fmt.Sprintf("tetherd-helper speaks protocol %s but this CLI expects %s; run: brew upgrade tetherd && sudo brew services restart tetherd", e.Helper, e.CLI)
+	return fmt.Sprintf("tetherd-helper speaks protocol %s but this CLI expects %s; run: brew upgrade tetherd && sudo tetherd-helper install  (then: sudo launchctl kickstart -k system/dev.tetherd.helper)", e.Helper, e.CLI)
 }
 
 // Dial connects and checks the protocol version.
@@ -90,6 +90,23 @@ func (c *Client) ResolverSet(domains []string, port int) error {
 // ResolverClear removes tetherd-managed resolver files.
 func (c *Client) ResolverClear() error {
 	_, err := c.call(request{Op: OpResolverClear})
+	return err
+}
+
+// RouteSet pins hosts to lo0 for the life of this connection (see route.go
+// for why the credential endpoint needs it).
+func (c *Client) RouteSet(hosts []netip.Addr) error {
+	ss := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		ss = append(ss, h.String())
+	}
+	_, err := c.call(request{Op: OpRouteSet, Hosts: ss})
+	return err
+}
+
+// RouteClear removes them.
+func (c *Client) RouteClear() error {
+	_, err := c.call(request{Op: OpRouteClear})
 	return err
 }
 

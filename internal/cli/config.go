@@ -28,12 +28,18 @@ func changed(cmd *cobra.Command, name string) bool {
 // applyConfig fills RunOptions fields the flags did not set, from
 // ~/.tetherd/config.yml and then .tetherd.yml. Flags always win, so a
 // value the user typed is never overwritten.
-func applyConfig(cmd *cobra.Command, opts *RunOptions) error {
+//
+// It returns the configuration it read so that a command with flags the
+// others do not register can apply its own keys from the same two files -
+// see applyIncoming, which `tetherd run` calls and the other two must not.
+// Re-reading the files there instead would be two more decodes and, worse,
+// a second chance for the two reads to disagree.
+func applyConfig(cmd *cobra.Command, opts *RunOptions) (config.Config, error) {
 	shared := configPath
 	if shared == "" {
 		wd, err := os.Getwd()
 		if err != nil {
-			return err
+			return config.Config{}, err
 		}
 		if p, ok := config.Find(wd); ok {
 			shared = p
@@ -44,12 +50,12 @@ func applyConfig(cmd *cobra.Command, opts *RunOptions) error {
 		// missing shared path as "use defaults" so that a *discovered* path
 		// can be optional, but a path the operator typed themselves must
 		// fail loudly instead of being silently ignored.
-		return fmt.Errorf("--config %s: %w", shared, err)
+		return config.Config{}, fmt.Errorf("--config %s: %w", shared, err)
 	}
 
 	personalPath, err := config.DefaultPersonalPath()
 	if err != nil {
-		return err
+		return config.Config{}, err
 	}
 	// The personal file is created on first run (spec §6.7), before Load so
 	// the file Load reads back is the one just created. Seed it with the
@@ -62,11 +68,11 @@ func applyConfig(cmd *cobra.Command, opts *RunOptions) error {
 		seedUser = opts.User
 	}
 	if _, _, err := config.EnsurePersonal(personalPath, seedUser); err != nil {
-		return err
+		return config.Config{}, err
 	}
 	cfg, err := config.Load(shared, personalPath)
 	if err != nil {
-		return err
+		return config.Config{}, err
 	}
 
 	if !changed(cmd, "user") {
@@ -109,13 +115,40 @@ func applyConfig(cmd *cobra.Command, opts *RunOptions) error {
 	opts.LocalCIDRs = cfg.Shared.Network.LocalCIDRs
 	opts.RemoteServices = cfg.Shared.Network.RemoteServices
 	opts.RemoteDomains = cfg.Shared.Network.RemoteDomains
+	opts.PinCredentialRoute = cfg.Shared.Network.PinCredentialRoute
 	opts.EnvOverride = cfg.Shared.Env.Override
 	opts.EnvExclude = cfg.Shared.Env.Exclude
 
 	if cfg.SharedPath != "" {
 		opts.ConfigPath = cfg.SharedPath
 	}
-	return nil
+	return cfg, nil
+}
+
+// applyIncoming fills the steal settings from the same two files
+// applyConfig read: the repository's incoming block, and the token from the
+// personal file. Only `tetherd run` calls it, because only `tetherd run`
+// registers --local-port, --no-incoming and --as - which is what keeps the
+// changed() guard below honest, since changed() panics on a flag the
+// command does not have rather than quietly answering false.
+//
+// --as wins over both --user and the personal file's user, deliberately:
+// hello.user and the name the agent matches the request's user header
+// against are one value, so there is nothing to reconcile.
+func applyIncoming(cmd *cobra.Command, cfg config.Config, opts *RunOptions) {
+	if !changed(cmd, "local-port") {
+		opts.LocalPort = cfg.Shared.Incoming.LocalPort
+	}
+	// No flags bind the header names (they are a property of the
+	// deployment's ALB and its browser extension, not of one run), so these
+	// are unconditional. Empty is left empty here and defaulted in
+	// stealSettings, so that one place decides what the agent is told.
+	opts.MatchHeader = cfg.Shared.Incoming.Match.Header
+	opts.MatchTokenHeader = cfg.Shared.Incoming.Match.TokenHeader
+	opts.Token = StealToken(cfg.Personal.Token)
+	if changed(cmd, "as") {
+		opts.User = opts.As
+	}
 }
 
 // unionStrings returns base followed by any of extra not already present in

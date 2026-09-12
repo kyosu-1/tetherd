@@ -13,10 +13,47 @@ import (
 	"github.com/kyosu-1/tetherd/internal/proto"
 )
 
+// Opener opens a new stream toward the peer. Serve hands one to the handler
+// at hello time so the agent can push an http stream to this CLI when a
+// request for that user arrives; nothing else opens streams from the agent
+// side.
+//
+// yamux is symmetric, so either end can open a stream. Until v0.3 only the
+// CLI did (dial, resolve), which is why the CLI's accept loop is new.
+//
+// On error the returned net.Conn is nil (a plain `s == nil` test is safe).
+// The caller must bound its own read of the reply: a CLI older than the
+// accept loop never answers an http stream at all, and a session can go
+// away between the moment the registry hands out this Opener and the moment
+// it is used.
+type Opener interface {
+	OpenStream() (net.Conn, error)
+}
+
+// muxOpener adapts yamux's concrete return type (*yamux.Stream) to Opener.
+type muxOpener struct{ mux *yamux.Session }
+
+// OpenStream deliberately does not `return m.mux.OpenStream()`. That
+// compiles - *yamux.Stream is assignable to net.Conn - but on error it
+// returns a non-nil net.Conn wrapping a nil *yamux.Stream, so the caller's
+// `if s != nil { s.Close() }` dereferences nil. That panic would happen
+// inside tetherd-agent, which has no recover, taking down the sidecar and
+// every developer's session on the task.
+func (m muxOpener) OpenStream() (net.Conn, error) {
+	s, err := m.mux.OpenStream()
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
 // Handler is implemented by the agent.
 type Handler interface {
 	// Hello validates the hello and returns welcome, or an error to reject.
-	Hello(h proto.Hello, remote string) (proto.Welcome, *proto.Error)
+	// open is the session's Opener: hello is the moment the agent learns
+	// which session belongs to which user, so it is where the handler is
+	// given the means to push streams back at that user's CLI.
+	Hello(h proto.Hello, remote string, open Opener) (proto.Welcome, *proto.Error)
 	// Dial opens a TCP connection to addr from the agent's network.
 	Dial(ctx context.Context, addr string) (net.Conn, error)
 	// Resolve looks name up with the agent's own resolver (the task's
@@ -87,7 +124,7 @@ func Serve(ctx context.Context, conn net.Conn, h Handler, opts ServeOptions) err
 		enc.Encode(proto.TypeError, proto.Error{Code: proto.CodeVersionMismatch, Message: "agent speaks protocol " + proto.Version})
 		return errors.New("session: version mismatch")
 	}
-	welcome, rej := h.Hello(hello, conn.RemoteAddr().String())
+	welcome, rej := h.Hello(hello, conn.RemoteAddr().String(), muxOpener{mux: mux})
 	if rej != nil {
 		enc.Encode(proto.TypeError, *rej)
 		return fmt.Errorf("session: rejected: %s", rej.Code)
