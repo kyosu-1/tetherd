@@ -38,7 +38,13 @@ tetherd only works against a task definition that has been adapted for it;
 there is no way to attach to an existing one unchanged. Before the first
 `tetherd run`:
 
-- Add a `tetherd-agent` sidecar (`ghcr.io/kyosu-1/tetherd-agent`) to the task
+- **Build and push the `tetherd-agent` image to a registry you control.**
+  Nothing in this repository publishes one, so there is no public image to
+  pull. `make push-images ECR_REGISTRY=<account>.dkr.ecr.<region>.amazonaws.com`
+  builds the agent (and the sample app) for `linux/amd64` and `linux/arm64`
+  and pushes them there; `deploy/dev-env/` creates the ECR repositories and
+  is a working example of the whole setup.
+- Add a `tetherd-agent` sidecar - the image you just pushed - to the task
   definition next to your app container, with `essential: true`,
   `restartPolicy.enabled: true`, `linuxParameters.capabilities.add:
   ["SYS_PTRACE"]`, `pidMode: task`, and `TETHERD_ENV` set to the

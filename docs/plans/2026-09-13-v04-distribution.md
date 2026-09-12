@@ -580,6 +580,6 @@ cask の全文、root 所有のディレクトリにコピーする理由（と 
 
 ## 次の計画（v1.0、この計画には含めない）
 
-**署名と notarization**（Apple Developer アカウントが必要。quarantine の `xattr` 回避をやめられる）。複数人が同じタスクに同時接続する実機検証（steal の照合は実装済みだが 2 人以上で測っていない）。現実的なアプリでのレイテンシ計測。`TETHERD_CONTROL` をデプロイ側から CLI に伝える経路。
+**agent / sampleapp イメージを公開レジストリ（GHCR）に publish する**（workflow 1 本とパッケージ権限が要る外向きのスコープ。v0.4 では Task 1 の決定 1 どおり `.goreleaser.yml` に含めず、代わりに README / `docs/design.md` / spec から「`ghcr.io/kyosu-1/tetherd-agent` を pull できる」という記述を取り除いた。**現状、利用者は `make push-images ECR_REGISTRY=...` で自分のレジストリに push する**）。**署名と notarization**（Apple Developer アカウントが必要。quarantine の `xattr` 回避をやめられる）。複数人が同じタスクに同時接続する実機検証（steal の照合は実装済みだが 2 人以上で測っていない）。現実的なアプリでのレイテンシ計測。`TETHERD_CONTROL` をデプロイ側から CLI に伝える経路。
 
 持ち越し: `follow.go` の**永続的な** attach 失敗が何もログに出さない点、`sessionset.go` の昇格通知が `Primary()` の liveness 検査を通らない点、`discover.go:90` の `reasons` 上書き、`internal/dnsproxy` の一部テストがポート競合の緩和策の外にある点、リポジトリ直下の `.tetherd.yml` がテストスイートの隠れた入力になりうる点、`opts.Timeout` を長く取ったテストは本当のハングを Go の 10 分 panic まで待つ点、`LICENSE` ファイルが無い点（所有者の判断）。

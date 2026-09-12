@@ -16,7 +16,7 @@
 | steal の一致 | `X-Dev-User` + `X-Dev-Token`（ユーザー固定トークン） | ヘッダー 1 つ → 2 つ |
 | 複数タスク | RUNNING な全タスクに接続 | 1 タスク → 全タスク |
 | トランスポート | `ssm:StartSession` を SDK で呼び `session-manager-plugin` を子プロセスで起動 | AWS CLI 依存を削除 |
-| agent イメージ | `ghcr.io/kyosu-1/tetherd-agent` | 未決 → GHCR |
+| agent イメージ | 利用者が自分のレジストリに push（`make push-images ECR_REGISTRY=...`） | 未決 → 当初 GHCR を想定したが、公開するパイプラインは未実装。v1.0 に持ち越し |
 | 検証環境 | `deploy/dev-env/`（Terraform） | 新規 |
 | v1 から外す | mirror、env-rewrite、`remote_localhost`、`init`、UDP、IPv6、Linux、Cloud Run、公証 | ロードマップ再編 |
 
@@ -259,7 +259,7 @@ agent は root で動く（`SYS_PTRACE` を effective にするため。distrole
 - env のみ: `TETHERD_ENV`（必須）、`TETHERD_PROXY`（`0.0.0.0:8080`。ALB を受ける口）、`TETHERD_APP_ADDR`（`127.0.0.1:8081`。app への転送先）、`TETHERD_CONTROL`（`127.0.0.1:9900`）、`TETHERD_APP_CONTAINER`（`app`）、`TETHERD_TASK_ARN`（任意。メタデータが取れればそちらが優先）
 - `TETHERD_CONTROL` は**実装上は固定**。CLI の `ssm` トランスポートが転送先ポートに 9900 を固定で入れる（`internal/transport/ssm` の `controlPort`）ので、これを変えた agent は誰も繋げない listen になり、失敗は「agent に届かない」として出る。テストと埋め込み用の口であり、デプロイのつまみではない（トランスポート側に教えるのは v0.4）
 - AWS API は呼ばない
-- イメージ `ghcr.io/kyosu-1/tetherd-agent`、distroless static、linux/arm64 + linux/amd64
+- イメージは distroless static、linux/arm64 + linux/amd64。**このリポジトリには公開レジストリへ push するパイプラインが無い**（v0.4 実測: `.goreleaser.yml` に `dockers:` / `kos:` は無く、イメージを扱うのは `make push-images` だけで、呼び出し元が渡す ECR レジストリへ push する）。利用者は `make push-images ECR_REGISTRY=...` で自分のレジストリに置く。公開レジストリでの配布は v1.0 に持ち越し
 - タスク定義の推奨: `essential: true`、`restartPolicy.enabled: true`、`linuxParameters.capabilities.add: ["SYS_PTRACE"]`、`pidMode: task`
 - インターネットに出られない VPC 向けに ECR pull-through cache を README で案内
 
@@ -417,7 +417,7 @@ sudo tetherd-helper install        # sudo はこの 1 回
 tetherd doctor
 ```
 
-- tap `kyosu-1/homebrew-tap`（`brew install kyosu-1/tap/tetherd`）。GoReleaser がタグ push で GitHub Release（darwin arm64 / amd64）、GHCR の agent と sampleapp イメージ、tap の cask 更新を行う
+- tap `kyosu-1/homebrew-tap`（`brew install kyosu-1/tap/tetherd`）。GoReleaser がタグ push で GitHub Release（darwin arm64 / amd64）と tap の cask 更新を行う。**イメージは含めない**（v0.4 実測: `.goreleaser.yml` に `dockers:` / `kos:` は無い。Task 1 の決定 1 で `tetherd-agent` を意図的に除外した）。agent / sampleapp イメージは利用者が `make push-images ECR_REGISTRY=...` で自分のレジストリに push する。公開レジストリへの publish は v1.0 に持ち越し
 - **formula ではなく cask。** 3 バイナリを prefix に置くだけなのは変わらない（v0.4 実測: cask DSL の `binary` スタンザ 3 本）。cask にした理由は署名していないこと: Homebrew は cask のダウンロードを必ず quarantine するので、`postflight` で `xattr -dr com.apple.quarantine` を外す必要があり、formula にはその口が無い。`service` ブロックは使わない（launchd の登録は helper 自身が行う）。cask の `uninstall launchctl:` / `delete:` は `brew uninstall` が daemon を止めるための保険で、アンインストールの本体ではない（下記）
 - brew はインストール時に root の処理を実行できないので、root が要る初期化は `sudo tetherd-helper install` が行う: グループ `tetherd` の作成、`tetherd-exec` の `/usr/local/libexec/tetherd/` へのコピー（`root:tetherd`、`2755`）、**`tetherd-helper` 自身の同じディレクトリへのコピー**（v0.4 で追加。plist が指すのは Homebrew の prefix ではなくこのコピー。理由は `tetherd-exec` と同じで「Homebrew の prefix はユーザが書ける」、しかも launchd が root で起動するのはこちらなのでより強く効く）、`/Library/LaunchDaemons/dev.tetherd.helper.plist` の生成と `launchctl bootstrap`。**`install` は転送先パスの各構成要素（`/`, `/usr`, `/usr/local`, `/usr/local/libexec`, `/usr/local/libexec/tetherd`）が root 所有・group/world 書き込み不可・かつディレクトリであることを先に確かめ、違えば何も書かずに失敗する。エラーは違反した構成要素と、それを直すコマンドの両方を出す**（v0.4。Homebrew がどのディレクトリを書き込み可能にするかを当てにしない）。**同じ検査を `/Library/LaunchDaemons` にも掛ける**（plist は launchd が「root で何を起動するか」を決めるもう一方の入力であり、ディレクトリに group が書ければファイル自身の mode に関係なく差し替えられる）。`install` が作るディレクトリの mode は umask に任せず明示する（`sudo` は呼び出し元の umask と 0022 の和を使うので、`umask 077` の開発者では `MkdirAll` が 0700 を作り、setgid の `tetherd-exec` に到達できなくなる）。`brew upgrade tetherd` の後は `sudo tetherd-helper install` を再実行する（冪等。`doctor` がバージョン不一致を検出して案内する）
 - **v0.4 の helper は常駐する（`RunAtLoad: true`、`Sockets` なし）。** 以下のソケットアクティベーションが本来の設計で、まだ実装が無い。
