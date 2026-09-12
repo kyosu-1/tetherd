@@ -340,7 +340,9 @@ aws:
 target:
   cluster: myapp-dev
   service: api
-  container: app                # env を読むコンテナ
+  # `container:` は書けない（v0.4 から起動時エラー、終了コード 2）。env を読む
+  # コンテナを決めるのは agent 側の TETHERD_APP_CONTAINER（既定 app）
+  agent_container: tetherd-agent # サイドカーを改名しているときだけ（既定 tetherd-agent）
   env: dev                      # agent の TETHERD_ENV と照合
 
 env:
