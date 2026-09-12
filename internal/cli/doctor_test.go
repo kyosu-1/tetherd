@@ -124,8 +124,44 @@ func wantRowSet(t *testing.T, out string) []doctorRow {
 		t.Fatalf("the remote domains row must be printed last: %v", got)
 	}
 	wantUncheckedRowsSaySo(t, rows, out)
+	wantNoRawClockAsAFinding(t, rows, out)
 	wantNoStrayLines(t, out)
 	return rows
+}
+
+// wantNoRawClockAsAFinding is the other half of what the four statuses
+// promise, and it is asserted on every report the tests render for the same
+// reason wantUncheckedRowsSaySo is: a row that drifted onto the wrong status
+// is the bug doctor.Unknown exists to prevent, and it drifts one row at a
+// time.
+//
+// A context error is never a measurement. It says "my own clock ran out", so
+// a row carrying it as a ✓, ⚠ or ✗ is claiming a fact about the developer's
+// machine that doctor never established - and worse, it is answered with the
+// judgement's advice for a *different* problem: "sudo tetherd-helper install"
+// for a group database that was never read, "brew install" for a PATH that
+// was never searched, "check the tetherd-agent sidecar is running" for a
+// handshake that never got a reply. Every clock in doctor.go is therefore
+// routed through checkTimedOut, which names what did not answer.
+//
+// ? rows are exempt, and only ? rows: that mark means "not checked", it is
+// the one status that cannot move the exit code, and the steal row's clock
+// arm deliberately prints the error it got after its "not checked:" prefix.
+// A raw clock landing there is the honest outcome; landing anywhere else is
+// the defect.
+func wantNoRawClockAsAFinding(t *testing.T, rows []doctorRow, out string) {
+	t.Helper()
+	for _, r := range rows {
+		if r.mark == "?" {
+			continue
+		}
+		for _, raw := range []string{"context deadline exceeded", "context canceled"} {
+			if strings.Contains(r.detail, raw) {
+				t.Errorf("the %q row reports a clock as a %s finding: %q\n  → %s\n%s",
+					r.name, r.mark, r.detail, r.next, out)
+			}
+		}
+	}
 }
 
 // wantUncheckedRowsSaySo pins what the ? mark promises: a row that could not
@@ -1003,6 +1039,137 @@ func TestBoundedCancelsTheCallItAbandons(t *testing.T) {
 	case <-cancelled:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the abandoned call was never cancelled, so whatever it started keeps running")
+	}
+}
+
+// TestBoundedsDirectArmDoesNotTakeAContextErrorAsAnAnswer is the pin for the
+// defect TestBoundedCancelsTheCallItAbandons only ever caught by luck.
+//
+// That test produces the same state by racing a real 50ms bound against a
+// call that answers with its own cancellation, so it passes whenever the
+// timer wins the select - which is nearly always, and was why the bug lived
+// through v0.3b while a test named after it stood green. Here the clock is
+// taken out of reach (a nil channel is never ready) and the outer context is
+// never done, so bounded's direct arm is the *only* arm the select can take,
+// on any machine, under any load. What arrives on it is what a dscl killed by
+// its own fctx answers: context.DeadlineExceeded and nothing else.
+//
+// Mutation: drop the boundedAnswered check from bounded's direct arm and this
+// fails on the raw error, deterministically, first run.
+func TestBoundedsDirectArmDoesNotTakeAContextErrorAsAnAnswer(t *testing.T) {
+	restoreBoundedAfter(t, func(time.Duration, <-chan struct{}) <-chan time.Time { return nil })
+
+	for _, answer := range []error{
+		context.DeadlineExceeded,
+		context.Canceled,
+		// Wrapped, which is how it actually arrives: LookupGroup returns
+		// exec.Cmd's error, the AWS SDK wraps its own.
+		fmt.Errorf("dscl: %w", context.DeadlineExceeded),
+	} {
+		v, err := bounded(context.Background(), 150*time.Millisecond, "the tetherd group lookup",
+			func(context.Context) (int, error) { return 7, answer }, nil)
+		if !isCheckTimeout(err) {
+			t.Errorf("answer %v: err = %v, want a check timeout so the row can route it", answer, err)
+		}
+		if err != nil && strings.Contains(err.Error(), "context") {
+			t.Errorf("answer %v: the raw clock reached the caller: %q", answer, err.Error())
+		}
+		if v != 0 {
+			t.Errorf("answer %v: v = %d, want the zero value - nothing was measured", answer, v)
+		}
+	}
+}
+
+// TestBoundedJudgesADeliveredResultTheWayAbandonBoundedDoes pins the property
+// that the fix is, rather than the two call sites it has: whichever of the
+// two paths a delivered result takes to the caller, the caller gets the same
+// thing. The direct arm and abandonBounded's re-check are reachable for the
+// *same* result - fctx's deadline and the bound's timer are derived from one
+// timeout microseconds apart, so the call's own cancellation and the clock
+// become ready at the same instant and a blocked select picks between them at
+// random - and a report whose wording depends on that coin flip is the
+// misattribution the four statuses exist to prevent.
+//
+// Asserted as an equality between the two paths, not as two copies of the
+// expected answer, so the test still holds if the answer itself is later
+// changed on purpose. Both are deterministic: the direct arm gets a clock
+// that cannot fire, and abandonBounded is called with the result already in
+// the channel.
+func TestBoundedJudgesADeliveredResultTheWayAbandonBoundedDoes(t *testing.T) {
+	restoreBoundedAfter(t, func(time.Duration, <-chan struct{}) <-chan time.Time { return nil })
+	boom := errors.New("dscl: eDSPermissionError")
+
+	for _, answer := range []error{
+		nil,
+		boom,
+		fmt.Errorf("read group: %w", boom),
+		context.DeadlineExceeded,
+		context.Canceled,
+		fmt.Errorf("dscl: %w", context.DeadlineExceeded),
+		fmt.Errorf("dial: %w", context.Canceled),
+	} {
+		direct, directErr := bounded(context.Background(), 150*time.Millisecond, "probe",
+			func(context.Context) (int, error) { return 7, answer }, nil)
+
+		ch := make(chan boundedResult[int], 1)
+		ch <- boundedResult[int]{v: 7, err: answer}
+		abandoned, abandonedErr := abandonBounded(ch, nil, &checkTimeout{msg: "probe did not answer"})
+
+		if direct != abandoned {
+			t.Errorf("answer %v: direct arm gave %d, abandonBounded gave %d", answer, direct, abandoned)
+		}
+		if isCheckTimeout(directErr) != isCheckTimeout(abandonedErr) {
+			t.Errorf("answer %v: one path called this a clock and the other did not: %v vs %v",
+				answer, directErr, abandonedErr)
+		}
+		if errors.Is(directErr, boom) != errors.Is(abandonedErr, boom) {
+			t.Errorf("answer %v: only one path kept the call's own failure: %v vs %v",
+				answer, directErr, abandonedErr)
+		}
+		if (directErr == nil) != (abandonedErr == nil) {
+			t.Errorf("answer %v: only one path reported a failure: %v vs %v", answer, directErr, abandonedErr)
+		}
+	}
+}
+
+// TestDoctorBlamesTheClockNotTheGroupDatabaseWhenTheLookupIsCancelled is the
+// row the defect was seen through, made deterministic. On a pristine
+// e88a20b/main tree TestDoctorBoundsAWedgedGroupLookup printed
+//
+//	setgid tetherd-exec  ✗  cannot read the tetherd group: context deadline exceeded
+//
+// in 1 of 20 rounds of `-race -count=5` (measured, this package) - advice to
+// run `sudo tetherd-helper install` for a group database that was never read.
+// This test reaches the same row with no clock in play at all: the per-check
+// bound cannot fire, so the lookup's answer is the only thing that can end
+// the wait, and the answer is its own cancellation.
+func TestDoctorBlamesTheClockNotTheGroupDatabaseWhenTheLookupIsCancelled(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	d := healthyDoctorDeps(healthyProvider(ag.addr))
+	restoreBoundedAfter(t, func(time.Duration, <-chan struct{}) <-chan time.Time { return nil })
+	d.LookupGroup = func(context.Context, string) (int, bool, error) {
+		return 0, false, context.DeadlineExceeded
+	}
+
+	opts := doctorOpts()
+	opts.Timeout = 150 * time.Millisecond
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	rows := wantRowSet(t, out.String())
+	r := findRow(t, rows, "setgid tetherd-exec")
+	if !strings.Contains(r.detail, "did not answer") {
+		t.Errorf("the row must say the lookup never answered, got %q", r.detail)
+	}
+	// The next step is the one that matters to a person: install advice for
+	// a database nothing read sends them to fix a machine that is fine.
+	if strings.Contains(r.next, "tetherd-helper install") {
+		t.Errorf("a clock must not be answered with install advice: %q", r.next)
 	}
 }
 
