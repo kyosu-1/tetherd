@@ -19,6 +19,7 @@ import (
 
 	"github.com/kyosu-1/tetherd/internal/agent"
 	"github.com/kyosu-1/tetherd/internal/capture"
+	"github.com/kyosu-1/tetherd/internal/env"
 	"github.com/kyosu-1/tetherd/internal/helper"
 	ecsprov "github.com/kyosu-1/tetherd/internal/provider/ecs"
 	"github.com/kyosu-1/tetherd/internal/transport"
@@ -411,6 +412,96 @@ func TestRunTaskRoleOverrideBeatsConfigEnvOverride(t *testing.T) {
 	}
 	if b := readFile(t, content); b != "" {
 		t.Fatalf("the task-role AWS_CONFIG_FILE must name an empty file (the task-role hiding effect), got %q: %q", got, b)
+	}
+}
+
+// TestRunStripsLocalAWSCredentialsFromTheChild pins the one line that stops
+// the child signing with the developer's own identity while the status line
+// prints a green iam row: mergeOpts.StripLocal = env.LocalAWSCredentialVars.
+// Mutating that line to nil left the whole suite green -
+// TestTaskRoleEnvOverridesLocalSharedConfig covers the shared-config half of
+// the same hardening (AWS_CONFIG_FILE pointed at an empty file), and the
+// environment-variable half was unpinned. Every name in
+// LocalAWSCredentialVars resolves before the container provider in the SDK
+// chain, so one of them surviving is enough to make the task role never
+// apply, silently.
+//
+// Every name in the list is set, not just two, so shortening the list is
+// caught here as well.
+//
+// The child is a throwaway script at opts.ExecPath that dumps its own
+// environment, for the reason spelled out on
+// TestRunTaskRoleOverrideBeatsConfigEnvOverride: in transparent mode Run
+// execs ExecPath and hands it the real command as trailing args, so a
+// stand-in like /usr/bin/true cannot show what child.Env was. The
+// credential endpoint fails on purpose (503) - the strip happens because the
+// task role is *reachable*, before it is verified, so this is provable with
+// no real STS call.
+func TestRunStripsLocalAWSCredentialsFromTheChild(t *testing.T) {
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no credentials for you", http.StatusServiceUnavailable)
+	})}
+	cl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	go srv.Serve(cl)
+
+	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil,
+		func(ctx context.Context, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", cl.Addr().String())
+		})
+	p := &fakeProvider{
+		region: "ap-northeast-1", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+
+	// The developer's own credentials, in this process's environment exactly
+	// as they would be in a shell with a profile exported.
+	for _, name := range env.LocalAWSCredentialVars {
+		t.Setenv(name, "local-"+name)
+	}
+
+	dir := t.TempDir()
+	dump := filepath.Join(dir, "env-dump")
+	script := filepath.Join(dir, "fake-exec.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nenv > "+dump+"\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := ssmOpts("true") // never run: the fake exec ignores its args
+	opts.NoNetwork = false
+	opts.ExecPath = script
+	var out strings.Builder
+	code, err := RunWithDeps(context.Background(), opts, &out, d)
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+
+	childEnv := map[string]string{}
+	for _, line := range strings.Split(strings.TrimRight(readFile(t, dump), "\n"), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			childEnv[k] = v
+		}
+	}
+	// A sanity check on the harness itself: if the dump were empty or the
+	// script never ran, every assertion below would pass for the wrong
+	// reason.
+	if len(childEnv) == 0 || childEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] == "" {
+		t.Fatalf("the child's environment was not captured (%d vars): %s", len(childEnv), out.String())
+	}
+	for _, name := range env.LocalAWSCredentialVars {
+		if got, ok := childEnv[name]; ok {
+			t.Errorf("%s reached the child as %q: the child would sign with the developer's own identity while the status line claims the task role", name, got)
+		}
+	}
+	if !strings.Contains(out.String(), "local AWS credentials") {
+		t.Errorf("removing them silently is not enough; the run must say so: %s", out.String())
 	}
 }
 
