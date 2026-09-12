@@ -22,5 +22,6 @@ network:
     - myapp.internal      # Cloud Map の名前を agent 側（VPC リゾルバ）で解決する
   # remote_services: [s3] # S3 への通信もタスクの ENI から出したいとき
   # local_cidrs: []       # VPC CIDR と自宅 LAN が重なっているときの逃げ道
+  # pin_credential_route: true # 169.254.170.2 を直書きしているツールがあるときだけ（マシン全体に効く）
 env:
   exclude: []
