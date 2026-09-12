@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -138,11 +139,20 @@ func TestRewriteContainerEndpointsPointsTheChildAtLoopback(t *testing.T) {
 	if got["AWS_CONTAINER_CREDENTIALS_FULL_URI"] != "http://127.0.0.1:51234/v2/credentials/abc-123" {
 		t.Errorf("FULL_URI = %q", got["AWS_CONTAINER_CREDENTIALS_FULL_URI"])
 	}
-	// The relative form must be blanked: aws-sdk-go-v2 checks it before the
-	// full URI, and leaving both set means the child still goes to
-	// 169.254.170.2, which is the address we no longer route.
-	if v, ok := got["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]; !ok || v != "" {
-		t.Errorf("the relative URI must be cleared, got %q (present=%v)", v, ok)
+	// The relative form must not be carried here in any shape. It has to be
+	// *removed* from the child's environment (Run does that through
+	// env.Options), and an empty entry in this map would defeat that: this
+	// map is Override, which env.Merge applies last, so an empty value here
+	// would survive every exclusion.
+	//
+	// Emptiness is not good enough because botocore branches on the
+	// variable's *presence* (ContainerProvider._provided_relative_uri is
+	// `ENV_VAR in self._environ`) and then fetches http://169.254.170.2 +
+	// "": measured against botocore 1.43.89, an empty variable sends
+	// `aws s3 ls` to the link-local address while tetherd has already
+	// stripped the developer's own credentials, which is worse than v0.2b.
+	if v, ok := got["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]; ok {
+		t.Errorf("the relative URI must not be in the override at all, got %q: botocore reads the variable's presence, not its value", v)
 	}
 	for _, k := range []string{"ECS_CONTAINER_METADATA_URI_V4", "ECS_CONTAINER_METADATA_URI", "ECS_AGENT_URI"} {
 		if !strings.HasPrefix(got[k], "http://127.0.0.1:51234/") {
@@ -235,6 +245,42 @@ func TestRewriteContainerEndpointsHandlesUnexpectedShapes(t *testing.T) {
 			t.Fatalf("a variable the task never had must not be invented: %v", got)
 		}
 	})
+}
+
+// TestUnroutableEndpointVars: a task value naming 169.254.170.2 that the
+// rewrite did not replace reaches the child unroutable. Passing it through
+// untouched is right - tetherd should not rewrite a shape it does not
+// understand - but until v0.3a such a value resolved anyway, because the
+// /24 was captured unconditionally, so saying nothing would be a silent
+// regression.
+func TestUnroutableEndpointVars(t *testing.T) {
+	addr := netip.MustParseAddrPort("127.0.0.1:51234")
+	taskEnv := map[string]string{
+		// https, so not the plain-HTTP shape the rewrite handles.
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI": "https://169.254.170.2/v2/credentials/x",
+		// A leading space: not a URL tetherd will touch.
+		"ECS_CONTAINER_METADATA_URI": " http://169.254.170.2/v3/x",
+		// An application variable naming the endpoint is exactly as
+		// unroutable as one of the four tetherd knows.
+		"APP_METADATA_URL": "http://169.254.170.2/v4/app",
+		// Rewritten, so not stuck.
+		"ECS_CONTAINER_METADATA_URI_V4": "http://169.254.170.2/v4/x",
+		// Nothing to do with the endpoint.
+		"PORT": "8080",
+	}
+	got := UnroutableEndpointVars(taskEnv, RewriteContainerEndpoints(taskEnv, addr))
+	want := []string{"APP_METADATA_URL", "AWS_CONTAINER_CREDENTIALS_FULL_URI", "ECS_CONTAINER_METADATA_URI"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v (sorted, so the log line does not flap)", got, want)
+	}
+	// A task whose values tetherd did rewrite has nothing stuck.
+	ok := map[string]string{
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x",
+		"ECS_CONTAINER_METADATA_URI_V4":          "http://169.254.170.2/v4/x",
+	}
+	if got := UnroutableEndpointVars(ok, RewriteContainerEndpoints(ok, addr)); len(got) != 0 {
+		t.Fatalf("got %v, want nothing: both values were rewritten", got)
+	}
 }
 
 // TestContainerCredentialsPath pins the one decision the rewrite and the

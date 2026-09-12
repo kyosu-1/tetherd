@@ -649,16 +649,32 @@ func TestRemoteSetRejectsLocalCIDRsThatRemoveEverything(t *testing.T) {
 // none - reaches the same "nothing would be captured" guard. Until v0.2b
 // the floor hid that case; blaming network.local_cidrs for it would send the
 // operator to a key they never set.
+//
+// Both pin settings, because the first round of this guard read
+// `len(cidrs) == 0 && len(floor) == 0` and so did not fire with the pin on:
+// measured, that run started and printed "✓ network … remote:
+// 169.254.170.0/24" while every VPC connection the child made left over the
+// laptop's own route. The floor is infrastructure for the route pin, never a
+// remote set on its own.
 func TestRemoteSetRejectsAnEmptyRemoteSetWithoutBlamingLocalCIDRs(t *testing.T) {
-	p := &fakeProvider{} // VPCCIDRs returns nothing
-	_, err := remoteSet(context.Background(), RunOptions{}, p, transport.Task{}, func(string, ...any) {})
-	if err == nil {
-		t.Fatal("capturing nothing at all must be reported")
-	}
-	if strings.Contains(err.Error(), "local_cidrs") {
-		t.Fatalf("local_cidrs was never set; the error must not blame it: %v", err)
-	}
-	if !isUsageError(err) {
-		t.Errorf("pointing tetherd at a VPC it cannot capture is a usage error (exit 2), got %v", err)
+	for _, pin := range []bool{false, true} {
+		p := &fakeProvider{} // VPCCIDRs returns nothing
+		_, err := remoteSet(context.Background(), RunOptions{PinCredentialRoute: pin}, p, transport.Task{}, func(string, ...any) {})
+		if err == nil {
+			t.Fatalf("pin=%v: capturing nothing at all must be reported", pin)
+		}
+		if strings.Contains(err.Error(), "local_cidrs") {
+			t.Fatalf("pin=%v: local_cidrs was never set; the error must not blame it: %v", pin, err)
+		}
+		// The remedy that actually works for an IPv6-only VPC: nothing
+		// under "check the VPC / --remote-cidr / remote_services" helps,
+		// but --no-network still delivers the task's environment, metadata
+		// and role over the session.
+		if !strings.Contains(err.Error(), "--no-network") {
+			t.Errorf("pin=%v: the error must name the way out: %v", pin, err)
+		}
+		if !isUsageError(err) {
+			t.Errorf("pin=%v: pointing tetherd at a VPC it cannot capture is a usage error (exit 2), got %v", pin, err)
+		}
 	}
 }

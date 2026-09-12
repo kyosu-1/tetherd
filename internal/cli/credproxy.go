@@ -13,10 +13,16 @@
 // be handed the task's role instead of the laptop's own.
 //
 // Pointing the child at a loopback port by environment variable instead
-// reaches exactly the child's process tree, needs no root, and cannot
-// collide with anything that owns 169.254.170.2 locally. aws-sdk-go-v2
-// accepts a loopback AWS_CONTAINER_CREDENTIALS_FULL_URI over plain HTTP with
-// no token (isAllowedHost admits ip.IsLoopback() in
+// needs no root operation at all, puts the endpoint on an ephemeral port
+// nothing can guess (rather than the well-known 169.254.170.2 every ECS tool
+// knows), and cannot collide with a tool that owns that address locally. It
+// is *not* scoped to the child: a loopback TCP listener on macOS is
+// reachable by every local process, with no uid or process-tree check - the
+// same trust boundary as the helper's own 127.0.0.1 socket. What it removes
+// is the machine-wide route and the well-known address, not local reach.
+//
+// aws-sdk-go-v2 accepts a loopback AWS_CONTAINER_CREDENTIALS_FULL_URI over
+// plain HTTP with no token (isAllowedHost admits ip.IsLoopback() in
 // config/resolve_credentials.go), and the other SDKs follow the same rule.
 package cli
 
@@ -27,6 +33,7 @@ import (
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -142,22 +149,55 @@ func RewriteContainerEndpoints(taskEnv map[string]string, addr netip.AddrPort) m
 	out := map[string]string{}
 	if p := ContainerCredentialsPath(taskEnv); p != "" {
 		out[fullURIVar] = "http://" + addr.String() + p
-		// Blank the relative form rather than leaving it: aws-sdk-go-v2
-		// checks the relative path *before* the full URI
-		// (resolveCredentials in config/resolve_credentials.go), so leaving
-		// it set would send the child to an address nothing routes any
-		// more - and the same is true of every tool that reads it directly.
-		// Only when the task has it: an empty variable that was never there
-		// is noise in the child's environment.
-		if taskEnv[relativeURIVar] != "" {
-			out[relativeURIVar] = ""
-		}
+		// The relative form is not rewritten here and must not be left
+		// set: it has to be *removed* from the child's environment, which
+		// Run does through env.Options (Exclude drops the task's copy,
+		// StripLocal the developer's). Setting it to "" is not enough, and
+		// the difference is measured, not theoretical:
+		//
+		//   aws-sdk-go-v2 tests emptiness    (len(...) != 0)
+		//   botocore tests *presence*        (ENV_VAR in self._environ)
+		//
+		// so an empty AWS_CONTAINER_CREDENTIALS_RELATIVE_URI sends boto3 -
+		// which is to say `aws s3 ls` - to http://169.254.170.2 + "",
+		// while tetherd has already stripped the developer's own
+		// credentials. Both SDKs check the relative form before the full
+		// URI, so the variable surviving in any shape wins over the
+		// loopback port.
 	}
 	for _, k := range containerMetadataVars {
 		if rewritten, ok := swapHost(taskEnv[k], addr); ok {
 			out[k] = rewritten
 		}
 	}
+	return out
+}
+
+// UnroutableEndpointVars lists the task variables that still name
+// 169.254.170.2 in the child's environment: a value that mentions the
+// endpoint and that rewritten (the result of RewriteContainerEndpoints) did
+// not replace. Passing an unfamiliar value through untouched is the right
+// choice - rewriting a shape tetherd does not understand is worse - but the
+// child cannot reach the address, so it has to be said out loud.
+//
+// Until v0.3a such a value happened to resolve anyway, because
+// 169.254.170.0/24 was captured unconditionally; the warning that covered
+// the other case ("the task advertises a role but 169.254.170.0/24 is not
+// captured") went away with the floor, and this replaces it. Every task
+// variable is scanned, not just the four tetherd knows: an application
+// variable naming the endpoint (a health-check URL, a sidecar address) is
+// exactly as unroutable.
+func UnroutableEndpointVars(taskEnv, rewritten map[string]string) []string {
+	var out []string
+	for k, v := range taskEnv {
+		if _, done := rewritten[k]; done {
+			continue
+		}
+		if strings.Contains(v, awsid.CredentialsHost) {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out) // map order would make the log line flap between runs
 	return out
 }
 

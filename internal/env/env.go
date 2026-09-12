@@ -34,9 +34,23 @@ var DefaultExclude = append([]string{
 }, ContainerPathVars...)
 
 // AWSContainerVars only resolve inside the task: they address
-// 169.254.170.2, which the child reaches through the agent in transparent
-// mode. They are kept there (that is what makes the task role and the task
-// metadata work) and dropped with --no-network, where nothing would answer.
+// 169.254.170.2, which exists nowhere on the laptop. DropAWSContainer
+// removes them, and --no-network sets it.
+//
+// Since v0.3a that is mostly a formality for a task with a role: the CLI
+// serves the task's endpoint on a loopback port and passes rewritten values
+// for these same names through Options.Override (see
+// internal/cli/credproxy.go), which is applied after this exclusion and
+// under --no-network too - the endpoint travels over the session, which
+// --no-network keeps. What DropAWSContainer still decides is the case the
+// CLI did not rewrite: a value naming the endpoint in a shape tetherd does
+// not recognise is dropped under --no-network and passed through (with a
+// warning) in transparent mode.
+//
+// AWS_CONTAINER_CREDENTIALS_RELATIVE_URI is in this list, but a run with a
+// task role does not rely on it: it excludes that name explicitly, in both
+// modes, because leaving it set in *any* shape - including empty - beats the
+// loopback full URI in every SDK's resolution order.
 var AWSContainerVars = []string{
 	"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
 	"ECS_CONTAINER_METADATA_URI_V4",

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/miekg/dns"
 
 	"github.com/kyosu-1/tetherd/internal/agent"
@@ -329,16 +330,31 @@ func TestRunVerifiesTheTaskRoleThroughTheAgent(t *testing.T) {
 	// failure; what matters is that tetherd got that far through the agent
 	// and said so honestly.
 	RunWithDeps(context.Background(), opts, &out, d)
-	if !strings.Contains(out.String(), "iam") {
-		t.Fatalf("no iam line at all: %s", out.String())
-	}
 	// The probe has to travel the child's own path: through the loopback
-	// port, over the session, to the endpoint. A probe that dialed the
-	// session directly would pass this test with the loopback listener
-	// broken, and the child would then be the one to find out.
-	if !strings.Contains(out.String(), "127.0.0.1:") {
-		t.Errorf("the iam line must name the loopback port the child is pointed at: %s", out.String())
+	// port, over the session, to the endpoint - and the line has to say so
+	// on the line that reports the probe, not merely somewhere in the log
+	// (the ✓ endpoint line above already names the port, so a
+	// whole-output Contains check here would pin nothing).
+	if l := iamResultLine(t, out.String()); !strings.Contains(l, "127.0.0.1:") {
+		t.Errorf("the iam line must name the loopback port the child is pointed at, got %q", l)
 	}
+}
+
+// iamResultLine returns the ✓/⚠ iam line that reports what the credential
+// probe found - the one carrying "(via …)". Asserting on this line rather
+// than on the whole log is what makes "the probe went through the loopback
+// proxy" testable: the ✓ endpoint line names the same port a few lines
+// earlier, so a Contains check over out.String() passes even with the iam
+// line reverted to "(via 169.254.170.2)".
+func iamResultLine(t *testing.T, out string) string {
+	t.Helper()
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "iam") && strings.Contains(l, "(via ") {
+			return l
+		}
+	}
+	t.Fatalf("no iam line reporting the probe (a '(via …)' line) in:\n%s", out)
+	return ""
 }
 
 // TestRunTaskRoleOverrideBeatsConfigEnvOverride pins item 8b: a committed
@@ -920,6 +936,16 @@ func TestRunGivesTheChildTheTaskRoleWithoutCapturingTheEndpoint(t *testing.T) {
 	if !strings.HasPrefix(childEnv["AWS_CONTAINER_CREDENTIALS_FULL_URI"], "http://127.0.0.1:") {
 		t.Fatalf("the child must still get the task role: %v", childEnv["AWS_CONTAINER_CREDENTIALS_FULL_URI"])
 	}
+	// Transparent mode is the only place the explicit exclusion of the
+	// relative URI is load-bearing: env.Options.DropAWSContainer (which
+	// --no-network sets) happens to drop the same name, so every
+	// --no-network test would pass with the exclusion deleted - measured.
+	// The workload that matters most, `tetherd run -- aws s3 ls` in
+	// transparent mode, is this one, and botocore reads the variable's
+	// presence.
+	if v, ok := childEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]; ok {
+		t.Fatalf("the relative URI reached the child as %q in transparent mode; botocore would fetch http://169.254.170.2", v)
+	}
 	if strings.Contains(out.String(), "not captured") {
 		t.Errorf("nothing has to be captured for the task role any more: %s", out.String())
 	}
@@ -943,17 +969,45 @@ func TestRunPointsTheChildAtTheLoopbackCredentialProxy(t *testing.T) {
 	p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
 	// The child's exit status carries the assertion: a loopback FULL_URI,
 	// no mention of the endpoint's address, and the relative form cleared.
+	//
+	// The relative form is checked for *presence*, not emptiness:
+	// `[ -z "$X" ]` passes both for a variable that is gone and for one set
+	// to "", and the difference is the whole bug - botocore's
+	// ContainerProvider tests `ENV_VAR in self._environ` and then fetches
+	// http://169.254.170.2 + "", so an empty variable takes `aws s3 ls`
+	// to the address nothing routes while the developer's own credentials
+	// have already been stripped.
 	opts := ssmOpts("sh", "-c", `case "$AWS_CONTAINER_CREDENTIALS_FULL_URI" in http://127.0.0.1:*/v2/credentials/abc) ;; *) exit 11;; esac
-		[ -z "$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" ] || exit 12
+		if [ "${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI+set}" = set ]; then exit 12; fi
 		case "$ECS_CONTAINER_METADATA_URI_V4" in *169.254*) exit 13;; esac
-		case "$ECS_CONTAINER_METADATA_URI_V4" in http://127.0.0.1:*/v4/task) ;; *) exit 14;; esac`)
+		case "$ECS_CONTAINER_METADATA_URI_V4" in http://127.0.0.1:*/v4/task) ;; *) exit 14;; esac
+		exit 0`)
 	var out strings.Builder
 	code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p))
 	if err != nil || code != 0 {
 		t.Fatalf("the child rejected its environment: code=%d err=%v log=%s", code, err, out.String())
 	}
-	if !strings.Contains(out.String(), "127.0.0.1:") {
-		t.Errorf("the iam line must say where the child was pointed: %s", out.String())
+	if l := iamResultLine(t, out.String()); !strings.Contains(l, "127.0.0.1:") {
+		t.Errorf("the iam line must say where the child was pointed, got %q", l)
+	}
+}
+
+// TestRunRemovesTheRelativeURIEvenFromTheDevelopersOwnEnvironment: the
+// variable has to be gone from the child whatever its source. It is not in
+// env.LocalAWSCredentialVars (that list is about the developer's own
+// identity), so a copy exported in the shell would otherwise survive the
+// task's copy being excluded - and botocore would read it.
+func TestRunRemovesTheRelativeURIEvenFromTheDevelopersOwnEnvironment(t *testing.T) {
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/credentials/mine")
+	ag := startAgentFor(t, map[string]string{
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/abc",
+	}, nil, endpointReturning(t, http.StatusServiceUnavailable, "no credentials for you"))
+	p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+	opts := ssmOpts("sh", "-c", `if [ "${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI+set}" = set ]; then exit 12; fi
+		exit 0`)
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, depsFor(p)); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
 	}
 }
 
@@ -1042,6 +1096,11 @@ func TestRunServesTheTaskEndpointToTheChildOverLoopback(t *testing.T) {
 	if !strings.HasPrefix(full, "http://127.0.0.1:") {
 		t.Fatalf("AWS_CONTAINER_CREDENTIALS_FULL_URI = %q: %s", full, out.String())
 	}
+	// `env` prints an empty variable as "NAME=", so the key being absent
+	// from this map is exactly the property botocore needs: not empty, gone.
+	if v, ok := childEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]; ok {
+		t.Fatalf("the relative URI reached the child as %q; botocore branches on its presence and would fetch http://169.254.170.2", v)
+	}
 	// The credential path: the task's own 503 has to arrive, which proves
 	// the request travelled endpoint-ward rather than failing at the proxy.
 	resp, err := http.Get(full)
@@ -1099,6 +1158,154 @@ func endpointReturning(t *testing.T, status int, body string) func(context.Conte
 	go srv.Serve(cl)
 	return func(ctx context.Context, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "tcp", cl.Addr().String())
+	}
+}
+
+// credentialEndpoint is a fake 169.254.170.2 that serves usable-looking
+// container credentials, for the tests that need Run's probe to get past
+// FetchContainerCredentials and on to the STS leg.
+func credentialEndpoint(t *testing.T) func(context.Context, string) (net.Conn, error) {
+	t.Helper()
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"AccessKeyId":"AKIAEXAMPLE","SecretAccessKey":"s3cret","Token":"tok","Expiration":%q}`,
+			time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+	})}
+	cl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	go srv.Serve(cl)
+	return func(ctx context.Context, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", cl.Addr().String())
+	}
+}
+
+// TestRunSeparatesTheCredentialLegFromTheSTSLeg: the ✓ iam check has two
+// halves and only one of them is about the child. The credential fetch is
+// hermetic (loopback → the session → the task) and decides whether the child
+// has an AWS identity at all; sts:GetCallerIdentity leaves the laptop's own
+// network for sts.<region>.amazonaws.com and only names the role.
+//
+// Collapsing them - which is what this task's first round did - means a
+// developer offline, behind a proxy, or on --no-network with no
+// connectivity reads "the task role could not be verified; the child may
+// have no AWS identity" about a child that can sign perfectly well.
+func TestRunSeparatesTheCredentialLegFromTheSTSLeg(t *testing.T) {
+	// The developer's own credentials are in the environment, so the
+	// "removed so the task role applies" line is reached either way.
+	t.Setenv("AWS_PROFILE", "mine")
+
+	run := func(t *testing.T, identity func(context.Context, aws.Credentials, string) (string, error), dial func(context.Context, string) (net.Conn, error)) string {
+		t.Helper()
+		ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil, dial)
+		p := &fakeProvider{region: "ap-northeast-1", task: transport.Task{ID: "t1"}, agentAddr: ag.addr}
+		d := depsFor(p)
+		d.CallerIdentity = identity
+		var out strings.Builder
+		if code, err := RunWithDeps(context.Background(), ssmOpts("true"), &out, d); err != nil || code != 0 {
+			t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+		}
+		return out.String()
+	}
+
+	t.Run("both legs succeed", func(t *testing.T) {
+		out := run(t, func(context.Context, aws.Credentials, string) (string, error) {
+			return "arn:aws:sts::1:assumed-role/dev-task/abc", nil
+		}, credentialEndpoint(t))
+		l := iamResultLine(t, out)
+		if !strings.Contains(l, "✓ iam") || !strings.Contains(l, "assumed-role/dev-task") {
+			t.Errorf("want the ARN on a ✓ iam line, got %q", l)
+		}
+		// The successful line has to name the loopback port too: it is the
+		// line a developer reads to know where their child is pointed.
+		if !strings.Contains(l, "127.0.0.1:") {
+			t.Errorf("the ✓ iam line must name the loopback port, got %q", l)
+		}
+		if !strings.Contains(out, "✓ env      local AWS credentials") {
+			t.Errorf("the strip must be reported as good news: %s", out)
+		}
+	})
+
+	t.Run("the credentials arrive but STS cannot be reached", func(t *testing.T) {
+		out := run(t, func(context.Context, aws.Credentials, string) (string, error) {
+			return "", errors.New("dial tcp: lookup sts.ap-northeast-1.amazonaws.com: no such host")
+		}, credentialEndpoint(t))
+		line := iamResultLine(t, out)
+		if !strings.Contains(line, "could not confirm") || !strings.Contains(line, "no such host") {
+			t.Errorf("the line must say STS is what failed, got %q", line)
+		}
+		if strings.Contains(line, "127.0.0.1") == false {
+			t.Errorf("and still say where the credentials came from, got %q", line)
+		}
+		// The child can sign: the credentials reached tetherd over the same
+		// path the child uses. Warning that it "may have no AWS identity"
+		// would be a false alarm.
+		if !strings.Contains(out, "✓ env      local AWS credentials") {
+			t.Errorf("STS being unreachable must not be reported as the child having no identity: %s", out)
+		}
+	})
+
+	t.Run("the credentials do not arrive", func(t *testing.T) {
+		out := run(t, func(context.Context, aws.Credentials, string) (string, error) {
+			t.Error("sts must not be asked about credentials that never arrived")
+			return "", nil
+		}, endpointReturning(t, http.StatusServiceUnavailable, "no credentials for you"))
+		if l := iamResultLine(t, out); !strings.Contains(l, "HTTP 503") {
+			t.Errorf("want the endpoint's own failure, got %q", l)
+		}
+		if !strings.Contains(out, "⚠ env      local AWS credentials") {
+			t.Errorf("this is the case where the child may have no identity, and it must say so: %s", out)
+		}
+	})
+}
+
+// TestRunWarnsAboutATaskValueItCannotRewrite: a value that names
+// 169.254.170.2 in a shape tetherd does not rewrite (https, a stray space,
+// an application variable) reaches the child unroutable. Passing it through
+// is right; saying nothing is not - until v0.3a it resolved anyway, because
+// 169.254.170.0/24 was captured unconditionally.
+func TestRunWarnsAboutATaskValueItCannotRewrite(t *testing.T) {
+	taskEnv := map[string]string{
+		"APP_METADATA_URL":              "https://169.254.170.2/v4/app",
+		"ECS_CONTAINER_METADATA_URI_V4": "http://169.254.170.2/v4/task",
+	}
+	ag := startAgentFor(t, taskEnv, nil, nil)
+	p := &fakeProvider{
+		region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.ExecPath = "/usr/bin/true"
+
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if !strings.Contains(out.String(), "APP_METADATA_URL") || !strings.Contains(out.String(), "pin_credential_route") {
+		t.Errorf("the warning must name the variable and the way to make it work: %s", out.String())
+	}
+	// The rewritten one is not stuck and must not be named.
+	if strings.Contains(out.String(), "ECS_CONTAINER_METADATA_URI_V4") {
+		t.Errorf("a rewritten variable must not be warned about: %s", out.String())
+	}
+
+	// With the route pin on, the address *is* captured, so the value
+	// resolves and there is nothing to warn about.
+	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+	opts.PinCredentialRoute = true
+	var pinned strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &pinned, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, pinned.String())
+	}
+	if strings.Contains(pinned.String(), "APP_METADATA_URL") {
+		t.Errorf("with the endpoint captured the value resolves; warning about it is noise: %s", pinned.String())
 	}
 }
 

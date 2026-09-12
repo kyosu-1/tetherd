@@ -16,6 +16,7 @@ import (
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
 	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
 
+	"github.com/kyosu-1/tetherd/internal/awsid"
 	"github.com/kyosu-1/tetherd/internal/capture"
 	"github.com/kyosu-1/tetherd/internal/capture/pfrdr"
 	"github.com/kyosu-1/tetherd/internal/helper"
@@ -77,6 +78,13 @@ type Deps struct {
 	NewAWSProvider func(ctx context.Context, opts RunOptions) (awsProvider, error)
 	DialHelper     func(socket string) (HelperClient, error)
 	NewCapturer    func(h HelperClient, logf func(string, ...any)) Capturer
+	// CallerIdentity names the role behind the credentials the task's
+	// endpoint served. It is the one leg of the ✓ iam check that leaves the
+	// laptop's own network (sts.<region>.amazonaws.com has nothing to do
+	// with the session), so it is injected: a test must be able to exercise
+	// "the credentials arrived but STS could not be asked" - the state of
+	// every offline run - without reaching for the network itself.
+	CallerIdentity func(ctx context.Context, creds aws.Credentials, region string) (string, error)
 
 	// The four below are what `tetherd doctor` reads about the machine it
 	// runs on, injected for the same reason the AWS provider is: a check
@@ -111,6 +119,11 @@ func (d Deps) withDefaults() Deps {
 			c := pfrdr.New(h)
 			c.Logf = logf
 			return c
+		}
+	}
+	if d.CallerIdentity == nil {
+		d.CallerIdentity = func(ctx context.Context, creds aws.Credentials, region string) (string, error) {
+			return awsid.CallerIdentity(ctx, creds, region)
 		}
 	}
 	if d.LookupGroup == nil {
