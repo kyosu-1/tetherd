@@ -557,9 +557,11 @@ design.md §10 に加えて:
 | 8 | 1 台 1 セッション | ✅ 2 つ目が `rejected by agent (duplicate_user)` |
 | 14 | `tetherd doctor` の 10 項目 | ✅ helper・setgid・plugin・AWS 認証・タスク・pidMode・agent セッション・捕捉範囲・ローカルアドレスが緑。`remote domains` の行は偽陰性が見つかり修正（下記） |
 | 19 | 存在しない名前が NXDOMAIN として即座に返る | ✅ `dns nope.myapp.internal: not found` が出て `gaierror` が 0.06 秒で返る（SERVFAIL のリトライ待ちが無い） |
-| 15 | doctor が 1 つ失敗しても残りを続ける | 未実施 |
-| 16 | `remote_services: [s3]` の prefix list がページングされて数百件入る | 未実施 |
-| 17-18 | `local_cidrs` の分割引き算と、全部消したときのエラー | 未実施 |
+| 15 | doctor が 1 つ失敗しても残りを続ける | ✅ `service: nope` にすると `✗ attachable task` に `ServiceNotFoundException` が出て exit 1、残る 6 行は `!` で「not checked: …」と理由付きで出続ける |
+| 16 | `remote_services: [s3]` の prefix list が入る | ✅ `remote_services s3 → 15 prefixes` と出て、`✓ network` 行に `3.5.152.0/21` `52.219.0.0/20` などが並ぶ。`ap-northeast-1` の S3 は 15 件（当初「数百件」と書いていたのは誤り。API は 1 ページ 100 件で切るのでページングは依然必要で、`--max-results 5` を指定すると実際に `NextToken` が返る） |
+| 17 | `local_cidrs` の分割引き算 | ✅ `local_cidrs: [10.0.5.0/24]` で `10.0.0.0/16` が `10.0.0.0/22, 10.0.4.0/24, 10.0.6.0/23, 10.0.8.0/21, 10.0.16.0/20, 10.0.32.0/19, 10.0.64.0/18, 10.0.128.0/17` の 8 本になる（ユニットテストの property 検証と完全に一致） |
+| 18 | 全部消したときのエラー | ✅ `local_cidrs: [10.0.0.0/8, 169.254.0.0/16]` で `✗ network.local_cidrs excludes the entire remote set; nothing would be captured`、exit 1 |
+| 11-13 | `tetherd env` | ✅（上記） |
 
 検証のために agent イメージを再ビルド・再デプロイした（`make push-images` + `aws ecs update-service --force-new-deployment`、linux/amd64 + linux/arm64）。再デプロイ前は `✗ remote domains: this agent does not support name resolution; upgrade the sidecar` と出ており、今夜追加したバージョン不一致メッセージが実機で正しく機能することの確認にもなった。
 
