@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -33,5 +34,147 @@ func TestApplyConfigFillsUnsetFlagsOnly(t *testing.T) {
 		len(captured.LocalCIDRs) != 1 || len(captured.RemoteDomains) != 1 || len(captured.RemoteServices) != 1 ||
 		captured.EnvOverride["PORT"] != "8080" {
 		t.Errorf("network/env blocks must be applied: %+v", captured)
+	}
+}
+
+// TestApplyConfigExplicitMissingConfigErrors pins item 1: --config naming a
+// file that does not exist must fail loudly (the run would otherwise fall
+// through to "defaults" and die complaining about --cluster instead of
+// about the typo'd path).
+func TestApplyConfigExplicitMissingConfigErrors(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	runFn = func(opts RunOptions) (int, error) { return 0, nil }
+	t.Cleanup(func() { runFn = defaultRun })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"run", "--config", filepath.Join(dir, "typo.yml"), "--cluster", "c", "--service", "s", "--", "true"})
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("an explicitly named missing --config must error")
+	}
+	if !strings.Contains(err.Error(), "typo.yml") {
+		t.Errorf("the error must name the missing path: %v", err)
+	}
+}
+
+// TestApplyConfigDiscoveredMissingConfigIsFine is the other half of item 1:
+// a config that is merely *looked for* (no --config given) and not found is
+// not an error - only a path the operator typed themselves must be.
+func TestApplyConfigDiscoveredMissingConfigIsFine(t *testing.T) {
+	dir := t.TempDir() // empty: no .tetherd.yml here or above it, ideally
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	t.Chdir(dir)
+
+	configPath = ""
+	cmd := newRunCommand()
+	var opts RunOptions
+	if err := applyConfig(cmd, &opts); err != nil {
+		t.Fatalf("a missing discovered config must not error: %v", err)
+	}
+}
+
+// TestApplyConfigUnionsRemoteCIDRsWithFlags pins item 4: --remote-cidr is
+// documented as "additional" and repeatable, so a config-committed range and
+// a flag-supplied one must both reach RunOptions, not just the flag's.
+func TestApplyConfigUnionsRemoteCIDRsWithFlags(t *testing.T) {
+	dir := t.TempDir()
+	body := "version: 1\nnetwork:\n  remote_cidrs: [10.9.0.0/16, 10.1.0.0/16]\n"
+	if err := os.WriteFile(filepath.Join(dir, ".tetherd.yml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+
+	var captured RunOptions
+	runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+	t.Cleanup(func() { runFn = defaultRun })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"run", "--config", filepath.Join(dir, ".tetherd.yml"),
+		"--remote-cidr", "10.1.0.0/16", "--remote-cidr", "172.20.0.0/16",
+		"--transport", "direct", "--agent-addr", "x:1", "--", "true"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"10.9.0.0/16": true, "10.1.0.0/16": true, "172.20.0.0/16": true}
+	if len(captured.RemoteCIDRs) != len(want) {
+		t.Fatalf("RemoteCIDRs = %v, want the union of config and flags (deduplicated): %v", captured.RemoteCIDRs, want)
+	}
+	for _, c := range captured.RemoteCIDRs {
+		if !want[c] {
+			t.Errorf("unexpected CIDR %q in %v", c, captured.RemoteCIDRs)
+		}
+	}
+	if captured.RemoteCIDRs[0] != "10.9.0.0/16" {
+		t.Errorf("config values must come first: %v", captured.RemoteCIDRs)
+	}
+}
+
+// TestApplyConfigUserRespectsExplicitEmptyFlag pins item 6: Changed("user"),
+// not a zero-value check, decides whether the flag was set - `--user ""` is
+// an explicit (if odd) choice and must not fall through to the personal
+// file or $USER.
+func TestApplyConfigUserRespectsExplicitEmptyFlag(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	if err := os.MkdirAll(filepath.Join(home, ".tetherd"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	personalBody := "user: shota\ntoken: tok\n"
+	if err := os.WriteFile(filepath.Join(home, ".tetherd", "config.yml"), []byte(personalBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USER", "env-user")
+	t.Chdir(dir) // no .tetherd.yml here or above it: nothing to discover
+
+	var captured RunOptions
+	runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+	t.Cleanup(func() { runFn = defaultRun })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"run", "--transport", "direct", "--agent-addr", "x:1", "--user", "", "--", "true"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if captured.User != "" {
+		t.Errorf("an explicit --user \"\" must win over the personal file and $USER: %q", captured.User)
+	}
+}
+
+// TestApplyConfigPersonalOverridesShared closes the mutation gap in item 8a:
+// a mutant that reverses precedence (shared beating personal) or that drops
+// the `opts.User = cfg.Personal.User` fallback must fail this test.
+func TestApplyConfigPersonalOverridesShared(t *testing.T) {
+	dir := t.TempDir()
+	sharedBody := "version: 1\naws:\n  profile: shared-profile\n  region: ap-northeast-1\n"
+	if err := os.WriteFile(filepath.Join(dir, ".tetherd.yml"), []byte(sharedBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(dir, "home")
+	if err := os.MkdirAll(filepath.Join(home, ".tetherd"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	personalBody := "user: shota\ntoken: tok\naws:\n  profile: personal-profile\n  region: ap-southeast-2\n"
+	if err := os.WriteFile(filepath.Join(home, ".tetherd", "config.yml"), []byte(personalBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+
+	var captured RunOptions
+	runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
+	t.Cleanup(func() { runFn = defaultRun })
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"run", "--config", filepath.Join(dir, ".tetherd.yml"), "--", "true"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if captured.Profile != "personal-profile" || captured.Region != "ap-southeast-2" {
+		t.Errorf("the personal file must win over the shared file: %+v", captured)
+	}
+	if captured.User != "shota" {
+		t.Errorf("user must come from the personal file: %q", captured.User)
 	}
 }

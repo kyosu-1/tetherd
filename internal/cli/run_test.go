@@ -29,6 +29,8 @@ func TestParseRemoteCIDRs(t *testing.T) {
 }
 
 func TestRunCommandDirectFlags(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
 	var captured RunOptions
 	runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
 	t.Cleanup(func() { runFn = defaultRun })
@@ -51,6 +53,8 @@ func TestRunCommandDirectFlags(t *testing.T) {
 }
 
 func TestRunCommandParsesFlagsAndCommand(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
 	var captured RunOptions
 	runFn = func(opts RunOptions) (int, error) { captured = opts; return 0, nil }
 	t.Cleanup(func() { runFn = defaultRun })
@@ -93,6 +97,8 @@ func TestRunSSMRequiresClusterAndService(t *testing.T) {
 }
 
 func TestExitCodeMapping(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
 	t.Run("child exit code", func(t *testing.T) {
 		runFn = func(opts RunOptions) (int, error) { return 7, nil }
 		t.Cleanup(func() { runFn = defaultRun })
@@ -221,6 +227,8 @@ func TestCheckTargetEnv(t *testing.T) {
 }
 
 func TestRunRequiresCommand(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
 	root := NewRootCommand()
 	root.SetArgs([]string{"run", "--transport", "direct", "--agent-addr", "x:1"})
 	root.SetErr(&bytes.Buffer{})

@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -214,6 +216,99 @@ func TestRunVerifiesTheTaskRoleThroughTheAgent(t *testing.T) {
 	if strings.Contains(out.String(), "the task advertises a role but") {
 		t.Errorf("169.254.170.0/24 is captured, so the not-captured warning must not fire: %s", out.String())
 	}
+}
+
+// TestRunTaskRoleOverrideBeatsConfigEnvOverride pins item 8b: a committed
+// .tetherd.yml naming AWS_CONFIG_FILE in env.override must not be able to
+// defeat the task-role hardening that hides the developer's shared AWS
+// config from the child - that would hand the child the developer's own
+// identity while the status line still prints a green iam line. The
+// credential endpoint is made to fail on purpose, exactly as in
+// TestRunVerifiesTheTaskRoleThroughTheAgent above: the override is built as
+// soon as the task role is *reachable* (before the credential fetch even
+// happens), so this failure mode is provable without a real STS call.
+//
+// With !opts.NoNetwork, Run execs opts.ExecPath (the setgid tetherd-exec in
+// production) and passes the real command as trailing args for *it* to run;
+// a stand-in like "/usr/bin/true" (used elsewhere in this file to satisfy
+// the pre-flight stat) never looks at those args, so it cannot be used to
+// observe child.Env here. Instead ExecPath is pointed at a throwaway shell
+// script that dumps its own environment - which is exactly child.Env, built
+// by the env.Merge call this test is pinning - to a file this test reads
+// back directly.
+func TestRunTaskRoleOverrideBeatsConfigEnvOverride(t *testing.T) {
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no credentials for you", http.StatusServiceUnavailable)
+	})}
+	cl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	go srv.Serve(cl)
+
+	ag := startAgentFor(t, map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}, nil,
+		func(ctx context.Context, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", cl.Addr().String())
+		})
+	p := &fakeProvider{
+		region: "ap-northeast-1", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+
+	dir := t.TempDir()
+	dump := filepath.Join(dir, "env-dump")
+	content := filepath.Join(dir, "aws-config-file-content")
+	script := filepath.Join(dir, "fake-exec.sh")
+	// Both dumps happen from inside the fake exec while it stands in for the
+	// child: the real AWS_CONFIG_FILE temp file only lives until Run returns
+	// (its cleanup is deferred there), so its content has to be captured
+	// synchronously, during this script's run, not read back afterwards.
+	fakeExec := "#!/bin/sh\nenv > " + dump + "\ncat \"$AWS_CONFIG_FILE\" > " + content + " 2>/dev/null\nexit 0\n"
+	if err := os.WriteFile(script, []byte(fakeExec), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const poison = "/tmp/tetherd-test-should-not-win"
+	opts := ssmOpts("true") // never actually run: the fake exec above ignores its args
+	opts.NoNetwork = false
+	opts.ExecPath = script
+	opts.EnvOverride = map[string]string{"AWS_CONFIG_FILE": poison}
+	var out strings.Builder
+	code, err := RunWithDeps(context.Background(), opts, &out, d)
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+
+	env := map[string]string{}
+	for _, line := range strings.Split(strings.TrimRight(readFile(t, dump), "\n"), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			env[k] = v
+		}
+	}
+	got, ok := env["AWS_CONFIG_FILE"]
+	if !ok {
+		t.Fatal("AWS_CONFIG_FILE was not set in the child's environment at all")
+	}
+	if got == poison {
+		t.Fatalf("the task-role AWS_CONFIG_FILE must win over a config env.override of the same name, got the config's value %q", got)
+	}
+	if b := readFile(t, content); b != "" {
+		t.Fatalf("the task-role AWS_CONFIG_FILE must name an empty file (the task-role hiding effect), got %q: %q", got, b)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 func TestRunWarnsWhenTheCredentialEndpointIsNotCaptured(t *testing.T) {
