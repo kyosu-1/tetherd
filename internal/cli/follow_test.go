@@ -686,6 +686,35 @@ func TestFollowerWithNoIntervalWaitsForTheDefaultBeforePolling(t *testing.T) {
 	// tasks DiscoverAll returned itself before starting the follower:
 	// Set.Primary() supplies the child's environment at startup, and an
 	// immediate tick would race that attach for the primary.
+	//
+	// The value itself is pinned here because nothing else can pin it:
+	// every test that runs a follower names its own interval (see
+	// pinFollowInterval), so the production one travels no test path, and
+	// the assertion below - "not within 50ms" - holds for any interval
+	// longer than that. Measured: `followInterval = 10 * time.Minute`
+	// compiled, was gofmt-clean and left `go test -race ./internal/cli/`
+	// green. In production that leaves a task a deploy has just added
+	// unattached for ten minutes while the ALB sends it requests, so a
+	// share of this developer's traffic reaches the deployed application
+	// instead of their laptop - the v0.3b hole, reopened proportionally.
+	// Zero is already caught (time.NewTicker panics and startFollower
+	// reports it), so the interval's positivity is pinned by accident while
+	// its value is not.
+	//
+	// Against the literal, not against the constant: `followInterval >=
+	// someConstant` is satisfied by a constant of zero, which is how the
+	// identical finding on DefaultAttachRetryBudget could have been fixed
+	// without fixing anything.
+	if followInterval != 10*time.Second {
+		t.Errorf("followInterval = %s, want the 10 seconds spec §6.2 fixes it at", followInterval)
+	}
+	// And the var run.go hands the Follower, which is the interval a real
+	// `tetherd run` polls at. A test may pin it - pinFollowInterval puts it
+	// back - but its value at rest is the constant above.
+	if followPollInterval != 10*time.Second {
+		t.Errorf("followPollInterval = %s, want the 10 seconds every real command polls at", followPollInterval)
+	}
+
 	var calls atomic.Int64
 	f := &Follower{
 		Set: &SessionSet{Logf: noLog}, // Interval left at zero on purpose

@@ -589,10 +589,12 @@ func targetLine(opts RunOptions, tasks []transport.Task) string {
 	primary := tasks[0]
 	// The age is the primary's: it is the task whose environment the child
 	// is running with, and (oldest first) the one a deploy replaces last.
-	started := ""
-	if !primary.StartedAt.IsZero() {
-		started = fmt.Sprintf("  (started %s ago)", time.Since(primary.StartedAt).Round(time.Minute))
-	}
+	//
+	// startedAgo, so that one function renders every age tetherd prints: a
+	// single `tetherd status` puts this line and status.go's own task rows
+	// on one screen, about the same task and from the same StartedAt, and
+	// Round(time.Minute) wrote "2h12m0s" where those rows say "2h12m".
+	started := startedAgo(primary.StartedAt)
 	if len(tasks) == 1 {
 		return fmt.Sprintf("%s/%s  task %s%s", opts.Cluster, opts.Service, short(primary.ID), started)
 	}

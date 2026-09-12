@@ -3028,6 +3028,10 @@ func TestTargetLine(t *testing.T) {
 	// StartedAt, which is every task that reached this line without a
 	// DescribeTasks behind it. Without that case, dropping the guard prints
 	// "(started 497006h23m0s ago)" and no test notices.
+	//
+	// The age clause is startedAgo's, the same renderer status.go's task
+	// rows use: one `tetherd status` prints both about the same task, and
+	// two spellings of one age on one screen read as two different ages.
 	opts := RunOptions{Cluster: "tetherd-dev", Service: "api"}
 	started := time.Now().Add(-14 * time.Minute)
 	long, other, third := "fbc1abc4-1111", "a17e1234-2222", "c0ffee00-3333"
@@ -3044,7 +3048,7 @@ func TestTargetLine(t *testing.T) {
 		{
 			name:  "one task",
 			tasks: []transport.Task{{ID: long, StartedAt: started}},
-			want:  "tetherd-dev/api  task fbc1abc4…  (started 14m0s ago)",
+			want:  "tetherd-dev/api  task fbc1abc4…  (started 14m ago)",
 		},
 		{
 			name: "two tasks",
@@ -3052,7 +3056,7 @@ func TestTargetLine(t *testing.T) {
 				{ID: long, StartedAt: started},
 				{ID: other, StartedAt: time.Now().Add(-time.Minute)},
 			},
-			want: "tetherd-dev/api  2 tasks (fbc1abc4… primary, a17e1234…)  (started 14m0s ago)",
+			want: "tetherd-dev/api  2 tasks (fbc1abc4… primary, a17e1234…)  (started 14m ago)",
 		},
 		{
 			name:  "two tasks, no start time",
@@ -3066,7 +3070,7 @@ func TestTargetLine(t *testing.T) {
 				{ID: other, StartedAt: time.Now().Add(-2 * time.Minute)},
 				{ID: third, StartedAt: time.Now().Add(-time.Minute)},
 			},
-			want: "tetherd-dev/api  3 tasks (fbc1abc4… primary, a17e1234…, c0ffee00…)  (started 14m0s ago)",
+			want: "tetherd-dev/api  3 tasks (fbc1abc4… primary, a17e1234…, c0ffee00…)  (started 14m ago)",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3349,6 +3353,106 @@ func TestRunFollowsADeployByAttachingToANewTask(t *testing.T) {
 	r := <-done
 	if r.err != nil {
 		t.Errorf("the run was ended by its context, so it must report no failure: code=%d err=%v\n%s", r.code, r.err, out.String())
+	}
+}
+
+// TestRunSurvivesADeployThatReplacesEveryTaskItAttachedTo is v0.3b's
+// headline property end to end: a rolling deploy stops every task the run
+// attached to at startup, and the run carries on through the sessions the
+// follower opened to the replacements.
+//
+// It exists because that property hangs on one line of run.go - loss.watch
+// in the Follower's Attach closure - and nothing travelled it. Measured:
+// deleting that line left `go test -race ./internal/cli/` green, while in
+// production the sessions the follower opens go uncounted, so the moment the
+// last startup session dies - which a rolling deploy guarantees, because it
+// replaces every task in turn - the run ends with "agent session lost" while
+// live sessions to the replacement tasks are attached. That is the v0.3a
+// failure this change exists to remove (plan completion condition 3).
+//
+// The three tests that look like they cover it each stop one step short, and
+// deliberately: TestRunSurvivesASecondaryTaskGoingAway pins the poll out of
+// reach so the session lost is one the *startup* attach opened,
+// TestRunFollowsADeployByAttachingToANewTask never kills the old task, and
+// TestSessionLossForgetsItsReportWhenASessionComesBack calls l.watch itself
+// and so cannot see whether run.go wires it. So here the follower has to do
+// the attach - through RunWithDeps, not through a Follower this test builds -
+// and every session the startup attach opened has to be gone afterwards.
+func TestRunSurvivesADeployThatReplacesEveryTaskItAttachedTo(t *testing.T) {
+	pinFollowInterval(t, followFast)
+	first := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	second := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	third := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	older := transport.Task{ID: "older", StartedAt: time.Unix(1000, 0), Addr: first.addr}
+	newer := transport.Task{ID: "newer", StartedAt: time.Unix(2000, 0), Addr: second.addr}
+	newest := transport.Task{ID: "newest", StartedAt: time.Unix(3000, 0), Addr: third.addr}
+	tr := &breakableTransport{} // no addr: each task's own Addr is dialed
+	p := &fakeProvider{region: "r", tasks: []transport.Task{older, newer}, tr: tr}
+
+	// The child ignores SIGINT and blocks until this test releases it, so
+	// whether the run is still alive is decided by files and by its result
+	// rather than by a sleep race: a run that ended cancelled its context
+	// on the way out and the child died with it.
+	dir := t.TempDir()
+	started, release, finished := filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "finished")
+	script := writeChildScript(t, "echo up > "+started+"\n"+
+		"while [ ! -f "+release+" ]; do sleep 0.05; done\n"+
+		"echo done > "+finished+"\n")
+
+	var out safeLog
+	done, _ := runWithCancel(t, stealingOpts("/bin/sh", script), &out, depsFor(p))
+	waitFor(t, func() bool { return len(first.a.Sessions()) == 1 && len(second.a.Sessions()) == 1 }, "both of the service's tasks to be attached at startup")
+	waitForFile(t, started)
+
+	// The deploy, in the order ECS does it: the replacement is RUNNING and
+	// listed before the tasks it replaces go away. The follower's own log
+	// line is waited for as well as the session, because the startup attach
+	// cannot have produced that line - past this point the replacement's
+	// session provably came from the Attach closure under test.
+	p.setTasks(older, newer, newest)
+	waitFor(t, func() bool { return len(third.a.Sessions()) == 1 }, "the follower to attach to the task the deploy added")
+	waitFor(t, func() bool { return strings.Contains(out.String(), "task newest attached") }, "the follower's line naming the task it attached")
+
+	// Now every task the run started with goes away: dropped from the
+	// service and its forward cut, which are the two halves of what a
+	// stopped task does to a session. Both, so that neither the Retain nor
+	// the Reap path is what this depends on.
+	p.setTasks(newest)
+	tr.breakTask("older")
+	tr.breakTask("newer")
+	waitFor(t, func() bool { return len(first.a.Sessions()) == 0 && len(second.a.Sessions()) == 0 }, "both startup sessions to end")
+
+	// The assertion that names the bug, and the fast one: sessionLoss
+	// publishes the instant the last session it counted dies, so a
+	// replacement that was never counted shows up here in milliseconds.
+	if reachedWithin(500*time.Millisecond, func() bool { return strings.Contains(out.String(), "agent session lost") }) {
+		t.Fatalf("the run reported every session lost while it was attached to task newest; a rolling deploy does this to every task in turn, so this ends every run that outlives a deploy\n%s", out.String())
+	}
+	select {
+	case r := <-done:
+		t.Fatalf("the run ended when the deploy replaced the tasks it started with (code=%d err=%v)\n%s", r.code, r.err, out.String())
+	default:
+	}
+	if _, err := os.Stat(finished); err == nil {
+		t.Fatal("the child finished on its own; this test proves nothing")
+	}
+	if n := len(third.a.Sessions()); n != 1 {
+		t.Fatalf("the replacement task holds %d sessions, want the one the run is carrying on through\n%s", n, out.String())
+	}
+
+	if err := os.WriteFile(release, []byte("go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.code != 0 || r.err != nil {
+			t.Errorf("the run must end with its child and nothing else: code=%d err=%v\n%s", r.code, r.err, out.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never returned after the child finished")
+	}
+	if strings.Contains(out.String(), "agent session lost") {
+		t.Errorf("every task the run attached to at startup went away, but it was attached to their replacement throughout:\n%s", out.String())
 	}
 }
 
