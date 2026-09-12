@@ -25,9 +25,11 @@ import (
 // The header names the agent matches a request against when
 // incoming.match leaves them out. internal/config applies no defaults of
 // its own - incoming.match is free text there - and the agent treats an
-// empty header name as "matches nothing", silently, forever. So this is the
-// only place the defaults can live: whatever ends up in proto.Hello is what
-// the agent will compare against.
+// empty header name as "matches nothing": it says so once at attach
+// (internal/agent/registry.go's incomingGap, logged from register) and then
+// sends every request to the application for the life of the session. So
+// this is the only place the defaults can live: whatever ends up in
+// proto.Hello is what the agent will compare against.
 const (
 	DefaultMatchHeader      = "X-Dev-User"
 	DefaultMatchTokenHeader = "X-Dev-Token"
@@ -97,8 +99,13 @@ type stealConfig struct {
 // stealSettings decides whether this run accepts stolen requests and what
 // the agent has to match to send one. It is the only place any of the three
 // defaults is applied: internal/config holds none (docs/config.md says so),
-// and the agent treats an empty header name as "matches nothing", silently
-// and forever.
+// and the agent treats an empty header name as "matches nothing" - it logs
+// that gap once at attach (internal/agent/registry.go's incomingGap) and
+// then sends every request to the application.
+//
+// Because this function always fills both header names and refuses an empty
+// token, that warning is unreachable from this CLI: only a hand-built
+// proto.Hello - an older or third-party client - can trip it.
 //
 // The returned Incoming is what the agent matches against, so it is matched
 // literally: the token comparison is crypto/subtle.ConstantTimeCompare and
@@ -139,8 +146,16 @@ func stealSettings(opts RunOptions) (stealConfig, error) {
 //
 // ReadHeaderTimeout applies only to the request line and headers, which the
 // agent writes immediately after opening the stream; net/http clears the
-// read deadline once they are in, so a slow endpoint - or a stolen
-// websocket that idles for an hour - is not cut off by it.
+// read deadline once they are in, so what the developer's process does
+// after that is unbounded here - a report that takes a minute, an SSE
+// stream that sits idle between events. Those are the reachable cases and
+// the reason this is not a whole-stream ReadTimeout.
+//
+// An upgraded stream would want the same, but the agent sends every Upgrade
+// request to the application instead of stealing it (internal/agent's
+// Proxy.Handler), so a stolen websocket cannot arrive here today. Do not
+// turn this into a whole-stream bound on the belief that it could not
+// matter: the streaming cases above make it matter without any upgrade.
 //
 // IdleTimeout is a backstop, not a negotiation with the other end. An
 // earlier version of this comment said it had to exceed
@@ -190,9 +205,12 @@ func (s *StealServer) Serve(stream net.Conn) {
 	// One stream is one connection, not a listener. http.Server.Serve
 	// returns as soon as it has handed the connection to its own goroutine,
 	// so the listener's second Accept is what waits for it to finish:
-	// returning any earlier would close the stream from under the request
-	// (and from under a stolen websocket, which lives for as long as the
-	// developer keeps it open).
+	// returning any earlier would close the stream from under the request -
+	// and for a streaming response (SSE, a slow report written in pieces)
+	// that means from under bytes the developer's process is still writing.
+	// An upgraded stream, which lives for as long as the developer keeps it
+	// open, would need the same; the agent does not steal upgrades today
+	// (internal/agent's Proxy.Handler sends them to the application).
 	s.server().Serve(&oneConnListener{c: c})
 }
 
@@ -385,19 +403,27 @@ func (s *StealServer) logging(next http.Handler) http.Handler {
 
 // statusRecorder remembers what was answered so the log line can say so.
 //
-// It has to pass Hijack and Flush through, not just WriteHeader: a
-// ReverseProxy serving a protocol switch (a websocket) asks the
+// It has to pass Flush and Hijack through, not just WriteHeader.
+//
+// Flush is the reachable one: httputil calls it to push bytes out as the
+// developer's process writes them, which is what a streaming response (SSE,
+// a slow report) needs to arrive in pieces rather than at the end.
+//
+// Hijack is for a protocol switch: a ReverseProxy serving one asks the
 // ResponseWriter for the raw connection, and one that cannot give it up is
-// answered with 502 by the error handler instead.
+// answered with 502 by the error handler instead. The agent sends every
+// Upgrade request to the application rather than stealing it
+// (internal/agent's Proxy.Handler), so no switch reaches this wrapper
+// today - this is what would make one work the day one does.
 //
 // Measured, so that the next person weighing up which of these methods
 // earns its place has the real answer: httputil asks through
 // http.ResponseController, which tries Hijack on this wrapper and then
-// follows Unwrap, so either method alone is enough to keep the switch
-// working and dropping both is what turns a stolen websocket into a bad
-// gateway. Hijack is still needed on its own account - it is the only
-// place the 101 can be recorded, because httputil writes that response
-// onto the raw connection where WriteHeader never sees it.
+// follows Unwrap, so either method alone is enough to keep a switch
+// working and dropping both is what turns one into a bad gateway. Hijack
+// is still needed on its own account - it is the only place the 101 can be
+// recorded, because httputil writes that response onto the raw connection
+// where WriteHeader never sees it.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int

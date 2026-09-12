@@ -480,6 +480,11 @@ func TestStealServerStripsTheReplayClaimFromTheLocalApp(t *testing.T) {
 // upgrade with the replay claim would put it on the wire toward the agent -
 // a different branch of the same contract item from the one above, and one
 // a reader would not guess is covered.
+//
+// The upgrade is written straight into StealServer.Serve because the agent
+// never routes one here: internal/agent's Proxy.Handler sends every Upgrade
+// request to the application. This pins the CLI half against the day it
+// does, not a state production can reach.
 func TestStealServerStripsTheReplayClaimFromAnUpgrade(t *testing.T) {
 	port := rawApp(t, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-Tetherd-No-Listener: 1\r\n\r\n")
 	s := &StealServer{LocalPort: port}
@@ -704,6 +709,10 @@ func TestStealServerStreamsAFlushedResponse(t *testing.T) {
 // does not steal upgrades today, but the CLI is what decides whether it
 // ever can - and the failure mode is quiet: a wrapper that cannot give up
 // the connection turns the switch into a 502.
+//
+// So the stream is injected straight into StealServer.Serve: internal/agent's
+// Proxy.Handler sends every Upgrade request to the application, and there is
+// no way to make one arrive through the agent.
 func TestStealServerProxiesAnUpgrade(t *testing.T) {
 	port := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") != "websocket" {
@@ -774,9 +783,14 @@ func TestStealServerProxiesAnUpgrade(t *testing.T) {
 
 // The header bound is a bound on the header and on nothing else. The
 // session layer clears the read deadline before handing the stream over
-// precisely so that a stolen websocket can sit idle (session.Options.
-// OnHTTP), and a whole-stream ReadTimeout here would undo that: the
-// upgraded stream would die the moment the developer stopped typing.
+// (session.Options.OnHTTP), and a whole-stream ReadTimeout here would undo
+// that: an idle stream would die the moment the developer stopped writing.
+//
+// An upgraded stream is the sharpest shape of that, so it is what this test
+// uses - injected straight into StealServer.Serve, because internal/agent's
+// Proxy.Handler sends every Upgrade request to the application and never
+// routes one here. The reachable cases with the same requirement are a slow
+// endpoint and a response streamed in pieces (SSE).
 func TestStealServerLetsAnUpgradedStreamIdlePastTheHeaderBound(t *testing.T) {
 	restore := stealReadHeaderTimeout
 	stealReadHeaderTimeout = 150 * time.Millisecond

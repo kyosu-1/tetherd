@@ -718,7 +718,7 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 	// address), so the warning is only true without it.
 	if !opts.PinCredentialRoute {
 		if stuck := UnroutableEndpointVars(taskEnv, overrideEnv); len(stuck) > 0 {
-			logf("⚠ env      %s still name%s %s, which the child cannot reach (tetherd only rewrites plain http://%s/… values; set network.pin_credential_route to capture the address itself)",
+			logf("⚠ env      %s still name%s %s, which the child cannot reach (tetherd only rewrites plain http://%s/… values; set network.pin_credential_route to capture the address itself, which reaches every process on this machine)",
 				strings.Join(stuck, ", "), plural(len(stuck)), awsid.CredentialsHost, awsid.CredentialsHost)
 		}
 	}
@@ -789,6 +789,23 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 				}
 				return 1, fmt.Errorf("pin the route to %s: %w", ecsprov.TaskRoleAddr, err)
 			}
+			// Registered before cap.Close() and ResolverClear() below, so
+			// LIFO runs them resolver -> pf -> route: the reverse of the
+			// documented teardown order (resolver -> route -> pf), and the
+			// route would come down after the rdr rule that backs it.
+			//
+			// It is safe because the helper does not take the CLI's order
+			// as the order. cap.Close() sends pf.clear, and the server's
+			// pf.clear clears this session's resolver files and host route
+			// itself, in the documented order, before flushing pf
+			// (internal/helper/server.go's pfClear); the disconnect cleanup
+			// does the same. So the route is always down before the rules
+			// are, and these RouteClear / ResolverClear calls are the
+			// idempotent belt to the helper's braces.
+			//
+			// Do not reshuffle these defers to "fix" the order, and do not
+			// read the order here as evidence that the helper need not
+			// enforce it.
 			defer hc.RouteClear()
 		}
 		cap := d.NewCapturer(hc, logf)

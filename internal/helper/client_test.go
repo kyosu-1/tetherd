@@ -106,9 +106,18 @@ func TestDialRefusesAHelperSpeakingAnOlderProtocol(t *testing.T) {
 	if ve.Helper != "1" || ve.CLI != ProtocolVersion {
 		t.Errorf("VersionError = %+v, want helper 1 and cli %s", ve, ProtocolVersion)
 	}
-	for _, want := range []string{"protocol 1", "expects " + ProtocolVersion, "restart"} {
+	// The remediation is spec §7's, and the same one internal/doctor's
+	// CheckHelper puts in Next: the helper is a launchd daemon that
+	// `tetherd-helper install` bootstraps, so `brew services restart
+	// tetherd` cannot restart it. This is the only path a v0.2b user takes
+	// to reach v0.3a (ProtocolVersion "1" -> "2"), so the wording is pinned
+	// here and must stay in step with internal/doctor/checks.go.
+	for _, want := range []string{"protocol 1", "expects " + ProtocolVersion, "brew upgrade tetherd", "sudo tetherd-helper install", "launchctl kickstart"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("message %q is missing %q", err.Error(), want)
 		}
+	}
+	if strings.Contains(err.Error(), "brew services") {
+		t.Errorf("message %q names brew services, which cannot restart the launchd plist", err.Error())
 	}
 }

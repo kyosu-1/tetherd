@@ -155,8 +155,13 @@ func (c *Client) serveInbound(s net.Conn, onHTTP func(net.Conn), headerTimeout t
 	switch {
 	case typ == proto.TypeHTTP && onHTTP != nil:
 		// The handler owns the stream from here, including its deadlines: a
-		// stolen websocket or a slow endpoint must not be cut off by the
-		// bound that only ever applied to the header.
+		// slow endpoint, or a response streamed in pieces (SSE, a long
+		// report), must not be cut off by the bound that only ever applied
+		// to the header. Those are the reachable cases. An upgraded stream
+		// would need the same, but the agent sends every Upgrade request to
+		// the application instead of stealing it (internal/agent's
+		// Proxy.Handler), so one cannot arrive here today - do not restore
+		// a deadline on the belief that nothing else needs it cleared.
 		s.SetReadDeadline(time.Time{})
 		callOnHTTP(s, onHTTP) // onHTTP owns s, including closing it
 	case typ == proto.TypeHTTP:

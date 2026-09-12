@@ -94,9 +94,15 @@ func TestMatchRequestSuppliesACaseInsensitiveLookup(t *testing.T) {
 }
 
 // TestRegisterWarnsWhenIncomingCannotWork covers the silent misconfiguration:
-// incoming.match has no defaults, so a developer can attach successfully,
-// see an "attached" line, and have every request go to the application with
-// nothing naming the cause.
+// a hello that asks for incoming requests but cannot match one attaches
+// successfully, prints an "attached" line, and then has every request go to
+// the application with nothing naming the cause.
+//
+// The cases below are hand-built proto.Hello values because that is the only
+// thing that reaches the branch. tetherd's own CLI always fills both header
+// names and refuses an empty token (internal/cli/steal.go's stealSettings),
+// so incomingGap guards an older or third-party client - do not simplify it
+// away on the belief that `tetherd run` exercises it.
 func TestRegisterWarnsWhenIncomingCannotWork(t *testing.T) {
 	full := proto.Incoming{Enabled: true, Header: "X-Dev-User", TokenHeader: "X-Dev-Token"}
 	cases := []struct {

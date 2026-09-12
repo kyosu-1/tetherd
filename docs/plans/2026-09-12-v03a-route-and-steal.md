@@ -2358,8 +2358,10 @@ Expected: FAIL（`undefined: CredProxy` / `RewriteContainerEndpoints` / `RunOpti
 // role instead of the laptop's own.
 //
 // Pointing the child at a loopback port by environment variable instead
-// reaches exactly the child's process tree, needs no root, and cannot
-// collide with anything that owns 169.254.170.2 locally. aws-sdk-go-v2
+// needs no root and cannot collide with anything that owns 169.254.170.2
+// locally. It is not narrower by process, though: a loopback listener is
+// reachable by every process on the machine regardless of uid, so all that
+// is gained over the pin is an ephemeral, unadvertised address. aws-sdk-go-v2
 // accepts a loopback AWS_CONTAINER_CREDENTIALS_FULL_URI over plain HTTP
 // with no token (isAllowedHost in config/resolve_credentials.go), and the
 // other SDKs follow the same rule.

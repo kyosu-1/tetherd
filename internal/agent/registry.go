@@ -117,7 +117,7 @@ func (a *Agent) register(h proto.Hello, from string, open session.Opener) *proto
 	if s, ok := a.sessions[h.User]; ok {
 		e := &proto.Error{
 			Code:    proto.CodeDuplicateUser,
-			Message: fmt.Sprintf("another session for user %q is already attached", h.User),
+			Message: fmt.Sprintf("another session for user %q is already attached; if you just stopped a session of your own, the agent may not have noticed the disconnect yet - retry in a moment", h.User),
 			From:    s.From,
 			Since:   s.Since.UTC().Format(time.RFC3339),
 		}
@@ -137,10 +137,16 @@ func (a *Agent) register(h proto.Hello, from string, open session.Opener) *proto
 	// nothing the registry holds should be held while calling out to it.
 	//
 	// A hello that asks for incoming requests but leaves out the token or
-	// either header name is reachable from a real config file - the CLI's
-	// incoming.match is free text with no defaults applied - and today it
-	// produces a successful attach followed by requests that go to the
-	// application forever with nothing naming the cause. Say it once, here.
+	// either header name produces a successful attach followed by requests
+	// that go to the application forever with nothing naming the cause. Say
+	// it once, here.
+	//
+	// tetherd's own CLI cannot send such a hello: internal/cli/steal.go's
+	// stealSettings fills both header names from DefaultMatchHeader /
+	// DefaultMatchTokenHeader and refuses an empty token before the first
+	// AWS call. What can is a hand-built proto.Hello - an older or
+	// third-party client - which the protocol is additive enough to admit,
+	// so the guard stays.
 	if h.Incoming.Enabled {
 		if gap := incomingGap(h.Incoming, h.Token); gap != "" {
 			a.logf("user %q attached but cannot receive incoming requests: %s; every request will go to the application", h.User, gap)

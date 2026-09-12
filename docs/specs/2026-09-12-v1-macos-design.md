@@ -129,7 +129,7 @@ CLI が `127.0.0.1:<redirect_port>` で accept したら、helper に `natlook{p
 - 接続時に peer credential（`LOCAL_PEERCRED`）を取り、uid が **`admin` グループのメンバー**であることを要求（`resolver.set` はマシン全体の名前解決に影響するため）
 - 1 接続 = 1 セッション。`pf.apply` は接続ごとに 1 回。接続が切れたら（CLI の異常終了含む）helper がそのセッションの pf ルール・resolver ファイル・host route を消す（消す順は resolver → route → pf）
 - 同時セッションは 1 つ。2 つ目の `pf.apply` は `busy{pid, command, since}` で拒否
-- 最初に `version` を交換。プロトコルバージョン不一致なら CLI が `brew upgrade tetherd && sudo brew services restart tetherd` を案内
+- 最初に `version` を交換。プロトコルバージョン不一致なら CLI が `brew upgrade tetherd && sudo tetherd-helper install`（その後 `sudo launchctl kickstart -k system/dev.tetherd.helper`）を案内する。helper は `/Library/LaunchDaemons/dev.tetherd.helper.plist` で launchd が持つので brew の service ではなく、`brew services restart tetherd` では再起動できない（§7）
 
 | 操作 | 引数 | 内容 |
 |---|---|---|
@@ -521,7 +521,7 @@ design.md §10 に加えて:
 - `:9900` は無認証だが lo にしか bind せず、信頼境界は「タスク内」。design.md に明記する
 - `.tetherd.yml` は**信頼された入力**として扱う。`env.override` は子プロセスの `PATH` や `DYLD_INSERT_LIBRARIES` も設定できるので、悪意ある `.tetherd.yml` を含むリポジトリで `tetherd run` すれば任意コード実行になる。ただし `tetherd run -- go run ./cmd/api` はそもそもそのリポジトリのコードを実行するので、これは `env.override` があること自体に内在する性質であり tetherd が新たに作った経路ではない。「信頼していないリポジトリのコードを実行しない」という通常の前提がそのまま当てはまる
 - タスクロールを配るループバック口（`127.0.0.1:<空きポート>`）は無認証。同じマシンの他のローカルプロセスが叩けばタスクロールの認証情報を得られる。信頼境界は既存の SSM ローカルフォワード（`127.0.0.1:9900`）と同じ「同一マシンに閉じるが、それ自体が境界」。ポートは毎回変わり広告もされないが、秘密ではない。`hello` にユーザー単位のトークンを載せる v0.3 でも、この口は別経路なので閉じない
-- `network.pin_credential_route: true` は**マシン全体**に効く host route を張る。セッション中は `tetherd` グループ以外のプロセスも `169.254.170.2` で dev タスクの認証情報に到達する（pf の `rdr` は `group` 句を受け付けないため gid で絞れない）。`amazon-ecs-local-container-endpoints` のようにこのアドレスをローカルで使うツールと衝突し、そちらが**タスクの**ロールを掴む。既定で無効、有効時は `doctor` が警告する
+- `network.pin_credential_route: true` は**マシン全体**に効く host route を張る。セッション中は `tetherd` グループ以外のプロセスも `169.254.170.2` で dev タスクの認証情報に到達する（pf の `rdr` は `group` 句を受け付けないため gid で絞れない）。`amazon-ecs-local-container-endpoints` のようにこのアドレスをローカルで使うツールと衝突し、そちらが**タスクの**ロールを掴む。既定で無効。有効時に `doctor` が警告する行は v0.3b で追加する（v0.3a には無い）
 - ローカルアプリは共有 dev DB に書く。ローカルブランチの auto-migrate が dev DB を変えうることを README で注意する
 - セッション中は `tetherd-exec` が誰でも実行可能（mode `2755`、setgid `tetherd`）なので、同じマシンの他のローカルユーザーも gid `tetherd` でコマンドを起動しトンネルに到達できる。シングルユーザーのラップトップでは許容するが、その前提であることを明記する
 - セッション中、ラップトップ上の SSM ローカルフォワードのポート（`127.0.0.1:9900`）は無認証で agent に届く経路になる: 同じマシンの他のローカルプロセスがそのポートに直接繋いで `welcome.app_env` を読んだり、VPC 内へ dial したりできる。lo にしか bind しないので同一マシンには閉じるが、それ自体が信頼境界。`hello` にユーザー単位のトークンを載せる（v0.3）までこの経路が開いていることを明記する

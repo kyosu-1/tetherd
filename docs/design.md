@@ -473,7 +473,7 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 
 - 認証は AWS SDK の標準チェーン（SSO プロファイル、アクセスキー、AssumeRole）をそのまま使う。tetherd が `ssm:StartSession` を呼んでストリーム URL とトークンを得て session-manager-plugin に渡す（AWS CLI と同じ手順だが AWS CLI 自体は不要）
 - IAM Identity Center（SSO）では `${aws:username}` が無いので `OwnSessions` の Resource は `arn:aws:ssm:*:*:session/*` にする
-- 透過モードでは 169.254.170.2 が素通しになるので、開発者はローカルからタスクロールの権限を実質的に使える。「dev タスクができることは開発者もできる」という意味で dev では通常許容範囲だが、タスクロールが必要以上に広くないかは一度見ておく
+- タスクロールの認証情報は CLI のループバック口から（`pin_credential_route` を有効にしたときは `169.254.170.2` の固定経路からも）ラップトップに届くので、開発者はローカルからタスクロールの権限を実質的に使える。「dev タスクができることは開発者もできる」という意味で dev では通常許容範囲だが、タスクロールが必要以上に広くないかは一度見ておく
 
 ---
 
@@ -525,7 +525,7 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 | env / secrets | agent が Pod 内プロセスの /proc/pid/environ を読む | 同じ。agent が app の /proc/pid/environ を読む（pidMode: task）。開発者に Secrets Manager 権限は不要 |
 | 受信の取り方 | L4（iptables / raw socket）。任意 TCP | L7 リバースプロキシ。HTTP/1.1 中心、gRPC / WS は個別対応 |
 | 振り分けの粒度 | `connect()` 単位。`getaddrinfo` も見ているのでホスト名で local / remote を選べる | 宛先 CIDR。macOS の DNS は mDNSResponder が出すのでホスト名では見えない |
-| IAM の身元 | Pod の SA トークンが env / ファイル経由で効く | 169.254.170.2 が透過で通り、タスクロールが自動で効く |
+| IAM の身元 | Pod の SA トークンが env / ファイル経由で効く | CLI がループバック口を開き、env（`AWS_CONTAINER_CREDENTIALS_FULL_URI` とメタデータ 3 変数）でそこを指すのでタスクロールが自動で効く。透過ではないため、env を読まずに `169.254.170.2` を直書きするツールには届かない（`pin_credential_route` が逃げ道） |
 | 接続体験 | kube port-forward、1 秒未満 | SSM 中継、2〜3 秒。VPN 不要。運ぶ層は Tailscale に差し替え可 |
 | 複数人 | OSS 版は弱く、Operator（有償）で解決 | ユーザー名単位の多重接続とヘッダー振り分けが中核 |
 | 本番観察 | 読み取り専用で可能 | 意図的に禁止 |
@@ -548,7 +548,7 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 | AWS Copilot `run local --proxy` | ECS（Copilot 管理下） | Service Connect のサービスと RDS のみ。Docker の pause コンテナ内で宛先ごとに SSM ポートフォワード + iptables REDIRECT + /etc/hosts | なし | タスク定義の env/secrets を注入。IAM はラップトップの資格情報 | コンセプトの先行例。Docker 内実行・既知ホスト限定・受信なし。**2026-06-12 サポート終了** |
 | ecsta（fujiwara） | ECS | 1 ポートの SSM フォワード | なし | なし | ③運ぶ層の部品として同じ API を使う。`doctor` / タスク選択 UX の参考 |
 | Tailscale subnet router on Fargate | VPC 全体 | マシン単位で VPC に透過到達 | なし | なし | ネットワークだけなら最短の代替。プロセス単位でなく、env・IAM・steal は別途必要。将来の③の選択肢 |
-| amazon-ecs-local-container-endpoints | ローカル Docker | なし | なし | 169.254.170.2 をローカルで模倣（資格情報はラップトップのもの） | tetherd は透過経路で本物に届くので模倣が不要 |
+| amazon-ecs-local-container-endpoints | ローカル Docker | なし | なし | 169.254.170.2 を lo0 に alias してローカルで模倣（資格情報はラップトップのもの） | 模倣が不要なのは同じだが、関係はそれより強い: このツールとの衝突が、tetherd が透過方式をやめてループバック口に替えた理由の 1 つ（§6「タスクロールの届け方」）。透過だと衝突相手が壊れるだけでなく**タスクの**ロールを掴むことになる。既定のループバック口なら衝突しない。衝突するのは `pin_credential_route` を有効にしたときだけ |
 | sshuttle / tun2socks / gvisor-tap-vsock | 汎用 | 透過（pf/iptables + ユーザー空間スタック） | — | — | §6 の技術的前例。v1 の pf rdr + `DIOCNATLOOK` は sshuttle の macOS 実装そのもの |
 | Cloud Code / `gcloud beta code dev`（Cloud Run） | ローカル Docker | なし | なし | ADC or SA 鍵 | Cloud Run 側には Copilot 相当の先行例すら無い |
 
@@ -569,7 +569,7 @@ tetherd は「Kubernetes を使わないサーバーレスコンテナのため�
 | 複数インスタンス | RUNNING な全タスクに繋ぐ | リクエストの着地インスタンスを制御できない。dev は min=max=1 なら (a) で足りる。それ以外は (b) のリレーが必要 |
 | CPU / スケール | 常時割り当て | リクエスト外は CPU スロットリング。(a) は WebSocket がリクエスト扱いで CPU が付くが 60 分で切れるので再接続。(b) は CPU 常時割り当てが必要。scale-to-zero を避けるため min=1 |
 | env | agent が /proc から | 同じ（マルチコンテナで PID 共有可否は要確認。不可なら Secret Manager 経由のフォールバック） |
-| IAM の透過 | 169.254.170.2（タスクロール） | metadata.google.internal（サービスアカウント） |
+| IAM エンドポイントのアドレス | 169.254.170.2（タスクロール）。透過では届かないので CLI のループバック口がここへ転送する | metadata.google.internal（サービスアカウント） |
 | 認証 | IAM（ssm:StartSession） | Cloud Run IAM（invoker）+ ID トークン |
 
 **実装方針**: v1 ではプロバイダのインターフェースを切らず、ECS 固有部分を `internal/provider/ecs` に寄せるだけにする（実装が 1 つの段階で抽象を切ると ECS の都合に歪む）。ただし③運ぶ層（`Transport`）と①捕まえる層（`Capturer`）は v1 から インターフェースを持つ。Cloud Run を足すときに `provider/cloudrun` を書きながら共通インターフェースを抽出する。リレーサービスが必要になれば同じリポジトリのオプションコンポーネントとして置く。

@@ -124,7 +124,7 @@ func newRunCommand() *cobra.Command {
 	// names up, so registering them on a command that does not want them
 	// would be how they arrive there.
 	f.BoolVar(&opts.NoIncoming, "no-incoming", false, "do not take any incoming request, whatever incoming.local_port says")
-	f.IntVar(&opts.LocalPort, "local-port", 0, "port your own process listens on; requests matching your name and token are proxied there (default: incoming.local_port)")
+	f.IntVar(&opts.LocalPort, "local-port", 0, fmt.Sprintf("port your own process listens on; requests matching your name and token are proxied there (overrides incoming.local_port; default: %d)", DefaultLocalPort))
 	f.StringVar(&opts.As, "as", "", "the name the agent matches the request's user header against (default: your configured user)")
 	// --as is the spec's name for this (§6.5) and --user was v0.2b
 	// diverging from it. Two visible flags for one field is a wart that
