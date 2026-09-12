@@ -29,8 +29,13 @@ func New(cfg Config, logf func(string, ...any)) *Agent {
 		logf = func(string, ...any) {}
 	}
 	a := &Agent{cfg: cfg.withDefaults(), logf: logf, sessions: map[string]*Session{}}
-	if cfg.MetadataURL != "" {
-		a.env = &ProcEnvReader{MetadataURL: cfg.MetadataURL, ProcRoot: "/proc", AppContainer: cfg.AppContainer}
+	// a.cfg, not cfg: everything below this line reads the normalised
+	// Config. The two are the same today for MetadataURL, which has no
+	// default, and AppContainer, which gets one - but reading the raw
+	// Config here is how the next default added to withDefaults would
+	// quietly not apply to the env reader.
+	if a.cfg.MetadataURL != "" {
+		a.env = &ProcEnvReader{MetadataURL: a.cfg.MetadataURL, ProcRoot: "/proc", AppContainer: a.cfg.AppContainer}
 	}
 	return a
 }

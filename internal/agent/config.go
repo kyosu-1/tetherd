@@ -7,13 +7,18 @@ import "errors"
 
 // Config comes from environment variables only.
 type Config struct {
-	Env          string // TETHERD_ENV, required. Refuse to start without it.
-	TaskARN      string // TETHERD_TASK_ARN, optional; metadata wins when present.
-	Control      string // TETHERD_CONTROL, default 127.0.0.1:9900.
-	AppContainer string // TETHERD_APP_CONTAINER, default app.
+	Env     string // TETHERD_ENV, required. Refuse to start without it.
+	TaskARN string // TETHERD_TASK_ARN, optional; metadata wins when present.
+	// Control is the port the CLIs attach to: TETHERD_CONTROL, default
+	// defaultControl. Loopback, and not by accident - it is what keeps the
+	// control port unreachable from the task's ENI without a
+	// security-group change, and the SSM port forward terminates inside
+	// the task, on 127.0.0.1 (docs/design.md: ":9900 (lo only)").
+	Control      string
+	AppContainer string // TETHERD_APP_CONTAINER, default defaultAppContainer.
 	MetadataURL  string // ECS_CONTAINER_METADATA_URI_V4, set by ECS; empty outside ECS.
 	// Proxy is where the ALB arrives: TETHERD_PROXY, default
-	// 0.0.0.0:8080. Unlike Control it cannot be a loopback address by
+	// defaultProxy. Unlike Control it cannot be a loopback address by
 	// default - the ALB reaches the task over the VPC network.
 	Proxy string
 	// AppAddr is the application the proxy passes everything through to:
@@ -23,22 +28,44 @@ type Config struct {
 	AppAddr string
 }
 
-// defaultAppAddr is where the proxy passes requests through to when nothing
-// says otherwise. One constant for the two paths that must agree -
-// ConfigFromEnv and Config.withDefaults - because the copy that drifts is
-// the one no task definition mentions.
-const defaultAppAddr = "127.0.0.1:8081"
+// The defaults, one constant each and nowhere else. Both paths that build a
+// Config - ConfigFromEnv and Config.withDefaults - read these, because the
+// copy that drifts is the one no task definition mentions.
+const (
+	defaultControl      = "127.0.0.1:9900"
+	defaultAppContainer = "app"
+	defaultProxy        = "0.0.0.0:8080"
+	defaultAppAddr      = "127.0.0.1:8081"
+)
 
 // withDefaults fills in what a Config built by hand would otherwise hand on
 // empty. New applies it, so the paths that do not go through ConfigFromEnv
-// (tests today, an embedded agent later) get the documented behaviour.
+// (tests today, an embedded agent later) get the same agent the environment
+// path produces.
 //
-// Only AppAddr, because it is the one that fails quietly: Control and Proxy
-// are listen addresses, so an empty one is a startup error naming the port
-// (see Run), while an empty AppAddr is a dial target the proxy carries
-// forward - every request through it then fails against an address nobody
-// typed, several layers away from the empty field that caused it.
+// Every field, not just the dial target. An empty address is not a startup
+// error: net.Listen("tcp", "") succeeds and binds *every* interface on a
+// kernel-chosen port. Measured on this branch -
+// New(Config{Env: "dev"}).Run(ctx) returned nil and logged "control
+// listening on [::]:58165, proxy listening on [::]:58166" - so an embedded
+// agent built from a Config by hand would have published the control port,
+// which is documented loopback-only, on the task's ENI, and served the ALB
+// port on a port the target group has never heard of. Neither says a word
+// at startup.
+//
+// So: defaults here rather than a refusal in Run. Every one of them is the
+// safe value - loopback for control, the documented port for the ALB - and
+// a caller who means something else says so in the field.
 func (c Config) withDefaults() Config {
+	if c.Control == "" {
+		c.Control = defaultControl
+	}
+	if c.AppContainer == "" {
+		c.AppContainer = defaultAppContainer
+	}
+	if c.Proxy == "" {
+		c.Proxy = defaultProxy
+	}
 	if c.AppAddr == "" {
 		c.AppAddr = defaultAppAddr
 	}
@@ -59,17 +86,9 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	if cfg.Env == "" {
 		return Config{}, errors.New("TETHERD_ENV is not set; tetherd-agent refuses to start without it")
 	}
-	if cfg.Control == "" {
-		cfg.Control = "127.0.0.1:9900"
-	}
-	if cfg.AppContainer == "" {
-		cfg.AppContainer = "app"
-	}
-	if cfg.Proxy == "" {
-		cfg.Proxy = "0.0.0.0:8080"
-	}
-	// The last default comes from withDefaults rather than from a literal
-	// here, so that the environment path and New's cannot disagree about
-	// where the application is.
+	// Every default comes from withDefaults rather than from literals here,
+	// so that the environment path and New's cannot disagree about where
+	// the control port, the ALB port or the application is. This function
+	// is then only "read the environment, and refuse without TETHERD_ENV".
 	return cfg.withDefaults(), nil
 }
