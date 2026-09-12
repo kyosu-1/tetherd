@@ -336,7 +336,7 @@ tetherd token rotate
 - `doctor` の検査項目（各項目に「次に何をするか」を付ける）:
   helper が応答しバージョンが一致 / `tetherd` グループと setgid `tetherd-exec` / session-manager-plugin の有無 / AWS 認証 / サービスの `enableExecuteCommand` / タスクの agent コンテナと ExecuteCommandAgent / タスク定義の `pidMode: task` / ターゲットグループが HTTP1 / ECS・EC2 の読み取り権限 / VPC CIDR とローカル IF の重なり / `remote_domains` が agent 側で解けるか / `remote_cidrs` に `0.0.0.0/0` が無いか
 
-  v0.2b で実装したのは 9 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲の広さ / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査はまだ入っていない** — developer policy に `elasticloadbalancing:DescribeTargetGroups` が要るためで、その付与は v0.3b で入れた（`deploy/dev-env/iam-developer.tf` の `InspectTargetGroup`）。行そのものが残っている理由は §12 の v0.3b に書いた。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
+  v0.2b で実装したのは 9 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲の広さ / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査は v0.3b にも入らず、v0.4 に送った** — `elasticloadbalancing:DescribeTargetGroups` を呼ぶ SDK が無いため。理由と残作業は §12 の v0.3b に書いた。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
 
   v0.3a / v0.3b で足したのは、`agent session`（tetherd 自身が通した handshake。ECS の見解とは別）・`task env`（agent が読めた変数と `env_error`）・`task role`（子プロセスと同じ経路でループバック口から取った認証情報の ARN）・`steal`（一致条件と、ラップトップ側に listener が居るか）の 4 行と、**`?`（検査できなかった）ステータス**。`?` は「動くが注意」の `⚠` と分けてあり、**どの行でも exit code を動かさない**（失敗した行は既にそれ自身で数えられているため）。`pin_credential_route` の行は入っていない
 
@@ -654,15 +654,17 @@ design.md §10 に加えて:
 
 あわせて入ったもの: `tetherd status`（§6.5。`welcome` の `sessions` を読む。専用メッセージは足していない）、`tetherd token rotate`（§5.2。0600 を保ち、`user` / `aws` を残す）、`doctor` の `?` ステータスと `steal` / `task role` の行（§6.5）。
 
-Terraform の変更は 1 点だけ: developer policy に `elasticloadbalancing:DescribeTargetGroups`（`deploy/dev-env/iam-developer.tf` の `InspectTargetGroup`）。`doctor` のターゲットグループの行（31 行）だけが使う。ELB の `Describe*` はリソースレベルの権限を取らないので `Resource` は `*` になる。
+**Terraform の変更は無い。** `deploy/dev-env` は v0.3a のまま。検証のために `desired_count` を動かすだけで、当てるべき差分は 1 行も無い。
 
-**ターゲットグループの行そのものは v0.3b に入っていない**（持ち越し）。判定は「`protocol_version` が `HTTP1` でなければ `✗`（§5.1）／agent の既定ポートと違えば `⚠`（`TETHERD_PROXY` で変えられるので `✗` にはできない）／権限が無ければ `?`」で決まっているが、事実を集める側が二重に詰まっている: (1) `DescribeTargetGroups` を呼ぶ SDK（`aws-sdk-go-v2/service/elasticloadbalancingv2`）が `go.mod` に無く、この計画は「依存追加なし・`go.mod` は 1 行も変えない」を条件にしている。(2) agent の既定プロキシポートは `internal/agent` の非公開定数 `defaultProxy`（`0.0.0.0:8080`）で、`internal/doctor` から読めない。どちらも方針の決定が要るので、決めてから入れる。
+**`doctor` のターゲットグループの検査は v0.4 に送った。** 計画には入っていたが、計画自身の「依存追加なし・`go.mod` は 1 行も変えない」と両立しない: `protocol_version` を報告する API は `elasticloadbalancing:DescribeTargetGroups` だけで、それを呼ぶ SDK（`aws-sdk-go-v2/service/elasticloadbalancingv2`）は `go.mod` に無い。**`ecs:DescribeServices` はターゲットグループの ARN とポートは返すが、`protocol_version` は返さない**（agent 側にも分からない。ALB のプロトコルバージョンは「パースできないリクエストが来る」としてしか現れない）。片方だけ入れても意味が無いので、**判定も、そのための developer policy の権限追加も、v0.3b には入れていない** — 実装の無い権限を配るのは、この計画が 9 タスクかけて消してきた「どこかに書いてあるが実装が無い」そのものだから。
 
-**ポート検査の限界は v0.4 で埋める。** agent のプロキシポートは `TETHERD_PROXY` で変えられるのに、`doctor` にはそれを知る手段が無い（`welcome` は `Version` / `TaskARN` / `Env` / `AppEnv` / `EnvError` / `Others` / `Sessions` だけで、CLI が繋ぐのは**制御**ポート）。だから既定と違うポートは `⚠` にしかできない。安いのはタスク定義の agent コンテナの env から `TETHERD_PROXY` を読むこと（`awsProvider` は `SecretNames` / `PIDMode` で既にタスク定義を読んでいるので同じ呼び出し形）。もう一方は `welcome` にフィールドを 1 つ足すこと（追加のみなので互換は保てる）。
+v0.4 でやること 3 つ（どれも独立）: (1) `aws-sdk-go-v2/service/elasticloadbalancingv2` を入れて `DescribeTargetGroups` を呼び、developer policy に権限を足す。(2) agent の既定プロキシポート（`internal/agent` の非公開定数 `defaultProxy` = `0.0.0.0:8080`）を `internal/doctor` から読める場所に出す。(3) タスク定義の agent コンテナの env から `TETHERD_PROXY` を読み、ポートの判定を `⚠` から本当の検査にする。検証手順は `docs/e2e-aws.md` の「v0.4 に持ち越した行」にある（31 行。**ターゲットグループを HTTP2 にすると dev 環境が一時的に壊れる**ので、実施は最後に回してすぐ戻すこと）。
+
+**なぜポートを「検査」できないのか**（上の (3) の背景）: agent のプロキシポートは `TETHERD_PROXY` で動かせるのに、`doctor` にはそれを知る手段が無い。`welcome` は `Version` / `TaskARN` / `Env` / `AppEnv` / `EnvError` / `Others` / `Sessions` だけで、CLI が繋ぐのは**制御**ポートであってプロキシポートではない。だから「既定と違う」は `⚠`（質問）にしかならず、`✗`（判定）にはできない — 既定と違うポートを向けている配置は**正しく設定されている**。安いのはタスク定義から `TETHERD_PROXY` を読むこと（`awsProvider` は `SecretNames` / `PIDMode` で既にタスク定義を読んでいるので同じ呼び出し形）。もう一方は `welcome` にフィールドを 1 つ足すこと（追加のみなので互換は保てる）。
 
 **検証には `desired_count` を 2 にする必要がある**（27・28 行）。ALB がタスクを選ぶ以上、1 タスクでは「どのタスクに落ちても届く」は検証できない。**検証が終わったら 1 に戻す** — Fargate の課金が倍になるため。
 
-検証手順は `docs/e2e-aws.md` の 27〜31 行。結果は実施後にここに記録する。
+検証手順は `docs/e2e-aws.md` の 27〜30 行（31 行は上記のとおり v0.4）。結果は実施後にここに記録する。
 
 | 行 | 検証 | 結果 |
 |---|---|---|
@@ -670,7 +672,6 @@ Terraform の変更は 1 点だけ: developer policy に `elasticloadbalancing:D
 | 28 | rolling deploy 中に `run` が生き続け、新しいタスクに繋ぎ、古いタスクが落ちても終わらない | 未実施 |
 | 29 | `tetherd status` が各タスクの接続者を出し、トークンを送らない | 未実施 |
 | 30 | `token rotate` の直後は走行中のセッションが古いトークンのまま steal し続ける | 未実施 |
-| 31 | ターゲットグループを HTTP2 にすると `doctor` が `✗` で `protocol_version` を名指しする | 未実施 |
 
 ---
 

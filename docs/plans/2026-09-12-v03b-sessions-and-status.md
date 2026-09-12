@@ -1258,4 +1258,13 @@ const duplicateUserRetry = 2 * time.Second
 
 Homebrew tap、LaunchDaemon（helper を `sudo` 前面起動から常駐へ）、GoReleaser、README。**他人の Mac に配れる状態**にする。
 
+**`doctor` のターゲットグループの検査（Task 9 から繰り越し）。** この計画の Task 9 は、`protocol_version` が `HTTP1` かを見る `doctor` の行を求めながら、同じ計画の Global Constraints で「依存追加なし・`go.mod` は 1 行も変えない」を求めていた。**この 2 つは両立しない** — `protocol_version` を報告する API は `elasticloadbalancing:DescribeTargetGroups` だけで、それを呼ぶ SDK（`aws-sdk-go-v2/service/elasticloadbalancingv2`）が `go.mod` に無い。`ecs:DescribeServices` はターゲットグループの ARN とポートを返すが `protocol_version` は返さず、agent 側にも分からない（ALB のプロトコルバージョンは「パースできないリクエストが来る」としてしか現れない）。そのため判定も、そのための developer policy の権限追加も v0.3b には入れていない（実装の無い権限を配らないため）。v0.4 で入れるときの内訳:
+
+1. `aws-sdk-go-v2/service/elasticloadbalancingv2` を追加して `DescribeTargetGroups` を呼び、developer policy に `elasticloadbalancing:DescribeTargetGroups` を足す（ELB の `Describe*` はリソースレベルの権限を取らないので `Resource` は `*` になる）
+2. agent の既定プロキシポート（`internal/agent` の非公開定数 `defaultProxy` = `0.0.0.0:8080`）を `internal/doctor` から読める場所に出す。`internal/proto` が両側から見える
+3. タスク定義の agent コンテナの env から `TETHERD_PROXY` を読み、ポートの判定を `⚠`（質問）から本当の検査にする。**既定と違うポートは `✗` にしてはいけない** — `TETHERD_PROXY` で動かせる以上、違うポートを向けた配置は正しく設定されている
+4. `ecsprov.Target.AgentContainer` は既定 `"tetherd-agent"` のまま誰も設定しない（`internal/cli/run.go` が `Target{Cluster, Service, TaskID}` しか組まない）。`.tetherd.yml` に出すか、固定であることを書くかを決める
+
+検証手順は `docs/e2e-aws.md` の「v0.4 に持ち越した行」（31 行）。**ターゲットグループを HTTP2 にすると dev 環境が一時的に壊れる**（agent は HTTP/1.1 サーバなので ALB の h2c ヘルスチェックが落ちる）ので、実施は最後に回してすぐ HTTP1 に戻すこと。
+
 持ち越し: 書き込み中断の猶予が「クライアントが送り切らないボディを読んでブロックした writer」を解放できない点、`internal/dnsproxy` の一部テストがポート競合の緩和策の外にある点、リポジトリ直下の `.tetherd.yml` がテストスイートの隠れた入力になりうる点（cwd の設定発見に依存）。
