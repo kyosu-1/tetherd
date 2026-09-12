@@ -152,7 +152,7 @@ CLI が `127.0.0.1:<redirect_port>` で accept したら、helper に `natlook{p
 3. `network.remote_cidrs`。ピアリング先 VPC、Transit Gateway 越しのオンプレなど
 4. `network.remote_services` に書いた AWS サービスの managed prefix list（`com.amazonaws.<region>.s3` / `.dynamodb`）。`DescribeManagedPrefixLists` → `GetManagedPrefixListEntries`
 
-から `network.local_cidrs` を除く。
+から `network.local_cidrs` を除く。引き算は範囲を分割する正確なもので、`10.0.0.0/16` から `10.0.5.0/24` を除けば残りは 8 個のプレフィックスになる（pf は 1 つのテーブルに集合として持つ）。ただし 2 の `169.254.170.0/24` だけは引かれない床で、`local_cidrs` に何を書いても残る — ここが捕捉から外れると子プロセスはタスクロールを失い、開発者自身の身元で動いてしまうため。`local_cidrs` が床以外のすべてを消した場合は、起動時にエラーにして `local_cidrs` を名指しする（`10.0.0.0/8` と書いて `10.0.0.0/16` の VPC を丸ごと消す、が現実的な失敗）。
 
 それ以外（インターネット、localhost、LAN）は子プロセスからそのまま出る。`go run` のモジュール取得、`npm install`、外部 API はラップトップの回線。dev タスクの ENI を踏み台にインターネットへ出る経路は既定で無い。`remote_cidrs: [0.0.0.0/0]` を書けば可能だが `doctor` が警告する。
 
@@ -297,6 +297,8 @@ tetherd token rotate
 - `status`: タスクごとに接続中のユーザー、自分のルール、primary かどうか。agent の `status` メッセージで取る
 - `doctor` の検査項目（各項目に「次に何をするか」を付ける）:
   helper が応答しバージョンが一致 / `tetherd` グループと setgid `tetherd-exec` / session-manager-plugin の有無 / AWS 認証 / サービスの `enableExecuteCommand` / タスクの agent コンテナと ExecuteCommandAgent / タスク定義の `pidMode: task` / ターゲットグループが HTTP1 / ECS・EC2 の読み取り権限 / VPC CIDR とローカル IF の重なり / `remote_domains` が agent 側で解けるか / `remote_cidrs` に `0.0.0.0/0` が無いか
+
+  v0.2b で実装したのは 9 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲の広さ / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査は v0.3** — developer policy に `elasticloadbalancing:DescribeTargetGroups` を足す必要があり、検証環境が動いている間は Terraform を再適用しない方針のため。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
 
 ### 6.6 出力
 
@@ -482,6 +484,7 @@ design.md §10 に加えて:
 - helper は `admin` グループのユーザーからのみ受け付け、操作は 5 つに固定。コマンド起動の操作は無い
 - setgid `tetherd` の権限は pf に捕まることだけ
 - `:9900` は無認証だが lo にしか bind せず、信頼境界は「タスク内」。design.md に明記する
+- `.tetherd.yml` は**信頼された入力**として扱う。`env.override` は子プロセスの `PATH` や `DYLD_INSERT_LIBRARIES` も設定できるので、悪意ある `.tetherd.yml` を含むリポジトリで `tetherd run` すれば任意コード実行になる。ただし `tetherd run -- go run ./cmd/api` はそもそもそのリポジトリのコードを実行するので、これは `env.override` があること自体に内在する性質であり tetherd が新たに作った経路ではない。「信頼していないリポジトリのコードを実行しない」という通常の前提がそのまま当てはまる
 - ローカルアプリは共有 dev DB に書く。ローカルブランチの auto-migrate が dev DB を変えうることを README で注意する
 - セッション中は `tetherd-exec` が誰でも実行可能（mode `2755`、setgid `tetherd`）なので、同じマシンの他のローカルユーザーも gid `tetherd` でコマンドを起動しトンネルに到達できる。シングルユーザーのラップトップでは許容するが、その前提であることを明記する
 - セッション中、ラップトップ上の SSM ローカルフォワードのポート（`127.0.0.1:9900`）は無認証で agent に届く経路になる: 同じマシンの他のローカルプロセスがそのポートに直接繋いで `welcome.app_env` を読んだり、VPC 内へ dial したりできる。lo にしか bind しないので同一マシンには閉じるが、それ自体が信頼境界。`hello` にユーザー単位のトークンを載せる（v0.3）までこの経路が開いていることを明記する
@@ -535,6 +538,42 @@ design.md §10 に加えて:
 1. `ssm:StartSession` のターゲットに agent コンテナの runtimeId を使うと `TargetNotConnected`。distroless の agent コンテナでは ECS Exec の SSM エージェントが接続できていないのに、`DescribeTasks` は `RUNNING` と報告する。awsvpc は netns を共有するので、同じタスクの別コンテナ経由で転送すれば `127.0.0.1:9900` に届く
 2. 開発者の `~/.aws/config` の `default` プロファイルがコンテナクレデンシャルより先に評価され、タスクロールを覆い隠す
 3. distroless イメージの `SSL_CERT_FILE`（コンテナ内のパス）が注入され、macOS 側の子プロセスの TLS が全部壊れる
+
+### v0.2b（設定ファイル・DNS・`env`・`doctor`）
+
+検証手順は `docs/e2e-aws.md`（20 行）。helper（sudo）が要らない行と要る行を分けてあり、結果は実施後にここに記録する。
+
+| 行 | 検証 | 結果 |
+|---|---|---|
+| 0 | `.tetherd.yml` だけでフラグ無しに動く | ✅ `config` 行に読んだパスが出て、`tetherd-dev/api` のタスクに接続、19 変数注入、子プロセスが `PORT=8081` と secret を受け取る。フラグはゼロ |
+| 7 | 環境ガード | ✅ `tetherd env --env prod` が `refusing to attach: agent reports TETHERD_ENV="dev", expected "prod"` で exit 1 |
+| 11 | `tetherd env` の既定マスク | ✅ `DB_PASSWORD=***` / `FEATURE_FLAG=***`（タスク定義の `secrets` 2 件）、`PORT=8081` は素のまま |
+| 12 | `--format json` と `--reveal` | ✅ JSON として妥当、`--reveal` で 24 文字の実値 |
+| 13 | stdout と stderr の分離 | ✅ `eval "$(tetherd env --format shell)"` が成功し `PORT=8081`。ステータス行は 4 行すべて stderr |
+| — | secret が stdout / stderr に漏れない | ✅ 実値 24 文字で grep して両方とも不在 |
+| 1 | 捕捉ありの env 注入 | ✅ 19 変数、`✓ network` にリモート集合と DNS 行、`✓ iam` にタスクロール（`assumed-role/tetherd-dev-api-task/…`） |
+| 2 | VPC 内の RDS に pf → SSM → agent で届く | ✅ `10.0.10.164:5432` に接続して Postgres の SSL 応答 `S` |
+| 6 | `remote_domains` で Cloud Map の名前が解け、`/etc/resolver` が run 中だけ存在する | ✅ `dig @127.0.0.1 -p 53530 api.myapp.internal` → `10.0.11.30`、`getaddrinfo` も同じ、`curl http://api.myapp.internal:8081/` → `sampleapp on ip-10-0-11-30… from 10.0.11.30`（= 解決した IP も捕捉されて agent 経由で届いている）。run 中だけ `/etc/resolver/myapp.internal` が存在し、中身は `# managed by tetherd` / `nameserver 127.0.0.1` / `port 53530`、終了後に消える |
+| 8 | 1 台 1 セッション | ✅ 2 つ目が `rejected by agent (duplicate_user)` |
+| 14 | `tetherd doctor` の 10 項目 | ✅ helper・setgid・plugin・AWS 認証・タスク・pidMode・agent セッション・捕捉範囲・ローカルアドレスが緑。`remote domains` の行は偽陰性が見つかり修正（下記） |
+| 19 | 存在しない名前が NXDOMAIN として即座に返る | ✅ `dns nope.myapp.internal: not found` が出て `gaierror` が 0.06 秒で返る（SERVFAIL のリトライ待ちが無い） |
+| 15 | doctor が 1 つ失敗しても残りを続ける | ✅ `service: nope` にすると `✗ attachable task` に `ServiceNotFoundException` が出て exit 1、残る 6 行は `!` で「not checked: …」と理由付きで出続ける |
+| 16 | `remote_services: [s3]` の prefix list が入る | ✅ `remote_services s3 → 15 prefixes` と出て、`✓ network` 行に `3.5.152.0/21` `52.219.0.0/20` などが並ぶ。`ap-northeast-1` の S3 は 15 件（当初「数百件」と書いていたのは誤り。API は 1 ページ 100 件で切るのでページングは依然必要で、`--max-results 5` を指定すると実際に `NextToken` が返る） |
+| 17 | `local_cidrs` の分割引き算 | ✅ `local_cidrs: [10.0.5.0/24]` で `10.0.0.0/16` が `10.0.0.0/22, 10.0.4.0/24, 10.0.6.0/23, 10.0.8.0/21, 10.0.16.0/20, 10.0.32.0/19, 10.0.64.0/18, 10.0.128.0/17` の 8 本になる（ユニットテストの property 検証と完全に一致） |
+| 18 | 全部消したときのエラー | ✅ `local_cidrs: [10.0.0.0/8, 169.254.0.0/16]` で `✗ network.local_cidrs excludes the entire remote set; nothing would be captured`、exit 1 |
+| 11-13 | `tetherd env` | ✅（上記） |
+
+検証のために agent イメージを再ビルド・再デプロイした（`make push-images` + `aws ecs update-service --force-new-deployment`、linux/amd64 + linux/arm64）。再デプロイ前は `✗ remote domains: this agent does not support name resolution; upgrade the sidecar` と出ており、今夜追加したバージョン不一致メッセージが実機で正しく機能することの確認にもなった。
+
+実機で見つかった問題:
+
+1. **`doctor` の `remote domains` が健全な環境で偽陰性を出す**（修正済み）。設定されたドメインそのものを名前として解決していたが、Cloud Map の名前空間は apex に A レコードを持たないので `name not found` になる。検査の本当の問いは「このドメインの問い合わせが VPC リゾルバに届くか」であり、**not found という応答自体が到達の証明**。存在しないことが保証された名前を引いて、not found を成功として扱う形に変更。
+2. **macOS の負の DNS キャッシュ**。agent が resolve に対応する前に引いた名前は `mDNSResponder` に NXDOMAIN としてキャッシュされ、TTL の間 `getaddrinfo` が失敗し続ける（`dig` で直接引くと正しく答える）。`sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder` で解消。docs/config.md に記載。
+3. **`169.254.170.2` のルートが pf より先に評価される**（v0.3 送り、v0.2b の回帰ではない）。macOS がこのアドレスへの ARP に失敗して en0 上に拒否ルート（`UHLSW` + `LLINFO`、`netstat` の `!`）を残すため、`connect()` のルート探索が pf の `pass out route-to lo0` より先に `EHOSTUNREACH` を返すことがある。同じ子プロセス・同じ gid 309 で、curl と system python 3.9 は 200 を得るのに AWS CLI 2.34.49 が同梱する Homebrew python 3.14 は `Errno 65` で失敗し、同じ interpreter でも VPC 宛（RFC1918）は通る。ARP エントリの期限で成否が変わるので間欠的。修正はセッション中だけ `169.254.170.2` の host route を lo0 に向けること（helper に新操作が必要なため v0.3）。
+
+実機で 1 件見つかった（修正済み）:
+
+`tetherd env` がタスクの env を**そのまま**出していたため、`eval "$(tetherd env --format shell)"` が開発者のシェルを壊した。実測で `HOME` が `/home/nonroot`、`PATH` がコンテナの `PATH` に置き換わり、v0.2a で Go の子プロセスの TLS を全部壊した `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` もそのまま出ていた。`tetherd run` は同じ変数を除外して注入しているので、**`env` と `run` が違う env を作っていた** — `env` の存在理由（run が注入するものを見る・シェルに取り込む）に反する。`env` も §6.4 の除外・上書きを通すように修正。
 
 ---
 

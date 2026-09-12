@@ -24,6 +24,26 @@ func defaultRun(opts RunOptions) (int, error) {
 	return Run(ctx, opts, os.Stderr)
 }
 
+// envFn is swapped in tests, the same way runFn is.
+var envFn = defaultEnv
+
+func defaultEnv(opts EnvOptions) (int, error) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return EnvRun(ctx, opts, os.Stdout, os.Stderr)
+}
+
+// doctorFn is swapped in tests, the same way runFn is.
+var doctorFn = defaultDoctor
+
+// defaultDoctor writes the report to stdout: it is what the developer is
+// asking for, not a progress log about producing it.
+func defaultDoctor(opts DoctorOptions) (int, error) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return DoctorRun(ctx, opts, os.Stdout)
+}
+
 // NewRootCommand builds `tetherd`.
 func NewRootCommand() *cobra.Command {
 	root := &cobra.Command{
@@ -33,8 +53,28 @@ func NewRootCommand() *cobra.Command {
 		SilenceErrors: true,
 		Version:       version.Version,
 	}
-	root.AddCommand(newRunCommand())
+	root.AddCommand(newRunCommand(), newEnvCommand(), newDoctorCommand())
 	return root
+}
+
+// addTargetFlags registers the flags `run` and `env` share: everything
+// needed to discover the task and reach its agent. Both commands' RunE call
+// applyConfig, whose changed() guards look up "user", "profile", "region",
+// "cluster", "service" and "env" by name - registering all of them here on
+// both commands is what keeps applyConfig callable (and its guards
+// non-panicking) under either one.
+func addTargetFlags(cmd *cobra.Command, opts *RunOptions) {
+	f := cmd.Flags()
+	f.StringVar(&opts.Transport, "transport", "ssm", "how to reach the agent: ssm | direct")
+	f.StringVar(&opts.Profile, "profile", "", "AWS profile (default: SDK default chain)")
+	f.StringVar(&opts.Region, "region", "", "AWS region (default: from the profile)")
+	f.StringVar(&opts.Cluster, "cluster", "", "ECS cluster of the dev service")
+	f.StringVarP(&opts.Service, "service", "s", "", "ECS service to attach to")
+	f.StringVar(&opts.TaskID, "task", "", "attach to this task ID instead of the oldest running one")
+	f.StringVar(&opts.TargetEnv, "env", "dev", "expected TETHERD_ENV of the agent; refuse to attach otherwise")
+	f.StringVar(&opts.AgentAddr, "agent-addr", "", "agent control address for --transport direct (host:port)")
+	f.StringVar(&opts.User, "user", "", "user name sent to the agent (default $USER)")
+	f.StringVar(&configPath, "config", "", "path to .tetherd.yml (default: the nearest one above the working directory)")
 }
 
 func newRunCommand() *cobra.Command {
@@ -50,8 +90,10 @@ func newRunCommand() *cobra.Command {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.Command = args
-			if opts.User == "" {
-				opts.User = os.Getenv("USER")
+			// Fill in what the flags did not set: personal file, then the
+			// shared file, then the defaults already on the flags (spec §6.7).
+			if err := applyConfig(cmd, &opts); err != nil {
+				return err
 			}
 			code, err := runFn(opts)
 			if err != nil {
@@ -66,21 +108,111 @@ func newRunCommand() *cobra.Command {
 			return nil
 		},
 	}
+	addTargetFlags(cmd, &opts)
 	f := cmd.Flags()
-	f.StringVar(&opts.Transport, "transport", "ssm", "how to reach the agent: ssm | direct")
-	f.StringVar(&opts.Profile, "profile", "", "AWS profile (default: SDK default chain)")
-	f.StringVar(&opts.Region, "region", "", "AWS region (default: from the profile)")
-	f.StringVar(&opts.Cluster, "cluster", "", "ECS cluster of the dev service")
-	f.StringVarP(&opts.Service, "service", "s", "", "ECS service to attach to")
-	f.StringVar(&opts.TaskID, "task", "", "attach to this task ID instead of the oldest running one")
-	f.StringVar(&opts.TargetEnv, "env", "dev", "expected TETHERD_ENV of the agent; refuse to attach otherwise")
-	f.StringVar(&opts.AgentAddr, "agent-addr", "", "agent control address for --transport direct (host:port)")
 	f.StringArrayVar(&opts.RemoteCIDRs, "remote-cidr", nil, "additional destination CIDR to route through the agent (repeatable; the VPC CIDR is added automatically with --transport ssm)")
 	f.StringVar(&opts.HelperSocket, "helper-socket", helper.DefaultSocket, "tetherd-helper socket")
 	f.StringVar(&opts.ExecPath, "exec-path", helper.ExecInstallDir+"/"+helper.ExecName, "path of the setgid tetherd-exec")
-	f.StringVar(&opts.User, "user", "", "user name sent to the agent (default $USER)")
 	f.BoolVar(&opts.NoNetwork, "no-network", false, "do not capture traffic (only connect to the agent)")
 	f.BoolVar(&opts.NoEnv, "no-env", false, "do not inject the task's environment into the command")
+	return cmd
+}
+
+func newEnvCommand() *cobra.Command {
+	var opts EnvOptions
+	cmd := &cobra.Command{
+		Use:   "env",
+		Short: "Print the environment `tetherd run` would inject (secrets masked by default)",
+		Long: "Print the environment `tetherd run` would inject into the child - the task's\n" +
+			"environment after the same filtering run applies (network.env.exclude,\n" +
+			"network.env.override; container-only names like PATH, HOME and\n" +
+			"SSL_CERT_FILE are always dropped), not the task's raw environment.\n" +
+			"Secrets (from the task definition's secrets: block) are masked as ***\n" +
+			"unless --reveal is given.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := applyConfig(cmd, &opts.RunOptions); err != nil {
+				return err
+			}
+			code, err := envFn(opts)
+			if err != nil {
+				if code == 0 {
+					code = 1
+				}
+				return &exitError{code: code, err: err}
+			}
+			return nil
+		},
+	}
+	addTargetFlags(cmd, &opts.RunOptions)
+	f := cmd.Flags()
+	f.StringVar(&opts.Format, "format", "dotenv", "output format: dotenv | shell | json")
+	f.BoolVar(&opts.Reveal, "reveal", false, "print secret values instead of ***")
+	return cmd
+}
+
+func newDoctorCommand() *cobra.Command {
+	var opts DoctorOptions
+	cmd := &cobra.Command{
+		Use:   "doctor",
+		Short: "Check that this machine and the dev service are set up for tetherd",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := applyConfig(cmd, &opts.RunOptions); err != nil {
+				return err
+			}
+			// A bound the operator did not type must reach DoctorRun as
+			// zero, not as the flag's default. Zero is what means "use the
+			// defaults", and the defaults are not one number: the
+			// agent-session row needs DefaultAgentCheckTimeout, because the
+			// ssm transport allows its plugin ssm.StartupWait to bind a
+			// port before the handshake even begins. Letting the flag's own
+			// default arrive as an explicit 10s would silently cap that row
+			// at 10s on every run, which is the bug the longer bound fixes.
+			// Both go through changed() so a rename cannot turn either
+			// guard into a silent no-op.
+			if !changed(cmd, "timeout") {
+				opts.Timeout = 0
+			}
+			if !changed(cmd, "budget") {
+				opts.Budget = 0
+			}
+			code, err := doctorFn(opts)
+			if err != nil {
+				if code == 0 {
+					code = 1
+				}
+				return &exitError{code: code, err: err}
+			}
+			if code != 0 {
+				// Every failing row has already printed what is wrong and
+				// what to do about it; child marks the error as one main
+				// must not print a line of its own for.
+				return &exitError{code: 1, child: true}
+			}
+			return nil
+		},
+	}
+	// The shared target flags are what applyConfig's changed() guards look
+	// up by name; registering them here is what keeps `tetherd doctor` from
+	// panicking inside that guard.
+	addTargetFlags(cmd, &opts.RunOptions)
+	f := cmd.Flags()
+	f.StringArrayVar(&opts.RemoteCIDRs, "remote-cidr", nil, "additional destination CIDR the run being checked would route through the agent (repeatable)")
+	f.StringVar(&opts.HelperSocket, "helper-socket", helper.DefaultSocket, "tetherd-helper socket")
+	f.StringVar(&opts.ExecPath, "exec-path", helper.ExecInstallDir+"/"+helper.ExecName, "path of the setgid tetherd-exec")
+	// No backticks in this help text: cobra reads a backquoted word as the
+	// flag's argument name, which for a bool flag prints as nonsense.
+	f.BoolVar(&opts.SkipAgent, "skip-agent", false, "do not open a session to the agent; the agent session, task env and remote domain rows are then reported as not checked, and they are the only ones that prove tetherd run can attach at all")
+	// The two bounds the report runs under. They were honoured by
+	// DoctorRun from the start but reachable only in-process, so an
+	// operator whose network makes a row time out had nothing to turn. The
+	// defaults shown here are only the general per-check bound and the
+	// whole-report budget; see DoctorOptions.Timeout for the agent-session
+	// row, whose default is longer, and RunE above for why not typing
+	// these is not the same as typing their defaults.
+	f.DurationVar(&opts.Timeout, "timeout", DefaultDoctorTimeout, "how long any one check may take before it is reported as not having answered")
+	f.DurationVar(&opts.Budget, "budget", DefaultDoctorBudget, "how long the whole report may take; what it cuts short is reported as not checked")
 	return cmd
 }
 

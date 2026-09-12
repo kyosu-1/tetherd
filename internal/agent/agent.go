@@ -21,9 +21,11 @@ type SessionInfo struct {
 
 // Agent serves control sessions.
 type Agent struct {
-	cfg  Config
-	logf func(string, ...any)
-	env  EnvReader // nil outside ECS
+	cfg    Config
+	logf   func(string, ...any)
+	env    EnvReader // nil outside ECS
+	dial   func(ctx context.Context, addr string) (net.Conn, error)
+	lookup func(ctx context.Context, name string) ([]net.IPAddr, error)
 
 	mu       sync.Mutex
 	sessions map[string]SessionInfo
@@ -43,6 +45,13 @@ func New(cfg Config, logf func(string, ...any)) *Agent {
 
 // SetEnvReader replaces the env source (tests).
 func (a *Agent) SetEnvReader(r EnvReader) { a.env = r }
+
+// SetDialer replaces what a dial stream connects to. Production leaves it
+// unset and the agent dials the address itself; tests point it at a stub so
+// the CLI side can be exercised without a VPC.
+func (a *Agent) SetDialer(dial func(ctx context.Context, addr string) (net.Conn, error)) {
+	a.dial = dial
+}
 
 // ListenAndServe listens on cfg.Control and serves until ctx is done.
 func (a *Agent) ListenAndServe(ctx context.Context) error {
@@ -158,6 +167,9 @@ func (h *handler) Hello(hello proto.Hello, remote string) (proto.Welcome, *proto
 }
 
 func (h *handler) Dial(ctx context.Context, addr string) (net.Conn, error) {
+	if h.a.dial != nil {
+		return h.a.dial(ctx, addr)
+	}
 	d := net.Dialer{Timeout: 10 * time.Second}
 	return d.DialContext(ctx, "tcp", addr)
 }

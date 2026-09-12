@@ -29,6 +29,9 @@ type Task struct {
 	// SubnetID and StartedAt come from DescribeTasks (ECS provider).
 	SubnetID  string
 	StartedAt time.Time
+	// DefinitionARN is the task definition revision the task runs, used to
+	// read the secrets list and pidMode.
+	DefinitionARN string
 }
 
 // Transport opens one TCP connection to the agent's control port.

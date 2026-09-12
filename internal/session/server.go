@@ -19,6 +19,10 @@ type Handler interface {
 	Hello(h proto.Hello, remote string) (proto.Welcome, *proto.Error)
 	// Dial opens a TCP connection to addr from the agent's network.
 	Dial(ctx context.Context, addr string) (net.Conn, error)
+	// Resolve looks name up with the agent's own resolver (the task's
+	// resolv.conf), which is what makes Cloud Map names and private hosted
+	// zones resolvable from the laptop.
+	Resolve(ctx context.Context, name string) (addrs []string, ttl int, err error)
 	// Closed is called once when the session ends for any reason.
 	Closed()
 }
@@ -28,6 +32,10 @@ type ServeOptions struct {
 	// ControlTimeout is the longest the control stream may be silent. The
 	// client pings every 5s, so 20s means ~4 missed pings.
 	ControlTimeout time.Duration
+	// ResolveTimeout bounds how long a single resolve stream's lookup may
+	// take before serveStream gives up and answers with an error, so a
+	// handler that hangs cannot leak a stream forever. Default 5s.
+	ResolveTimeout time.Duration
 }
 
 // Serve runs the agent side of one session until the client says bye, the
@@ -35,6 +43,9 @@ type ServeOptions struct {
 func Serve(ctx context.Context, conn net.Conn, h Handler, opts ServeOptions) error {
 	if opts.ControlTimeout == 0 {
 		opts.ControlTimeout = 20 * time.Second
+	}
+	if opts.ResolveTimeout == 0 {
+		opts.ResolveTimeout = 5 * time.Second
 	}
 	cfg := yamux.DefaultConfig()
 	cfg.LogOutput = io.Discard
@@ -93,7 +104,7 @@ func Serve(ctx context.Context, conn net.Conn, h Handler, opts ServeOptions) err
 			if err != nil {
 				return
 			}
-			go serveStream(ctx, s, h)
+			go serveStream(ctx, s, h, opts.ResolveTimeout)
 		}
 	}()
 
@@ -115,7 +126,7 @@ func Serve(ctx context.Context, conn net.Conn, h Handler, opts ServeOptions) err
 	}
 }
 
-func serveStream(ctx context.Context, s net.Conn, h Handler) {
+func serveStream(ctx context.Context, s net.Conn, h Handler, resolveTimeout time.Duration) {
 	defer s.Close()
 	typ, raw, err := proto.ReadHeader(s)
 	if err != nil {
@@ -141,6 +152,24 @@ func serveStream(ctx context.Context, s net.Conn, h Handler) {
 			return
 		}
 		Pipe(s, target)
+	case proto.TypeResolve:
+		var hd proto.ResolveHeader
+		if err := proto.Unmarshal(raw, &hd); err != nil {
+			enc.Encode(proto.TypeResolve, proto.ResolveReply{Error: err.Error()})
+			return
+		}
+		if hd.QType != "A" {
+			enc.Encode(proto.TypeResolve, proto.ResolveReply{Error: fmt.Sprintf("unsupported query type %q: only A is supported", hd.QType)})
+			return
+		}
+		rctx, cancel := context.WithTimeout(ctx, resolveTimeout)
+		addrs, ttl, err := h.Resolve(rctx, hd.Name)
+		cancel()
+		if err != nil {
+			enc.Encode(proto.TypeResolve, proto.ResolveReply{Error: err.Error(), NotFound: errors.Is(err, ErrNameNotFound)})
+			return
+		}
+		enc.Encode(proto.TypeResolve, proto.ResolveReply{OK: true, Addrs: addrs, TTL: ttl})
 	default:
 		enc.Encode(proto.TypeError, proto.Error{Code: proto.CodeBadHello, Message: "unknown stream type " + typ})
 	}

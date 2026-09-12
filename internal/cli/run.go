@@ -5,21 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
-	awsecs "github.com/aws/aws-sdk-go-v2/service/ecs"
-	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
-
 	"github.com/kyosu-1/tetherd/internal/awsid"
 	"github.com/kyosu-1/tetherd/internal/capture"
-	"github.com/kyosu-1/tetherd/internal/capture/pfrdr"
+	"github.com/kyosu-1/tetherd/internal/dnsproxy"
+	"github.com/kyosu-1/tetherd/internal/doctor"
 	"github.com/kyosu-1/tetherd/internal/env"
 	"github.com/kyosu-1/tetherd/internal/helper"
 	"github.com/kyosu-1/tetherd/internal/proto"
@@ -28,7 +26,6 @@ import (
 	"github.com/kyosu-1/tetherd/internal/session"
 	"github.com/kyosu-1/tetherd/internal/transport"
 	"github.com/kyosu-1/tetherd/internal/transport/direct"
-	ssmtr "github.com/kyosu-1/tetherd/internal/transport/ssm"
 )
 
 // RunOptions are the flags of `tetherd run`.
@@ -49,18 +46,35 @@ type RunOptions struct {
 	TaskID    string
 	TargetEnv string
 	NoEnv     bool
+
+	LocalCIDRs     []string
+	RemoteServices []string
+	RemoteDomains  []string
+	EnvOverride    map[string]string
+	EnvExclude     []string
+	ConfigPath     string // the .tetherd.yml read; shown in the status line
 }
 
-// ParseRemoteCIDRs parses IPv4 prefixes.
-func ParseRemoteCIDRs(in []string) ([]netip.Prefix, error) {
+// ParseRemoteCIDRs parses IPv4 prefixes. source names where the values came
+// from ("--remote-cidr", "network.local_cidrs", ...) so a parse failure
+// reads correctly regardless of which flag or config key produced it,
+// instead of every source's errors being mislabelled as "--remote-cidr".
+//
+// Every failure is a usageError, so Run exits 2 for it wherever it was
+// caught. An unparseable prefix is a value that is simply wrong - retrying
+// it will never work - and that has to be true of every source: measured on
+// this branch, `network.remote_cidrs: [10.0.0.0/99]` exited 2 while a
+// `network.local_cidrs` typo exited 1, and a CI wrapper that reads 2 as "fix
+// the invocation" and 1 as "retry" loops forever on the second.
+func ParseRemoteCIDRs(source string, in []string) ([]netip.Prefix, error) {
 	out := make([]netip.Prefix, 0, len(in))
 	for _, s := range in {
 		p, err := netip.ParsePrefix(s)
 		if err != nil {
-			return nil, fmt.Errorf("--remote-cidr %q: %w", s, err)
+			return nil, usageError{fmt.Errorf("%s %q: %w", source, s, err)}
 		}
 		if !p.Addr().Is4() {
-			return nil, fmt.Errorf("--remote-cidr %q: only IPv4 is supported in v1", s)
+			return nil, usageError{fmt.Errorf("%s %q: only IPv4 is supported in v1", source, s)}
 		}
 		out = append(out, p.Masked())
 	}
@@ -186,79 +200,333 @@ func emptyAWSConfigFile() (string, func(), error) {
 	return name, func() { os.Remove(name) }, nil
 }
 
-// Run connects to the agent, installs capture, runs the command and cleans
-// up. It returns the child's exit code.
-func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
-	logf := func(format string, args ...any) { fmt.Fprintf(stderr, "tetherd  "+format+"\n", args...) }
-	if len(opts.Command) == 0 {
-		return 2, errors.New("no command given")
-	}
-	extra, err := ParseRemoteCIDRs(opts.RemoteCIDRs)
-	if err != nil {
-		return 2, err
-	}
+// errLocalCIDRsExcludeEverything is returned when network.local_cidrs
+// subtracts every prefix a remote set would otherwise have contained: with
+// no fix, the privileged helper would be asked to install pf rules for zero
+// remote ranges (surfacing as its own, much less useful, "no remote cidrs"
+// failure two round trips later), so this is caught and named at the source
+// instead.
+var errLocalCIDRsExcludeEverything = errors.New("network.local_cidrs excludes the entire remote set; nothing would be captured")
 
-	// 1. transport, task, remote set
-	var tr transport.Transport
-	var task transport.Task
-	var cidrs []netip.Prefix
-	region := opts.Region
+// subtractOne removes e from p, returning the pieces of p left afterwards:
+// nothing (e covers p entirely), p unchanged (no overlap), or - when e is
+// strictly narrower than p and overlaps somewhere inside it - the
+// concatenation of subtracting e from each half of p, halved by extending
+// p's mask by one bit and setting that bit for the upper half. Recursing
+// this way (rather than pf's native "!" table negation) keeps the result an
+// explicit list of the exact prefixes captured, which is what both pf and
+// `doctor` must agree on - a negated table would make the printed set a lie
+// about what pf actually enforces.
+//
+// IPv4 only: v1 captures no IPv6, and the halving below indexes a 4-byte
+// address. An IPv6 prefix is dropped rather than kept: keeping it would mean
+// a range the operator asked to hold local survives every exclude, including
+// an identical one, which is the unsafe direction to fail in. Unreachable
+// today - every producer of the set filters IPv6 out first - so this is the
+// guard's shape, not a live path.
+func subtractOne(p, e netip.Prefix) []netip.Prefix {
+	if !p.Addr().Is4() {
+		return nil
+	}
+	if !e.Overlaps(p) {
+		return []netip.Prefix{p}
+	}
+	if e.Bits() <= p.Bits() {
+		// e is at least as wide as p and they overlap, so e covers p
+		// entirely.
+		return nil
+	}
+	bits := p.Bits() + 1
+	lower := netip.PrefixFrom(p.Addr(), bits)
+	addr4 := p.Addr().As4()
+	byteIdx := (bits - 1) / 8
+	bitIdx := 7 - (bits-1)%8
+	addr4[byteIdx] |= 1 << bitIdx
+	upper := netip.PrefixFrom(netip.AddrFrom4(addr4), bits)
+	return append(subtractOne(lower, e), subtractOne(upper, e)...)
+}
+
+// Subtract removes the portion of each prefix in all that any prefix in
+// exclude covers. A narrower exclude (VPC 10.0.0.0/16, local_cidrs
+// 10.0.5.0/24 - the sample in both config test fixtures) carves exactly
+// that /24 out rather than being a no-op or dropping the whole /16: the
+// result is 8 canonical prefixes covering 10.0.0.0/16 minus 10.0.5.0/24.
+// Always returns a freshly allocated slice, even with no exclusions, so the
+// caller's own slice is never handed back for the next append to corrupt.
+func Subtract(all []netip.Prefix, exclude []netip.Prefix) []netip.Prefix {
+	cur := slices.Clone(all)
+	for _, e := range exclude {
+		var next []netip.Prefix
+		for _, p := range cur {
+			next = append(next, subtractOne(p, e)...)
+		}
+		cur = next
+	}
+	return cur
+}
+
+// applyLocalCIDRs subtracts local (already-parsed network.local_cidrs
+// prefixes) from cidrs, then adds back floor - prefixes local_cidrs can
+// never remove because they are required infrastructure, not part of the
+// operator-tunable remote set (ssm's TaskRoleCIDR; direct has none).
+//
+// Emptiness is judged before the floor goes back on. Judging it after would
+// make the check unreachable under ssm, where the floor is never empty, and
+// the failure it exists to catch is a quiet one: `network.local_cidrs:
+// [10.0.0.0/8]` written to mean a home LAN, against a 10.0.0.0/16 VPC,
+// removes the whole VPC. The run then starts normally, prints a green
+// network line, and every connection to the VPC leaves over the laptop's
+// own route to time out somewhere else.
+// Both returns are usageErrors, so Run exits 2 rather than 1: this is a
+// value in .tetherd.yml that is wrong, in the same class as an unparseable
+// prefix, and nothing about retrying it can change the answer.
+func applyLocalCIDRs(cidrs, local, floor []netip.Prefix) ([]netip.Prefix, error) {
+	kept := Subtract(cidrs, local)
+	if len(cidrs) > 0 && len(kept) == 0 {
+		return nil, usageError{errLocalCIDRsExcludeEverything}
+	}
+	out := append(kept, floor...)
+	if len(out) == 0 {
+		return nil, usageError{errLocalCIDRsExcludeEverything}
+	}
+	return out, nil
+}
+
+// remoteSet is everything that goes to the task: the VPC, the configured
+// extras and any gateway-endpoint service ranges, minus the ranges the
+// laptop must keep for itself (spec §4.1), plus the credential endpoint.
+func remoteSet(ctx context.Context, opts RunOptions, prov awsProvider, task transport.Task, logf func(string, ...any)) ([]netip.Prefix, error) {
+	extra, err := ParseRemoteCIDRs("--remote-cidr", opts.RemoteCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	// Parsed before any AWS call, so a local_cidrs typo costs no round trip.
+	local, err := ParseRemoteCIDRs("network.local_cidrs", opts.LocalCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	vpc, err := prov.VPCCIDRs(ctx, task.SubnetID)
+	if err != nil {
+		return nil, err
+	}
+	// slices.Concat, not append(vpc, extra...): vpc is the provider's own
+	// slice (kept and reused across calls by at least one implementation),
+	// and appending onto it would silently overwrite its backing array
+	// whenever it has spare capacity.
+	cidrs := slices.Concat(vpc, extra)
+	if len(opts.RemoteServices) > 0 {
+		svc, err := prov.ServiceCIDRs(ctx, opts.RemoteServices)
+		if err != nil {
+			return nil, err
+		}
+		cidrs = append(cidrs, svc...)
+		logf("           remote_services %s → %d prefixes", strings.Join(opts.RemoteServices, ", "), len(svc))
+	}
+	// TaskRoleCIDR is passed as floor, not appended before the subtraction:
+	// an overly broad local_cidrs entry ("169.254.0.0/16", or even
+	// "0.0.0.0/0") must never drop the credential endpoint.
+	return applyLocalCIDRs(cidrs, local, []netip.Prefix{ecsprov.TaskRoleCIDR})
+}
+
+// ecsTarget is the discovery target the flags and the config describe.
+func ecsTarget(opts RunOptions) ecsprov.Target {
+	return ecsprov.Target{Cluster: opts.Cluster, Service: opts.Service, TaskID: opts.TaskID}
+}
+
+// usageError marks a discoverTask failure as a bad invocation (missing or
+// contradictory flags) rather than an operational one, so callers can map it
+// to exit code 2 the way Run always has, instead of every discovery failure
+// collapsing onto the same code 1 as an AWS outage.
+type usageError struct{ error }
+
+func (e usageError) Unwrap() error { return e.error }
+
+// isUsageError reports whether err (or something it wraps) is a usageError.
+func isUsageError(err error) bool {
+	var ue usageError
+	return errors.As(err, &ue)
+}
+
+// exitFor is Run's exit code for err: 2 when what went wrong is a value the
+// operator gave (a flag, or a key in .tetherd.yml), 1 when it is
+// operational. Both arms of the transport switch go through it, because the
+// same class of mistake exiting 2 from one and 1 from the other is a trap
+// for anything that reads the code: a CI wrapper treating 2 as "fix the
+// invocation" and 1 as "retry" loops forever on a local_cidrs typo.
+func exitFor(err error) int {
+	if isUsageError(err) {
+		return 2
+	}
+	return 1
+}
+
+// directProvider is the awsProvider for --transport direct: a bare TCP
+// connection to an address, used by tests and the local e2e harness. There
+// is no AWS session behind it, so discovery, the VPC/service CIDR lookups
+// and the task definition reads all refuse rather than silently succeed
+// with nothing.
+type directProvider struct{}
+
+func (directProvider) Region() string { return "" }
+
+func (directProvider) Discover(context.Context, ecsprov.Target) (transport.Task, error) {
+	return transport.Task{}, errors.New("--transport direct has no discovery; the task is --agent-addr itself")
+}
+
+func (directProvider) VPCCIDRs(context.Context, string) ([]netip.Prefix, error) {
+	return nil, errors.New("--transport direct has no VPC to look up; use --remote-cidr")
+}
+
+func (directProvider) ServiceCIDRs(context.Context, []string) ([]netip.Prefix, error) {
+	return nil, errors.New("--transport direct cannot resolve managed prefix lists (no AWS session)")
+}
+
+func (directProvider) Transport(func(string, ...any)) transport.Transport { return direct.Transport{} }
+
+func (directProvider) Identity(context.Context) (string, error) {
+	return "", errors.New("--transport direct has no AWS session, so there is no caller identity to report")
+}
+
+// SecretNames and PIDMode delegate to the ecs package with a nil API: a
+// direct task's DefinitionARN is always empty, so describe() refuses before
+// ever touching the API - there is no task definition to read over direct.
+func (directProvider) SecretNames(ctx context.Context, definitionARN string) (map[string]bool, error) {
+	return ecsprov.SecretNames(ctx, nil, definitionARN)
+}
+
+func (directProvider) PIDMode(ctx context.Context, definitionARN string) (string, error) {
+	return ecsprov.PIDMode(ctx, nil, definitionARN)
+}
+
+// discoverTask resolves the provider and the task to attach to, and logs the
+// target line. It is the first half of what Run always did in its step 1;
+// EnvRun shares it so `tetherd env` discovers the exact same task `tetherd
+// run` would attach to.
+func discoverTask(ctx context.Context, opts RunOptions, d Deps, logf func(string, ...any)) (awsProvider, transport.Task, error) {
 	switch opts.Transport {
 	case "direct":
 		if opts.AgentAddr == "" {
-			return 2, errors.New("--transport direct needs --agent-addr")
+			return nil, transport.Task{}, usageError{errors.New("--transport direct needs --agent-addr")}
 		}
-		if !opts.NoNetwork && len(extra) == 0 {
-			return 2, errors.New("no --remote-cidr given (or use --no-network)")
-		}
-		tr, task, cidrs = direct.Transport{}, transport.Task{ID: "direct", Addr: opts.AgentAddr}, extra
+		return directProvider{}, transport.Task{ID: "direct", Addr: opts.AgentAddr}, nil
 	case "ssm":
 		if opts.Cluster == "" || opts.Service == "" {
-			return 2, errors.New("--transport ssm needs --cluster and --service")
+			return nil, transport.Task{}, usageError{errors.New("--transport ssm needs --cluster and --service")}
 		}
-		var loadOpts []func(*awsconfig.LoadOptions) error
-		if opts.Profile != "" {
-			loadOpts = append(loadOpts, awsconfig.WithSharedConfigProfile(opts.Profile))
-		}
-		if opts.Region != "" {
-			loadOpts = append(loadOpts, awsconfig.WithRegion(opts.Region))
-		}
-		awscfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
+		prov, err := d.NewAWSProvider(ctx, opts)
 		if err != nil {
-			return 1, fmt.Errorf("aws config: %w", err)
+			return nil, transport.Task{}, fmt.Errorf("aws config: %w", err)
 		}
-		region = awscfg.Region
-		task, err = ecsprov.Discover(ctx, awsecs.NewFromConfig(awscfg), ecsprov.Target{Cluster: opts.Cluster, Service: opts.Service, TaskID: opts.TaskID})
+		task, err := prov.Discover(ctx, ecsTarget(opts))
 		if err != nil {
-			return 1, err
+			return nil, transport.Task{}, err
 		}
 		if task.StartedAt.IsZero() {
 			logf("%s/%s  task %s", opts.Cluster, opts.Service, short(task.ID))
 		} else {
 			logf("%s/%s  task %s  (started %s ago)", opts.Cluster, opts.Service, short(task.ID), time.Since(task.StartedAt).Round(time.Minute))
 		}
-		if !opts.NoNetwork {
-			vpc, err := ecsprov.VPCCIDRs(ctx, awsec2.NewFromConfig(awscfg), task.SubnetID)
-			if err != nil {
-				return 1, err
-			}
-			cidrs = append(append(vpc, ecsprov.TaskRoleCIDR), extra...)
-		}
-		tr = &ssmtr.Transport{API: awsssm.NewFromConfig(awscfg), Region: awscfg.Region, Profile: opts.Profile, Logf: logf}
+		return prov, task, nil
 	default:
-		return 2, fmt.Errorf("unknown transport %q (ssm | direct)", opts.Transport)
+		return nil, transport.Task{}, usageError{fmt.Errorf("unknown transport %q (ssm | direct)", opts.Transport)}
+	}
+}
+
+// dialAgent opens the transport and completes the control handshake. The
+// second half of Run's original steps 1 and 3.
+func dialAgent(ctx context.Context, opts RunOptions, d Deps, prov awsProvider, task transport.Task, logf func(string, ...any)) (*session.Client, error) {
+	tr := prov.Transport(logf)
+	conn, err := tr.Dial(ctx, task)
+	if err != nil {
+		return nil, fmt.Errorf("connect to agent: %w", err)
+	}
+	sess, err := session.Dial(ctx, conn, proto.Hello{Version: proto.Version, User: opts.User}, session.Options{})
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return sess, nil
+}
+
+// Run connects to the agent, installs capture, runs the command and cleans
+// up. It returns the child's exit code.
+func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
+	return RunWithDeps(ctx, opts, stderr, Deps{})
+}
+
+// RunWithDeps is Run with substitutable collaborators (see Deps).
+func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps) (int, error) {
+	d = d.withDefaults()
+	logf := func(format string, args ...any) { fmt.Fprintf(stderr, "tetherd  "+format+"\n", args...) }
+	if len(opts.Command) == 0 {
+		return 2, errors.New("no command given")
+	}
+	if opts.ConfigPath != "" {
+		logf("config     %s", opts.ConfigPath)
+	}
+	extra, err := ParseRemoteCIDRs("--remote-cidr", opts.RemoteCIDRs)
+	if err != nil {
+		return 2, err
+	}
+
+	// 1. transport, task, remote set
+	prov, task, err := discoverTask(ctx, opts, d, logf)
+	if err != nil {
+		if isUsageError(err) {
+			return 2, err
+		}
+		return 1, err
+	}
+	region := opts.Region
+	if opts.Transport == "ssm" {
+		region = prov.Region()
+	}
+
+	var cidrs []netip.Prefix
+	switch opts.Transport {
+	case "direct":
+		if !opts.NoNetwork && len(extra) == 0 {
+			return 2, errors.New("no --remote-cidr given (or use --no-network)")
+		}
+		cidrs = extra
+		if !opts.NoNetwork {
+			// direct has no AWS session, so remote_services (a prefix-list
+			// lookup) cannot be resolved here - only local_cidrs applies.
+			local, err := ParseRemoteCIDRs("network.local_cidrs", opts.LocalCIDRs)
+			if err != nil {
+				return exitFor(err), err
+			}
+			cidrs, err = applyLocalCIDRs(cidrs, local, nil)
+			if err != nil {
+				return exitFor(err), err
+			}
+			if len(opts.RemoteServices) > 0 {
+				logf("           remote_services %s ignored under --transport direct (prefix lists need an AWS session)", strings.Join(opts.RemoteServices, ", "))
+			}
+		}
+	case "ssm":
+		if !opts.NoNetwork {
+			cidrs, err = remoteSet(ctx, opts, prov, task, logf)
+			if err != nil {
+				// remoteSet mixes the two classes: a local_cidrs typo or a
+				// local_cidrs that removes everything (usage), and a
+				// DescribeVpcs or prefix-list call that failed
+				// (operational). They must not collapse onto one code.
+				return exitFor(err), err
+			}
+		}
 	}
 
 	// 2. helper and the setgid shim, before the SSM session: a helper that
 	// is not running, or a missing tetherd-exec, should not cost a
 	// StartSession round trip. A *busy* helper is only discovered when the
 	// pf rules are applied (step 4), which needs the session's VPC CIDRs.
-	var hc *helper.Client
+	var hc HelperClient
 	if !opts.NoNetwork {
 		if _, err := os.Stat(opts.ExecPath); err != nil {
 			return 1, fmt.Errorf("%s not found; is tetherd-helper running? (%w)", opts.ExecPath, err)
 		}
-		hc, err = helper.Dial(opts.HelperSocket)
+		hc, err = d.DialHelper(opts.HelperSocket)
 		if err != nil {
 			return 1, err
 		}
@@ -266,13 +534,8 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 	}
 
 	// 3. session
-	conn, err := tr.Dial(ctx, task)
+	sess, err := dialAgent(ctx, opts, d, prov, task, logf)
 	if err != nil {
-		return 1, fmt.Errorf("connect to agent: %w", err)
-	}
-	sess, err := session.Dial(ctx, conn, proto.Hello{Version: proto.Version, User: opts.User}, session.Options{})
-	if err != nil {
-		conn.Close()
 		return 1, err
 	}
 	defer sess.Close()
@@ -297,8 +560,7 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 				logf("⚠ remote CIDR overlaps this machine's network: %s (that part of the LAN is routed through the agent for the child)", o)
 			}
 		}
-		cap := pfrdr.New(hc)
-		cap.Logf = logf
+		cap := d.NewCapturer(hc, logf)
 		if err := cap.Start(ctx, capture.Spec{RemoteCIDRs: cidrs}); err != nil {
 			var busy *helper.BusyError
 			if errors.As(err, &busy) {
@@ -317,9 +579,39 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 				logf("✗ capture stopped: %v", err)
 			}
 		}()
-		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s", joinPrefixes(cidrs))
+
+		// DNS: names that only the VPC resolver knows (Cloud Map, private
+		// hosted zones). macOS routes them per-domain through
+		// /etc/resolver files that point at this loopback resolver, which
+		// forwards each question to the agent (spec §3.4).
+		dnsStatus := "local"
+		if len(opts.RemoteDomains) > 0 {
+			dsrv := &dnsproxy.Server{Resolve: sess.Resolve, Logf: logf}
+			daddr, err := dsrv.StartPreferring(ctx, dnsproxy.DefaultPort)
+			if err != nil {
+				return 1, fmt.Errorf("start the DNS resolver: %w", err)
+			}
+			defer dsrv.Close()
+			// Registered before ResolverSet is even called, not after it
+			// succeeds: ResolverSet writes one /etc/resolver/<domain> file
+			// per domain and can fail partway through (e.g. a later
+			// domain already has a file some other tool manages), and
+			// ResolverClear only ever removes files tetherd itself wrote -
+			// so running it unconditionally on any exit from this point on
+			// is always safe, and is what stops a partial failure from
+			// leaving a domain pointed at a resolver that just exited.
+			defer hc.ResolverClear()
+			if err := hc.ResolverSet(opts.RemoteDomains, int(daddr.Port())); err != nil {
+				return 1, fmt.Errorf("point %s at the agent: %w", strings.Join(opts.RemoteDomains, ", "), err)
+			}
+			dnsStatus = fmt.Sprintf("local (+ %s via the VPC resolver on 127.0.0.1:%d)", strings.Join(opts.RemoteDomains, ", "), daddr.Port())
+		}
+		// The same formatter doctor's remote CIDRs row uses, so the two
+		// surfaces cannot drift again - and so neither prints the whole
+		// managed prefix list on one line.
+		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s · DNS: %s", doctor.FormatPrefixes(cidrs), dnsStatus)
 		if taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "" && !taskRoleReachable(taskEnv, cidrs) {
-			logf("⚠ iam      the task advertises a role but %s is not captured; the child keeps your own AWS credentials (add --remote-cidr %s to use the task role)", ecsprov.TaskRoleCIDR, ecsprov.TaskRoleCIDR)
+			logf("⚠ iam      the task advertises a role but %s is not captured; the child keeps your own AWS credentials (with --transport direct, pass --remote-cidr %s and make sure network.local_cidrs does not exclude it)", ecsprov.TaskRoleCIDR, ecsprov.TaskRoleCIDR)
 		}
 
 		// 5. task role: fetch credentials the way the child's SDK will.
@@ -360,10 +652,16 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 		child = exec.CommandContext(ctx, opts.ExecPath, append([]string{"--"}, opts.Command...)...)
 	}
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
-	mergeOpts := env.Options{DropAWSContainer: opts.NoNetwork}
+	override := maps.Clone(opts.EnvOverride)
+	for k, v := range overrideEnv {
+		if override == nil {
+			override = map[string]string{}
+		}
+		override[k] = v
+	}
+	mergeOpts := env.Options{DropAWSContainer: opts.NoNetwork, Exclude: opts.EnvExclude, Override: override}
 	if !opts.NoNetwork && taskRoleReachable(taskEnv, cidrs) {
 		mergeOpts.StripLocal = env.LocalAWSCredentialVars
-		mergeOpts.Override = overrideEnv
 		var found []string
 		for _, name := range env.LocalAWSCredentialVars {
 			if _, ok := os.LookupEnv(name); ok {
@@ -380,7 +678,7 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 	}
 	child.Env = env.Merge(os.Environ(), taskEnv, mergeOpts)
 	child.Cancel = func() error { return child.Process.Signal(os.Interrupt) }
-	child.WaitDelay = 5 * time.Second
+	child.WaitDelay = childWaitDelay
 	logf("▶ %s", joinArgs(opts.Command))
 	if err := child.Start(); err != nil {
 		return 1, fmt.Errorf("start %s: %w", opts.Command[0], err)
@@ -401,27 +699,36 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 	case <-sess.Done():
 		logf("✗ agent session lost: %v", sess.Err())
 		cancel()
+		// Not a bare return: Run's defers pull the pf rules, the helper
+		// socket and every /etc/resolver file down, and doing that while
+		// the child is still alive leaves it running with its network half
+		// dismantled - connections to the VPC failing in whatever way the
+		// teardown happens to land. Waiting here is what bounds the child's
+		// life to the capture's. child.WaitDelay above is what bounds this
+		// wait: cancel() only asks (SIGINT), and a child that ignores it
+		// would otherwise hold `tetherd run` - and the pf rules - forever.
 		<-waitErr
 		return 1, sess.Err()
 	}
 }
+
+// childWaitDelay is how long a child gets between being asked to stop
+// (SIGINT, from child.Cancel) and being killed. It is the bound on the
+// <-waitErr above: a child that ignores SIGINT - an interactive shell, a
+// process with its own handler - would otherwise wedge `tetherd run` while
+// it still holds the pf rules and the /etc/resolver files, which is the one
+// state a developer cannot get out of without knowing about
+// `tetherd-helper`.
+//
+// A var, not a const, only so a test can shorten it: five seconds is
+// unremarkable to wait for and far too long to test against.
+var childWaitDelay = 5 * time.Second
 
 func short(id string) string {
 	if len(id) > 8 {
 		return id[:8] + "…"
 	}
 	return id
-}
-
-func joinPrefixes(ps []netip.Prefix) string {
-	s := ""
-	for i, p := range ps {
-		if i > 0 {
-			s += ", "
-		}
-		s += p.String()
-	}
-	return s
 }
 
 func joinArgs(a []string) string {

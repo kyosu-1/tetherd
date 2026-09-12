@@ -89,6 +89,62 @@ func TestEncodeTypedNilPayload(t *testing.T) {
 	}
 }
 
+// ResolveHeader/ResolveReply are the wire protocol a deployed agent speaks.
+// The end-to-end tests in internal/session are symmetric (the same struct
+// is encoded and decoded on both ends), so they cannot see a JSON tag
+// rename break compatibility with a real agent. These golden strings can.
+func TestResolveHeaderWireFormat(t *testing.T) {
+	var buf bytes.Buffer
+	h := ResolveHeader{Name: "api.myapp.internal", QType: "A"}
+	if err := NewEncoder(&buf).Encode(TypeResolve, h); err != nil {
+		t.Fatal(err)
+	}
+	want := `{"name":"api.myapp.internal","qtype":"A","type":"resolve"}` + "\n"
+	if got := buf.String(); got != want {
+		t.Fatalf("ResolveHeader wire format changed:\n got  %q\n want %q", got, want)
+	}
+}
+
+func TestResolveReplyWireFormat(t *testing.T) {
+	var buf bytes.Buffer
+	r := ResolveReply{OK: true, Addrs: []string{"10.0.11.229", "10.0.12.7"}, TTL: 30}
+	if err := NewEncoder(&buf).Encode(TypeResolve, r); err != nil {
+		t.Fatal(err)
+	}
+	want := `{"addrs":["10.0.11.229","10.0.12.7"],"ok":true,"ttl":30,"type":"resolve"}` + "\n"
+	if got := buf.String(); got != want {
+		t.Fatalf("ResolveReply wire format changed:\n got  %q\n want %q", got, want)
+	}
+}
+
+func TestResolveReplyErrorWireFormat(t *testing.T) {
+	var buf bytes.Buffer
+	r := ResolveReply{Error: "NXDOMAIN"}
+	if err := NewEncoder(&buf).Encode(TypeResolve, r); err != nil {
+		t.Fatal(err)
+	}
+	want := `{"error":"NXDOMAIN","ok":false,"type":"resolve"}` + "\n"
+	if got := buf.String(); got != want {
+		t.Fatalf("ResolveReply (failure) wire format changed:\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestResolveReplyNotFoundWireFormat pins the additive not_found field: an
+// agent built before it existed omits it, which an older CLI (and the
+// json:",omitempty" tag) both treat as false, so this stays backward
+// compatible in both directions.
+func TestResolveReplyNotFoundWireFormat(t *testing.T) {
+	var buf bytes.Buffer
+	r := ResolveReply{Error: "no such host", NotFound: true}
+	if err := NewEncoder(&buf).Encode(TypeResolve, r); err != nil {
+		t.Fatal(err)
+	}
+	want := `{"error":"no such host","not_found":true,"ok":false,"type":"resolve"}` + "\n"
+	if got := buf.String(); got != want {
+		t.Fatalf("ResolveReply (not found) wire format changed:\n got  %q\n want %q", got, want)
+	}
+}
+
 func TestEncodeConcurrent(t *testing.T) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)

@@ -14,6 +14,15 @@ import (
 	"github.com/kyosu-1/tetherd/internal/proto"
 )
 
+// HandshakeWait is how long Dial waits for the agent's welcome when the
+// caller's context carries no deadline of its own (`tetherd run`'s case).
+//
+// It is exported because a caller that does impose a deadline has to allow
+// at least this long for the handshake: `tetherd doctor` bounds every check,
+// and a bound shorter than this reports an agent that answers `tetherd run`
+// fine as one that is not there.
+const HandshakeWait = 15 * time.Second
+
 // Options tunes the client's liveness check.
 type Options struct {
 	PingInterval time.Duration // default 5s
@@ -62,7 +71,7 @@ func Dial(ctx context.Context, conn net.Conn, hello proto.Hello, opts Options) (
 	if dl, ok := ctx.Deadline(); ok {
 		control.SetReadDeadline(dl)
 	} else {
-		control.SetReadDeadline(time.Now().Add(15 * time.Second))
+		control.SetReadDeadline(time.Now().Add(HandshakeWait))
 	}
 	typ, raw, err := dec.Decode()
 	control.SetReadDeadline(time.Time{})
@@ -134,6 +143,71 @@ func (c *Client) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
 		return nil, fmt.Errorf("dial %s via agent: %s", addr, reply.Error)
 	}
 	return s, nil
+}
+
+// Resolve asks the agent to resolve name with the task's resolver.
+func (c *Client) Resolve(ctx context.Context, name string) ([]string, int, error) {
+	s, err := c.mux.OpenStream()
+	if err != nil {
+		return nil, 0, fmt.Errorf("session: open stream: %w", err)
+	}
+	defer s.Close()
+	if err := proto.NewEncoder(s).Encode(proto.TypeResolve, proto.ResolveHeader{Name: name, QType: "A"}); err != nil {
+		return nil, 0, err
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		s.SetReadDeadline(dl)
+	} else {
+		s.SetReadDeadline(time.Now().Add(10 * time.Second))
+	}
+	// A caller that cancels ctx (Ctrl-C on `tetherd doctor`, an errgroup
+	// tearing down its siblings) must not stay blocked in ReadHeader until
+	// the deadline set above fires.
+	stop := context.AfterFunc(ctx, func() { s.SetReadDeadline(time.Now()) })
+	defer stop()
+	typ, rawReply, err := proto.ReadHeader(s)
+	s.SetReadDeadline(time.Time{})
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, 0, ctxErr
+		}
+		return nil, 0, fmt.Errorf("session: resolve %s: %w", name, err)
+	}
+	switch typ {
+	case proto.TypeResolve:
+		var reply proto.ResolveReply
+		if err := proto.Unmarshal(rawReply, &reply); err != nil {
+			return nil, 0, err
+		}
+		if !reply.OK {
+			msg := reply.Error
+			if msg == "" {
+				msg = "agent did not say why"
+			}
+			if reply.NotFound {
+				return nil, 0, &notFoundError{msg: fmt.Sprintf("resolve %s via agent: %s", name, msg)}
+			}
+			return nil, 0, fmt.Errorf("resolve %s via agent: %s", name, msg)
+		}
+		return reply.Addrs, reply.TTL, nil
+	case proto.TypeError:
+		// A pre-v0.2 agent doesn't know the resolve stream type and answers
+		// TypeError(CodeBadHello, "unknown stream type resolve") instead —
+		// version skew is the single most likely failure for this feature,
+		// so name it plainly rather than surfacing the routing error as-is.
+		var e proto.Error
+		proto.Unmarshal(rawReply, &e)
+		if e.Code == proto.CodeBadHello {
+			return nil, 0, fmt.Errorf("resolve %s via agent: this agent does not support name resolution; upgrade the sidecar", name)
+		}
+		msg := e.Message
+		if msg == "" {
+			msg = "agent rejected the resolve request"
+		}
+		return nil, 0, fmt.Errorf("resolve %s via agent: %s", name, msg)
+	default:
+		return nil, 0, fmt.Errorf("resolve %s via agent: unexpected reply type %q", name, typ)
+	}
 }
 
 // Close sends bye and tears the session down.

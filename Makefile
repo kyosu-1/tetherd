@@ -22,8 +22,15 @@ build:
 test:
 	go test -race -count=1 $(PKGS)
 
+# gofmt is part of lint because a tree that builds, vets and tests green can
+# still be unformatted - which happened on this branch and would have failed
+# any CI gate that checks formatting.
 lint:
 	go vet $(PKGS)
+	@unformatted=$$(gofmt -l cmd internal examples); \
+	if [ -n "$$unformatted" ]; then \
+		echo "gofmt needed:"; echo "$$unformatted"; exit 1; \
+	fi
 
 clean:
 	rm -rf $(BIN)

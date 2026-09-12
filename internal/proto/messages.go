@@ -8,6 +8,12 @@ package proto
 const Version = "1"
 
 // Message types.
+//
+// Stream types are additive: an agent built before a given stream type
+// existed does not recognise it and answers TypeError (CodeBadHello,
+// "unknown stream type ...") on that stream instead of the type-specific
+// reply. Anything that opens a stream must handle that TypeError shape as
+// well as its own reply type — see Client.Resolve for the pattern.
 const (
 	TypeHello   = "hello"
 	TypeWelcome = "welcome"
@@ -70,4 +76,26 @@ type DialHeader struct {
 type DialReply struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
+}
+
+// ResolveHeader is the first line of a resolve stream.
+type ResolveHeader struct {
+	Name  string `json:"name"`
+	QType string `json:"qtype"`
+}
+
+// ResolveReply is the agent's answer on a resolve stream.
+type ResolveReply struct {
+	OK    bool     `json:"ok"`
+	Addrs []string `json:"addrs,omitempty"`
+	TTL   int      `json:"ttl,omitempty"`
+	Error string   `json:"error,omitempty"`
+	// NotFound distinguishes "the name does not exist" (or resolved to no
+	// usable IPv4 address) from every other resolve failure - a network
+	// glitch, a misconfigured resolv.conf. dnsproxy uses it to answer
+	// NXDOMAIN instead of SERVFAIL, so a mistyped hostname reads as "host
+	// not found" instead of a retried timeout. Additive: an older agent
+	// never sets it, which degrades to today's SERVFAIL - still correct,
+	// just less specific.
+	NotFound bool `json:"not_found,omitempty"`
 }

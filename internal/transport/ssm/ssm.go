@@ -42,7 +42,16 @@ type Transport struct {
 const (
 	document    = "AWS-StartPortForwardingSession"
 	controlPort = "9900"
-	startupWait = 20 * time.Second
+
+	// StartupWait is how long Dial allows the session-manager-plugin to
+	// open the forwarded local port before giving up on it.
+	//
+	// It is exported because a caller that bounds Dial with a context of
+	// its own has to allow at least this long: `tetherd doctor` bounds
+	// every check, and a bound shorter than this reports an agent that
+	// `tetherd run` (which imposes no bound on this step) attaches to
+	// perfectly well as unreachable.
+	StartupWait = 20 * time.Second
 )
 
 // SessionTargets formats the ECS Exec targets to try, in order. Every
@@ -150,7 +159,7 @@ func (t *Transport) Dial(ctx context.Context, task transport.Task) (net.Conn, er
 	// exited is closed once the plugin process has been waited on (the only
 	// call to cmd.Wait for this process; pluginConn.Close reuses it too), so
 	// the dial loop below can notice an early exit without waiting out the
-	// full startupWait deadline.
+	// full StartupWait deadline.
 	exited := make(chan struct{})
 	go func() {
 		cmd.Wait()
@@ -158,7 +167,7 @@ func (t *Transport) Dial(ctx context.Context, task transport.Task) (net.Conn, er
 	}()
 
 	// Wait for the plugin to open the local port.
-	deadline := time.Now().Add(startupWait)
+	deadline := time.Now().Add(StartupWait)
 	var conn net.Conn
 	for {
 		if ctx.Err() != nil {
@@ -181,7 +190,7 @@ func (t *Transport) Dial(ctx context.Context, task transport.Task) (net.Conn, er
 			cmd.Process.Kill()
 			<-exited
 			t.terminate(out)
-			return nil, fmt.Errorf("session-manager-plugin did not open 127.0.0.1:%d within %s: %v", port, startupWait, err)
+			return nil, fmt.Errorf("session-manager-plugin did not open 127.0.0.1:%d within %s: %v", port, StartupWait, err)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
