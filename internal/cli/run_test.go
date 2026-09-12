@@ -7,9 +7,11 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/kyosu-1/tetherd/internal/env"
 	"github.com/kyosu-1/tetherd/internal/proto"
 )
 
@@ -225,5 +227,72 @@ func TestRunRequiresCommand(t *testing.T) {
 	root.SetOut(&bytes.Buffer{})
 	if err := root.Execute(); err == nil {
 		t.Fatal("run without -- <command> must fail")
+	}
+}
+
+func TestTaskRoleEnv(t *testing.T) {
+	got := taskRoleEnv("ap-northeast-1", "/tmp/empty")
+	want := map[string]string{
+		"AWS_CONFIG_FILE":             "/tmp/empty",
+		"AWS_SHARED_CREDENTIALS_FILE": "/tmp/empty",
+		"AWS_REGION":                  "ap-northeast-1",
+		"AWS_DEFAULT_REGION":          "ap-northeast-1",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %q, want %q", k, got[k], v)
+		}
+	}
+	// Without a region only the shared-config pair is set.
+	noRegion := taskRoleEnv("", "/tmp/empty")
+	if len(noRegion) != 2 || noRegion["AWS_CONFIG_FILE"] != "/tmp/empty" {
+		t.Fatalf("no-region case = %v", noRegion)
+	}
+}
+
+func TestEmptyAWSConfigFile(t *testing.T) {
+	path, cleanup, err := emptyAWSConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the file must be readable: %v", err)
+	}
+	if len(b) != 0 {
+		t.Fatalf("the file must be empty, got %d bytes", len(b))
+	}
+	cleanup()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("cleanup must remove the file, stat err = %v", err)
+	}
+}
+
+// The shared-config override has to beat the developer's own value, or the
+// task role stays shadowed (observed on a real machine: a `default` profile
+// with a credential source wins over the container credentials).
+func TestTaskRoleEnvOverridesLocalSharedConfig(t *testing.T) {
+	local := []string{"AWS_CONFIG_FILE=/Users/dev/.aws/config", "PORT=3000"}
+	task := map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/x"}
+	out := env.Merge(local, task, env.Options{
+		StripLocal: env.LocalAWSCredentialVars,
+		Override:   taskRoleEnv("ap-northeast-1", "/tmp/empty"),
+	})
+	got := map[string]string{}
+	for _, kv := range out {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	if got["AWS_CONFIG_FILE"] != "/tmp/empty" {
+		t.Errorf("AWS_CONFIG_FILE = %q, want the empty file", got["AWS_CONFIG_FILE"])
+	}
+	if got["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "/v2/credentials/x" {
+		t.Errorf("the task's credential URI must survive: %q", got["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"])
+	}
+	if got["PORT"] != "3000" {
+		t.Errorf("unrelated local vars must survive: PORT=%q", got["PORT"])
 	}
 }

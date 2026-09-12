@@ -301,7 +301,7 @@ S3 / DynamoDB / SQS / Secrets Manager / Bedrock など VPC 外のサービスは
 
 ### 副産物: タスクロールが自動で効く
 
-タスクの env には `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` が入っていて、SDK はそれを見て `169.254.170.2` に認証情報を取りに行く。透過モードではこの通信も捕まって agent 経由でタスク内の本物のエンドポイントに届くので、**追加実装なしで SDK がタスクロールとして振る舞う**。`ECS_CONTAINER_METADATA_URI_V4` も同様。`run` は起動時に同じ経路でクレデンシャルを取り `sts:GetCallerIdentity` で確認して表示する。
+タスクの env には `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` が入っていて、SDK はそれを見て `169.254.170.2` に認証情報を取りに行く。透過モードではこの通信も捕まって agent 経由でタスク内の本物のエンドポイントに届くので、**追加実装なしで SDK がタスクロールとして振る舞う**。`ECS_CONTAINER_METADATA_URI_V4` も同様。`run` は起動時に同じ経路でクレデンシャルを取り `sts:GetCallerIdentity` で確認して表示する。ただし「自動で効く」ためには、開発者の `~/.aws/config` の `default` プロファイルがコンテナクレデンシャルを覆い隠さないようにする必要がある（SDK のチェーンは共有設定のほうが先）。tetherd は透過モードでタスクロールが使えるとき、子プロセスの `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` を空ファイルに向けてこの層を外し、リージョンを明示注入する。
 
 ### v2 で扱うもの
 

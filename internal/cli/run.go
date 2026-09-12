@@ -123,6 +123,44 @@ func checkTargetEnv(w proto.Welcome, opts RunOptions) error {
 	return nil
 }
 
+// taskRoleEnv returns the variables that make the task role the child's
+// only AWS identity. Stripping the developer's static keys is not enough:
+// every SDK resolves the shared config profile *before* the container
+// credentials, so a `default` profile with any credential source (SSO, a
+// login session, credential_process) silently wins over
+// AWS_CONTAINER_CREDENTIALS_RELATIVE_URI. Observed on a real machine,
+// where the child's `aws sts get-caller-identity` reported an expired
+// login session while the same command with the shared config hidden
+// returned the task role. Pointing both shared-config variables at an
+// empty file removes that layer; the region has to be supplied explicitly
+// because it usually comes from the same config.
+func taskRoleEnv(region, emptyFile string) map[string]string {
+	out := map[string]string{
+		"AWS_CONFIG_FILE":             emptyFile,
+		"AWS_SHARED_CREDENTIALS_FILE": emptyFile,
+	}
+	if region != "" {
+		out["AWS_REGION"] = region
+		out["AWS_DEFAULT_REGION"] = region
+	}
+	return out
+}
+
+// emptyAWSConfigFile creates a readable empty file to point the shared-config
+// variables at, and a cleanup that removes it.
+func emptyAWSConfigFile() (string, func(), error) {
+	f, err := os.CreateTemp("", "tetherd-aws-config-")
+	if err != nil {
+		return "", func() {}, err
+	}
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		os.Remove(name)
+		return "", func() {}, err
+	}
+	return name, func() { os.Remove(name) }, nil
+}
+
 // Run connects to the agent, installs capture, runs the command and cleans
 // up. It returns the child's exit code.
 func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
@@ -224,6 +262,7 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 	// 4. capture (helper + pf)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	var overrideEnv map[string]string // set in step 5 when the task role is usable
 	if !opts.NoNetwork {
 		if ifs, err := net.InterfaceAddrs(); err == nil {
 			for _, o := range LocalOverlaps(cidrs, ifs) {
@@ -254,6 +293,14 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 
 		// 5. task role: fetch credentials the way the child's SDK will.
 		if uri := taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]; uri != "" {
+			emptyCfg, cleanupCfg, err := emptyAWSConfigFile()
+			if err != nil {
+				logf("⚠ iam      could not hide the shared AWS config (%v); the child may resolve your own credentials instead of the task role", err)
+			} else {
+				defer cleanupCfg()
+				overrideEnv = taskRoleEnv(region, emptyCfg)
+			}
+
 			ictx, icancel := context.WithTimeout(ctx, 15*time.Second)
 			creds, err := awsid.FetchContainerCredentials(ictx, sess.DialTCP, uri)
 			var arn string
@@ -265,6 +312,9 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 				logf("⚠ iam      %v", err)
 			} else {
 				logf("✓ iam      %s  (via 169.254.170.2)", arn)
+				if overrideEnv != nil {
+					logf("           the task role is the child's only AWS identity (your shared AWS config is hidden from it)")
+				}
 			}
 		}
 	}
@@ -280,6 +330,7 @@ func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
 	mergeOpts := env.Options{DropAWSContainer: opts.NoNetwork}
 	if !opts.NoNetwork && taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "" {
 		mergeOpts.StripLocal = env.LocalAWSCredentialVars
+		mergeOpts.Override = overrideEnv
 		var found []string
 		for _, name := range env.LocalAWSCredentialVars {
 			if _, ok := os.LookupEnv(name); ok {
