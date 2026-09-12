@@ -74,6 +74,11 @@ type fakeProvider struct {
 	vpcErr    error
 	agentAddr string
 
+	// tr replaces the plain dial-to-agentAddr transport when a test needs
+	// to control what Dial does (block until its context expires) or to
+	// keep hold of the connection it returns (and break it mid-run).
+	tr transport.Transport
+
 	// vpcCalls and svcCalls count invocations, so a test can assert an AWS
 	// round trip was (or, for a local_cidrs typo, was not) made.
 	vpcCalls int
@@ -116,6 +121,9 @@ func (f *fakeProvider) ServiceCIDRs(context.Context, []string) ([]netip.Prefix, 
 	return f.svc, nil
 }
 func (f *fakeProvider) Transport(func(string, ...any)) transport.Transport {
+	if f.tr != nil {
+		return f.tr
+	}
 	return agentTransport{addr: f.agentAddr}
 }
 func (f *fakeProvider) SecretNames(_ context.Context, definitionARN string) (map[string]bool, error) {

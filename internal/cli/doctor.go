@@ -263,7 +263,19 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 			defer sess.Close()
 			welcome = sess.Welcome()
 		}
-		results = append(results, doctor.CheckAgentSession(welcome.Version, welcome.Env, opts.TargetEnv, dialErr))
+		// The clock, routed the way every other clock-sensitive row routes
+		// it. CheckAgentSession's next step is "check the tetherd-agent
+		// sidecar is running", which is the right answer for a refused or
+		// silent connection and the wrong one for a bound that expired
+		// before the handshake could finish - the report's own budget
+		// running out, or a plugin that was still binding its local port.
+		// Sending a developer to inspect a healthy sidecar over a clock is
+		// the misattribution timedOut exists for.
+		if isContextError(dialErr) {
+			results = append(results, timedOut("agent session", checkTimedOut(ctx, "the tetherd-agent handshake", timeout)))
+		} else {
+			results = append(results, doctor.CheckAgentSession(welcome.Version, welcome.Env, opts.TargetEnv, dialErr))
+		}
 	}
 
 	// 5b. The task's environment, as the agent itself reports it. `tetherd

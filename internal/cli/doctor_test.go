@@ -1088,6 +1088,57 @@ func TestDoctorFailsWhenTheAgentIsUnreachable(t *testing.T) {
 	// Everything ECS could see is still fine, which is exactly why this row
 	// is needed.
 	wantMarks(t, rows, map[string]string{"attachable task": "✓", "pidMode": "✓", "remote CIDRs": "✓", "task env": "!"})
+	// A refused connection is what CheckAgentSession's advice is written
+	// for, so it must keep it rather than being routed to the timeout row.
+	if !strings.Contains(r.next, "tetherd-agent") {
+		t.Errorf("a refused connection must keep the sidecar advice: %q", r.next)
+	}
+}
+
+// blockingTransport is a Dial that never connects and never fails on its
+// own: it waits for its context and reports that. Every real transport
+// behaves this way when a bound expires mid-connect - the ssm transport
+// returns ctx.Err() straight out of its dial loop - and it is the one agent
+// failure a test cannot produce with a real listener.
+type blockingTransport struct{}
+
+func (blockingTransport) Dial(ctx context.Context, _ transport.Task) (net.Conn, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestDoctorRoutesAnAgentTimeoutToItsOwnRow: the agent-session row was the
+// only clock-sensitive row whose error went straight into its judgement.
+// CheckAgentSession answers any dial error with "check the tetherd-agent
+// sidecar is running", so a bound that expired before the handshake could
+// finish - the report's own budget running out, or a session-manager-plugin
+// still binding its local port - read as a dead sidecar and sent the
+// developer to inspect a service `tetherd run` attaches to fine.
+func TestDoctorRoutesAnAgentTimeoutToItsOwnRow(t *testing.T) {
+	p := healthyProvider("")
+	p.tr = blockingTransport{}
+
+	opts := doctorOpts()
+	opts.Timeout = 200 * time.Millisecond
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, healthyDoctorDeps(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	rows := wantRowSet(t, out.String())
+	r := findRow(t, rows, "agent session")
+	if r.mark != "✗" {
+		t.Fatalf("agent session = %q %q, want a failure", r.mark, r.detail)
+	}
+	if !strings.Contains(r.detail, "did not answer within") {
+		t.Errorf("a bound that expired must be reported as such, got %q", r.detail)
+	}
+	if strings.Contains(r.next, "tetherd-agent sidecar is running") {
+		t.Errorf("a timeout must not be answered with advice for a dead sidecar: %q", r.next)
+	}
 }
 
 // TestDoctorFailsWhenTheAgentCannotReadTheTaskEnv is the last bug of the
