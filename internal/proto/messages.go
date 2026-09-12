@@ -78,6 +78,14 @@ type DialReply struct {
 	Error string `json:"error,omitempty"`
 }
 
+// HTTPHeader is the first line of an http stream, agent -> CLI. The user is
+// informational: the agent only ever opens the stream toward that user's
+// session, and the CLI has exactly one. It is carried so a stream seen in a
+// packet capture or a log says who it was for.
+type HTTPHeader struct {
+	User string `json:"user"`
+}
+
 // ResolveHeader is the first line of a resolve stream.
 type ResolveHeader struct {
 	Name  string `json:"name"`

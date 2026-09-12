@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,15 +27,29 @@ type fakeHandler struct {
 	// call only; subsequent calls fall through to addrs/ttl.
 	resolveErrOnce bool
 	resolved       string
+
+	mu   sync.Mutex
+	open Opener
 }
 
-func (f *fakeHandler) Hello(h proto.Hello, remote string) (proto.Welcome, *proto.Error) {
+func (f *fakeHandler) Hello(h proto.Hello, remote string, open Opener) (proto.Welcome, *proto.Error) {
+	f.mu.Lock()
+	f.open = open
+	f.mu.Unlock()
 	if f.reject != nil {
 		return proto.Welcome{}, f.reject
 	}
 	w := f.welcome
 	w.Version = proto.Version
 	return w, nil
+}
+
+// opener returns the Opener Serve handed to Hello, the way the agent's
+// session registry will hold on to it (Task 3).
+func (f *fakeHandler) opener() Opener {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.open
 }
 
 func (f *fakeHandler) Dial(ctx context.Context, addr string) (net.Conn, error) {
@@ -618,5 +633,221 @@ func TestServeStreamResolveTimeoutClosesStream(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("serveStream leaked: did not return after the lookup timed out")
+	}
+}
+
+// The reverse direction: the agent opens the stream. Nothing before v0.3
+// did, so the CLI had no accept loop at all. The stream must carry bytes
+// both ways after the header, because a stolen HTTP request is a request
+// and a response.
+func TestAgentCanOpenAnHTTPStreamToTheCLI(t *testing.T) {
+	cc, sc := pair(t)
+	h := &fakeHandler{closed: make(chan struct{})}
+	go Serve(context.Background(), sc, h, ServeOptions{})
+
+	got := make(chan string, 1)
+	c, err := Dial(context.Background(), cc, proto.Hello{Version: proto.Version, User: "shota"}, Options{
+		OnHTTP: func(s net.Conn) {
+			defer s.Close()
+			b := make([]byte, 5)
+			if _, err := io.ReadFull(s, b); err != nil {
+				return
+			}
+			got <- string(b)
+			s.Write([]byte("PONG!"))
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// The handler received an Opener at hello time; use it the way the L7
+	// proxy will.
+	open := h.opener()
+	if open == nil {
+		t.Fatal("Hello was not given an Opener")
+	}
+	s, err := open.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := proto.NewEncoder(s).Encode(proto.TypeHTTP, proto.HTTPHeader{User: "shota"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write([]byte("PING!")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case v := <-got:
+		if v != "PING!" {
+			t.Fatalf("the CLI read %q", v)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the CLI never saw the stream")
+	}
+	b := make([]byte, 5)
+	if _, err := io.ReadFull(s, b); err != nil || string(b) != "PONG!" {
+		t.Fatalf("agent read %q err %v: the stream must carry both directions", b, err)
+	}
+}
+
+// `tetherd run --no-incoming` leaves OnHTTP nil. An http stream pushed at
+// such a CLI must be answered with an error that says why, so the agent's
+// proxy can return a real status instead of hanging on a stream nobody will
+// ever read.
+func TestAnHTTPStreamIsRefusedWhenTheCLIDoesNotAcceptSteal(t *testing.T) {
+	cc, sc := pair(t)
+	h := &fakeHandler{closed: make(chan struct{})}
+	go Serve(context.Background(), sc, h, ServeOptions{})
+	c, err := Dial(context.Background(), cc, proto.Hello{Version: proto.Version, User: "shota"}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	s, err := h.opener().OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := proto.NewEncoder(s).Encode(proto.TypeHTTP, proto.HTTPHeader{User: "shota"}); err != nil {
+		t.Fatal(err)
+	}
+	s.SetReadDeadline(time.Now().Add(3 * time.Second))
+	typ, raw, err := proto.ReadHeader(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ != proto.TypeError {
+		t.Fatalf("type = %q, want an error reply", typ)
+	}
+	var e proto.Error
+	if err := proto.Unmarshal(raw, &e); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(e.Message, "incoming") {
+		t.Errorf("the refusal must say the CLI is not accepting incoming requests: %q", e.Message)
+	}
+}
+
+// The other half of the additive-stream-types contract documented in
+// package proto: the agent already answers TypeError for a stream type it
+// does not know, and now the CLI must too - without taking the run down.
+func TestAnUnknownInboundStreamTypeIsRefusedAndDoesNotKillTheSession(t *testing.T) {
+	cc, sc := pair(t)
+	h := &fakeHandler{closed: make(chan struct{}), addrs: []string{"10.0.0.7"}, ttl: 30}
+	go Serve(context.Background(), sc, h, ServeOptions{})
+	c, err := Dial(context.Background(), cc, proto.Hello{Version: proto.Version, User: "shota"}, Options{
+		OnHTTP: func(s net.Conn) { s.Close() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	s, err := h.opener().OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.NewEncoder(s).Encode("mirror", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	s.SetReadDeadline(time.Now().Add(3 * time.Second))
+	typ, raw, err := proto.ReadHeader(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ != proto.TypeError {
+		t.Fatalf("type = %q", typ)
+	}
+	var e proto.Error
+	if err := proto.Unmarshal(raw, &e); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(e.Message, "mirror") {
+		t.Errorf("the refusal must name the type it did not know: %q", e.Message)
+	}
+	s.Close()
+	// The session must still work: a future agent opening a stream type this
+	// CLI does not know must not take the run down.
+	if _, _, err := c.Resolve(context.Background(), "api.myapp.internal"); err != nil {
+		t.Fatalf("the session died after an unknown stream: %v", err)
+	}
+	select {
+	case <-c.Done():
+		t.Fatal("the session ended after an unknown inbound stream")
+	default:
+	}
+}
+
+// Each inbound stream gets its own goroutine: one slow stolen request (a
+// laptop handler that takes a second, or a developer sitting in a debugger)
+// must not stop the next request from reaching the laptop at all. Serving
+// inbound streams inline in the accept loop passes every other test in this
+// file and fails this one.
+func TestASlowInboundStreamDoesNotBlockTheNextOne(t *testing.T) {
+	cc, sc := pair(t)
+	h := &fakeHandler{closed: make(chan struct{}), addrs: []string{"10.0.0.7"}, ttl: 30}
+	go Serve(context.Background(), sc, h, ServeOptions{})
+
+	release := make(chan struct{})
+	started := make(chan string, 2)
+	c, err := Dial(context.Background(), cc, proto.Hello{Version: proto.Version, User: "shota"}, Options{
+		OnHTTP: func(s net.Conn) {
+			defer s.Close()
+			b := make([]byte, 1)
+			if _, err := io.ReadFull(s, b); err != nil {
+				return
+			}
+			started <- string(b)
+			<-release
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer close(release)
+
+	push := func(payload string) {
+		t.Helper()
+		s, err := h.opener().OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { s.Close() })
+		if err := proto.NewEncoder(s).Encode(proto.TypeHTTP, proto.HTTPHeader{User: "shota"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Write([]byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	push("A")
+	select {
+	case v := <-started:
+		if v != "A" {
+			t.Fatalf("first inbound stream carried %q", v)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the first inbound stream never reached OnHTTP")
+	}
+
+	push("B")
+	select {
+	case v := <-started:
+		if v != "B" {
+			t.Fatalf("second inbound stream carried %q", v)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a slow inbound stream blocked the next one: inbound streams must each get their own goroutine")
+	}
+
+	// And the session as a whole is still usable while one steal is stuck.
+	if _, _, err := c.Resolve(context.Background(), "api.myapp.internal"); err != nil {
+		t.Fatalf("the session was unusable while an inbound stream was in flight: %v", err)
 	}
 }

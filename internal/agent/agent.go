@@ -136,7 +136,12 @@ type handler struct {
 	user string
 }
 
-func (h *handler) Hello(hello proto.Hello, remote string) (proto.Welcome, *proto.Error) {
+// Hello registers the user's session. The Opener is how the L7 proxy will
+// push a stolen request at this user's CLI; Task 3 stores it in the session
+// registry alongside the user, and Task 4's proxy calls it. Until then it is
+// accepted and dropped, so that the interface is already the shape the
+// registry needs.
+func (h *handler) Hello(hello proto.Hello, remote string, _ session.Opener) (proto.Welcome, *proto.Error) {
 	if hello.User == "" {
 		return proto.Welcome{}, &proto.Error{Code: proto.CodeBadHello, Message: "hello.user is empty"}
 	}

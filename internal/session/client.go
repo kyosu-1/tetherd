@@ -23,10 +23,18 @@ import (
 // fine as one that is not there.
 const HandshakeWait = 15 * time.Second
 
-// Options tunes the client's liveness check.
+// Options tunes the client's liveness check and what it does with streams
+// the agent opens.
 type Options struct {
 	PingInterval time.Duration // default 5s
 	MaxMissed    int           // default 3
+	// OnHTTP is called on its own goroutine for each inbound stream whose
+	// header is proto.TypeHTTP, after that header has been read; the
+	// callback then owns the stream, including closing it. nil means this
+	// CLI does not accept steal (`tetherd run --no-incoming`): such a
+	// stream is answered with proto.TypeError and closed, so the agent's
+	// proxy learns why instead of waiting on a stream nobody will read.
+	OnHTTP func(stream net.Conn)
 }
 
 // Client is the CLI side of one session.
@@ -96,7 +104,49 @@ func Dial(ctx context.Context, conn net.Conn, hello proto.Hello, opts Options) (
 	}
 	go c.readLoop(dec)
 	go c.pingLoop(opts)
+	// The agent may push a stream at any moment from here on (v0.3a steal),
+	// so the accept loop is permanent rather than started on demand.
+	go c.acceptLoop(opts.OnHTTP)
 	return c, nil
+}
+
+// acceptLoop serves streams the agent opens. Each one is handled on its own
+// goroutine: a slow steal must not block the next request, and the session's
+// control loop must not be blocked at all.
+func (c *Client) acceptLoop(onHTTP func(net.Conn)) {
+	for {
+		s, err := c.mux.AcceptStream()
+		if err != nil {
+			return // the session is going away; readLoop reports why
+		}
+		go c.serveInbound(s, onHTTP)
+	}
+}
+
+func (c *Client) serveInbound(s net.Conn, onHTTP func(net.Conn)) {
+	typ, _, err := proto.ReadHeader(s)
+	if err != nil {
+		s.Close()
+		return
+	}
+	switch {
+	case typ == proto.TypeHTTP && onHTTP != nil:
+		onHTTP(s) // owns s, including closing it
+	case typ == proto.TypeHTTP:
+		proto.NewEncoder(s).Encode(proto.TypeError, proto.Error{
+			Code:    proto.CodeBadHello,
+			Message: "this session is not accepting incoming requests (--no-incoming)",
+		})
+		s.Close()
+	default:
+		// Additive by design: a newer agent may open a stream type this CLI
+		// does not know. Refuse that stream and keep the session.
+		proto.NewEncoder(s).Encode(proto.TypeError, proto.Error{
+			Code:    proto.CodeBadHello,
+			Message: "unknown stream type " + typ,
+		})
+		s.Close()
+	}
 }
 
 // Welcome returns the agent's welcome message.
