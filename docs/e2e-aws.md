@@ -34,7 +34,7 @@ v0.2b から、cluster / service / profile / region / env は `.tetherd.yml` か
 | 11 | `./bin/tetherd env \| head -20` | `KEY=value` の一覧。`DB_PASSWORD=***` | secrets はタスク定義の `secrets` ブロックから名前を取ってマスクされる。値も長さも漏れない |
 | 12 | `./bin/tetherd env --format json \| jq -r '.DB_PASSWORD, .PORT'` / `./bin/tetherd env --reveal --format json \| jq -r '.DB_PASSWORD'` | 前者は `***` と `8081`、後者は 24 文字の実値 | 既定はマスク、`--reveal` で実値。出力が JSON として妥当 |
 | 13 | `eval "$(./bin/tetherd env --format shell)" && echo "$PORT"` | `8081` | 変数は stdout、ステータス行は stderr。混ざっていれば `eval` が壊れる |
-| 14 | `./bin/tetherd doctor` | helper を起動していれば全行 `✓`（`remote domains` は `myapp.internal … resolve through the agent`）で exit 0。helper を落としていれば `✗ helper` とその次の一手が出て exit 1、**残りの行は出続ける** | 8 項目の検査と、失敗しても続けること |
+| 14 | `./bin/tetherd doctor` | helper を起動していれば全行 `✓`（`remote domains` は `myapp.internal … resolve through the agent`）で exit 0。helper を落としていれば `✗ helper` とその次の一手が出て exit 1、**残りの行は出続ける** | 9 項目の検査と、失敗しても続けること |
 | 15 | `.tetherd.yml` の `service` を `nope` にして `./bin/tetherd doctor` | `✗ attachable task` に `no RUNNING tasks in service tetherd-dev/nope` が出て exit 1。他の行は出続ける | 1 つ失敗しても残りの検査が走る（1 問ずつ直して再実行させない） |
 | 16 | `.tetherd.yml` に `remote_services: [s3]` を足して `$RUN -- sh -c 'aws s3 ls && curl -s -o /dev/null -w "%{http_code}\n" https://example.com'` | `aws s3 ls` が成功し `example.com` も 200。`✓ network` 行の prefix 数が数百になる | prefix list 由来の CIDR が捕捉範囲に入る（ページングが効いていないと 100 件で止まる）。それ以外はラップトップから直接出る |
 | 17 | `ipconfig getifaddr en0` の /24 を `local_cidrs` に足して `$RUN -- true` と `./bin/tetherd doctor` | 起動時の重なり警告が消え、doctor の `local addresses` が `!` → `✓` | 分割による引き算（VPC /16 から自宅 /24 だけを抜く）が効いている |

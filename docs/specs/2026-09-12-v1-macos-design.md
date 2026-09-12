@@ -298,7 +298,7 @@ tetherd token rotate
 - `doctor` の検査項目（各項目に「次に何をするか」を付ける）:
   helper が応答しバージョンが一致 / `tetherd` グループと setgid `tetherd-exec` / session-manager-plugin の有無 / AWS 認証 / サービスの `enableExecuteCommand` / タスクの agent コンテナと ExecuteCommandAgent / タスク定義の `pidMode: task` / ターゲットグループが HTTP1 / ECS・EC2 の読み取り権限 / VPC CIDR とローカル IF の重なり / `remote_domains` が agent 側で解けるか / `remote_cidrs` に `0.0.0.0/0` が無いか
 
-  v0.2b で実装したのは 8 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査は v0.3** — developer policy に `elasticloadbalancing:DescribeTargetGroups` を足す必要があり、検証環境が動いている間は Terraform を再適用しない方針のため。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
+  v0.2b で実装したのは 9 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲の広さ / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査は v0.3** — developer policy に `elasticloadbalancing:DescribeTargetGroups` を足す必要があり、検証環境が動いている間は Terraform を再適用しない方針のため。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
 
 ### 6.6 出力
 
@@ -545,13 +545,21 @@ design.md §10 に加えて:
 
 | 行 | 検証 | 結果 |
 |---|---|---|
-| 0 | `.tetherd.yml` だけでフラグ無しに動く | 未実施 |
+| 0 | `.tetherd.yml` だけでフラグ無しに動く | ✅ `config` 行に読んだパスが出て、`tetherd-dev/api` のタスクに接続、19 変数注入、子プロセスが `PORT=8081` と secret を受け取る。フラグはゼロ |
+| 7 | 環境ガード | ✅ `tetherd env --env prod` が `refusing to attach: agent reports TETHERD_ENV="dev", expected "prod"` で exit 1 |
+| 11 | `tetherd env` の既定マスク | ✅ `DB_PASSWORD=***` / `FEATURE_FLAG=***`（タスク定義の `secrets` 2 件）、`PORT=8081` は素のまま |
+| 12 | `--format json` と `--reveal` | ✅ JSON として妥当、`--reveal` で 24 文字の実値 |
+| 13 | stdout と stderr の分離 | ✅ `eval "$(tetherd env --format shell)"` が成功し `PORT=8081`。ステータス行は 4 行すべて stderr |
+| — | secret が stdout / stderr に漏れない | ✅ 実値 24 文字で grep して両方とも不在 |
 | 6 | `remote_domains` で Cloud Map の名前が解け、`/etc/resolver` が run 中だけ存在する | 未実施（helper 必須） |
-| 11-13 | `tetherd env` のマスク・`--reveal`・stdout と stderr の分離 | 未実施 |
-| 14-15 | `tetherd doctor` の 8 項目と「1 つ失敗しても続ける」 | 未実施 |
+| 14-15 | `tetherd doctor` の 9 項目と「1 つ失敗しても続ける」 | 未実施 |
 | 16 | `remote_services: [s3]` の prefix list がページングされて数百件入る | 未実施（helper 必須） |
 | 17-18 | `local_cidrs` の分割引き算と、全部消したときのエラー | 未実施（helper 必須） |
 | 19 | 存在しない名前が NXDOMAIN として即座に返る | 未実施（helper 必須） |
+
+実機で 1 件見つかった（修正済み）:
+
+`tetherd env` がタスクの env を**そのまま**出していたため、`eval "$(tetherd env --format shell)"` が開発者のシェルを壊した。実測で `HOME` が `/home/nonroot`、`PATH` がコンテナの `PATH` に置き換わり、v0.2a で Go の子プロセスの TLS を全部壊した `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` もそのまま出ていた。`tetherd run` は同じ変数を除外して注入しているので、**`env` と `run` が違う env を作っていた** — `env` の存在理由（run が注入するものを見る・シェルに取り込む）に反する。`env` も §6.4 の除外・上書きを通すように修正。
 
 ---
 
