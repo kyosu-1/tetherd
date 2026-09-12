@@ -27,6 +27,7 @@ type awsProvider interface {
 	Region() string
 	Discover(ctx context.Context, t ecsprov.Target) (transport.Task, error)
 	VPCCIDRs(ctx context.Context, subnetID string) ([]netip.Prefix, error)
+	ServiceCIDRs(ctx context.Context, services []string) ([]netip.Prefix, error)
 	Transport(logf func(string, ...any)) transport.Transport
 }
 
@@ -101,6 +102,10 @@ func (p *sdkProvider) Discover(ctx context.Context, t ecsprov.Target) (transport
 
 func (p *sdkProvider) VPCCIDRs(ctx context.Context, subnetID string) ([]netip.Prefix, error) {
 	return ecsprov.VPCCIDRs(ctx, awsec2.NewFromConfig(p.cfg), subnetID)
+}
+
+func (p *sdkProvider) ServiceCIDRs(ctx context.Context, services []string) ([]netip.Prefix, error) {
+	return ecsprov.ServiceCIDRs(ctx, awsec2.NewFromConfig(p.cfg), p.cfg.Region, services)
 }
 
 func (p *sdkProvider) Transport(logf func(string, ...any)) transport.Transport {

@@ -64,6 +64,7 @@ type fakeProvider struct {
 	region string
 	task   transport.Task
 	vpc    []netip.Prefix
+	svc    []netip.Prefix
 	// discErr and vpcErr are for later tasks; nothing sets them yet.
 	discErr   error
 	vpcErr    error
@@ -76,6 +77,9 @@ func (f *fakeProvider) Discover(context.Context, ecsprov.Target) (transport.Task
 }
 func (f *fakeProvider) VPCCIDRs(context.Context, string) ([]netip.Prefix, error) {
 	return f.vpc, f.vpcErr
+}
+func (f *fakeProvider) ServiceCIDRs(context.Context, []string) ([]netip.Prefix, error) {
+	return f.svc, nil
 }
 func (f *fakeProvider) Transport(func(string, ...any)) transport.Transport {
 	return agentTransport{addr: f.agentAddr}
@@ -309,6 +313,33 @@ func readFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// TestRunFailsOnBadLocalCIDRs pins the decision that a bad local_cidrs
+// entry - which can now arrive from a committed .tetherd.yml, not only a
+// flag - exits 1 (an operational/config failure) rather than the usage exit
+// code 2 that a bad --remote-cidr still gets before the switch on
+// opts.Transport (see TestRunSSMRequiresClusterAndService and
+// TestParseRemoteCIDRs elsewhere in this package for that flag-side check).
+func TestRunFailsOnBadLocalCIDRs(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{
+		region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.ExecPath = "/usr/bin/true"
+	opts.LocalCIDRs = []string{"not-a-cidr"}
+	code, err := RunWithDeps(context.Background(), opts, io.Discard, d)
+	if code != 1 || err == nil || !strings.Contains(err.Error(), "network.local_cidrs") {
+		t.Fatalf("code=%d err=%v, want code 1 and a network.local_cidrs error", code, err)
+	}
 }
 
 func TestRunWarnsWhenTheCredentialEndpointIsNotCaptured(t *testing.T) {

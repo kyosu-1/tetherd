@@ -187,6 +187,62 @@ func emptyAWSConfigFile() (string, func(), error) {
 	return name, func() { os.Remove(name) }, nil
 }
 
+// Subtract removes every prefix that a local_cidrs range covers, so a part
+// of the VPC range that the laptop must reach directly (an overlapping home
+// network, a service pinned to the machine) stays off the captured set.
+func Subtract(all []netip.Prefix, exclude []netip.Prefix) []netip.Prefix {
+	if len(exclude) == 0 {
+		return all
+	}
+	out := make([]netip.Prefix, 0, len(all))
+	for _, p := range all {
+		covered := false
+		for _, e := range exclude {
+			if e.Overlaps(p) && e.Bits() <= p.Bits() {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// remoteSet is everything that goes to the task: the VPC, the credential
+// endpoint, the configured extras and any gateway-endpoint service ranges,
+// minus the ranges the laptop must keep for itself (spec §4.1).
+func remoteSet(ctx context.Context, opts RunOptions, prov awsProvider, task transport.Task, logf func(string, ...any)) ([]netip.Prefix, error) {
+	extra, err := ParseRemoteCIDRs(opts.RemoteCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	vpc, err := prov.VPCCIDRs(ctx, task.SubnetID)
+	if err != nil {
+		return nil, err
+	}
+	cidrs := append(append(vpc, ecsprov.TaskRoleCIDR), extra...)
+	if len(opts.RemoteServices) > 0 {
+		svc, err := prov.ServiceCIDRs(ctx, opts.RemoteServices)
+		if err != nil {
+			return nil, err
+		}
+		cidrs = append(cidrs, svc...)
+		logf("           remote_services %s → %d prefixes", strings.Join(opts.RemoteServices, ", "), len(svc))
+	}
+	local, err := ParseRemoteCIDRs(opts.LocalCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("network.local_cidrs: %w", err)
+	}
+	return Subtract(cidrs, local), nil
+}
+
+// ecsTarget is the discovery target the flags and the config describe.
+func ecsTarget(opts RunOptions) ecsprov.Target {
+	return ecsprov.Target{Cluster: opts.Cluster, Service: opts.Service, TaskID: opts.TaskID}
+}
+
 // Run connects to the agent, installs capture, runs the command and cleans
 // up. It returns the child's exit code.
 func Run(ctx context.Context, opts RunOptions, stderr io.Writer) (int, error) {
@@ -231,7 +287,7 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 			return 1, fmt.Errorf("aws config: %w", err)
 		}
 		region = prov.Region()
-		task, err = prov.Discover(ctx, ecsprov.Target{Cluster: opts.Cluster, Service: opts.Service, TaskID: opts.TaskID})
+		task, err = prov.Discover(ctx, ecsTarget(opts))
 		if err != nil {
 			return 1, err
 		}
@@ -241,11 +297,10 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 			logf("%s/%s  task %s  (started %s ago)", opts.Cluster, opts.Service, short(task.ID), time.Since(task.StartedAt).Round(time.Minute))
 		}
 		if !opts.NoNetwork {
-			vpc, err := prov.VPCCIDRs(ctx, task.SubnetID)
+			cidrs, err = remoteSet(ctx, opts, prov, task, logf)
 			if err != nil {
 				return 1, err
 			}
-			cidrs = append(append(vpc, ecsprov.TaskRoleCIDR), extra...)
 		}
 		tr = prov.Transport(logf)
 	default:

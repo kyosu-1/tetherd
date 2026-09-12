@@ -13,6 +13,7 @@ import (
 
 	"github.com/kyosu-1/tetherd/internal/env"
 	"github.com/kyosu-1/tetherd/internal/proto"
+	"github.com/kyosu-1/tetherd/internal/transport"
 )
 
 func TestParseRemoteCIDRs(t *testing.T) {
@@ -350,5 +351,72 @@ func TestTaskRoleEnvOverridesLocalSharedConfig(t *testing.T) {
 	}
 	if got["PORT"] != "3000" {
 		t.Errorf("unrelated local vars must survive: PORT=%q", got["PORT"])
+	}
+}
+
+func TestSubtract(t *testing.T) {
+	all := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/16"),
+		netip.MustParsePrefix("10.0.5.0/24"),
+		netip.MustParsePrefix("169.254.170.0/24"),
+	}
+	got := Subtract(all, []netip.Prefix{netip.MustParsePrefix("10.0.5.0/24")})
+	if len(got) != 2 || got[0].String() != "10.0.0.0/16" || got[1].String() != "169.254.170.0/24" {
+		t.Fatalf("got %v", got)
+	}
+	// A local range that contains a remote one removes it entirely.
+	got = Subtract(all, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
+	if len(got) != 1 || got[0].String() != "169.254.170.0/24" {
+		t.Fatalf("got %v", got)
+	}
+	if len(Subtract(all, nil)) != 3 {
+		t.Fatal("without exclusions nothing changes")
+	}
+}
+
+// TestRemoteSet pins the whole set remoteSet assembles: the VPC CIDRs, the
+// task-role endpoint, the extra --remote-cidr ranges and any
+// network.remote_services prefixes - minus what network.local_cidrs claims
+// for the laptop. Deleting any one term from remoteSet's assembly (the VPC
+// append, the TaskRoleCIDR append, the extra append, the ServiceCIDRs call,
+// or the closing Subtract) changes this set and fails the test.
+func TestRemoteSet(t *testing.T) {
+	p := &fakeProvider{
+		vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		svc: []netip.Prefix{netip.MustParsePrefix("52.219.0.0/20")},
+	}
+	opts := RunOptions{
+		RemoteCIDRs:    []string{"10.9.0.0/16"},
+		RemoteServices: []string{"s3"},
+		// 10.9.0.0/16 is an extra remote range but also the laptop's own
+		// network in this scenario: local_cidrs must remove it again.
+		LocalCIDRs: []string{"10.9.0.0/16"},
+	}
+	got, err := remoteSet(context.Background(), opts, p, transport.Task{SubnetID: "subnet-a"}, func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"10.0.0.0/16": true, "169.254.170.0/24": true, "52.219.0.0/20": true}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want exactly %v", got, want)
+	}
+	for _, p := range got {
+		if !want[p.String()] {
+			t.Fatalf("unexpected %s in %v", p, got)
+		}
+	}
+}
+
+// TestRemoteSetRejectsBadLocalCIDRs pins the decision that a local_cidrs
+// parse failure is reported with the "network.local_cidrs" prefix (so an
+// operator can tell it apart from a bad --remote-cidr) and, since local_cidrs
+// can now come from a committed config file rather than only a flag, Run
+// maps it to exit 1 rather than the usage exit code 2 (see TestRunFailsOnBadLocalCIDRs).
+func TestRemoteSetRejectsBadLocalCIDRs(t *testing.T) {
+	p := &fakeProvider{}
+	opts := RunOptions{LocalCIDRs: []string{"not-a-cidr"}}
+	_, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {})
+	if err == nil || !strings.Contains(err.Error(), "network.local_cidrs") {
+		t.Fatalf("err = %v, want it to mention network.local_cidrs", err)
 	}
 }
