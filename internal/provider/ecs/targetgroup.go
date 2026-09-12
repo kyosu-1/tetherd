@@ -99,10 +99,10 @@ func TargetGroup(ctx context.Context, svc ServiceAPI, elb TargetGroupAPI, td Tas
 // this row is about - it is the container on the ALB's data path (spec §5.1)
 // - so it is preferred by name, and a service with exactly one entry is
 // taken whatever container it names, because that is the single-target-group
-// deployment docs/dev-env.md describes and its container name is not this
-// row's business. Anything else is ambiguous and says so: picking one of
-// three target groups by position would report a verdict about whichever
-// one ECS happened to list first.
+// deployment deploy/dev-env/alb.tf describes and its container name is not
+// this row's business. Anything else is ambiguous and says so: picking one
+// of three target groups by position would report a verdict about
+// whichever one ECS happened to list first.
 func targetGroupARN(ctx context.Context, svc ServiceAPI, t Target, agentContainer string) (string, error) {
 	out, err := svc.DescribeServices(ctx, &awsecs.DescribeServicesInput{
 		Cluster:  aws.String(t.Cluster),

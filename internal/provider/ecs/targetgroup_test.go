@@ -225,9 +225,9 @@ func TestTargetGroupRefusesRatherThanGuess(t *testing.T) {
 }
 
 // A single-target-group service is taken whatever container it names: that
-// is the deployment docs/dev-env.md describes, and the container's name is
-// not this row's business. Two or more without the agent's own is the
-// ambiguous case above.
+// is the deployment deploy/dev-env/alb.tf describes, and the container's
+// name is not this row's business. Two or more without the agent's own is
+// the ambiguous case above.
 func TestTargetGroupTakesTheOnlyGroupWhateverContainerItNames(t *testing.T) {
 	got, err := TargetGroup(context.Background(),
 		&fakeServices{out: oneTargetGroup("something-else")},

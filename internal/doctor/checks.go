@@ -115,7 +115,7 @@ func CheckTask(task transport.Task, err error) Result {
 	if err != nil {
 		r.Status = Fail
 		r.Detail = err.Error()
-		r.Next = "grant ecs:ListTasks / ecs:DescribeTasks, or enable ECS Exec on the service and deploy the tetherd-agent sidecar (see docs/dev-env.md)"
+		r.Next = "grant ecs:ListTasks / ecs:DescribeTasks, or enable ECS Exec on the service and deploy the tetherd-agent sidecar (see deploy/dev-env)"
 		return r
 	}
 	// StartedAt is formatted in whatever location it carries, so the row does
@@ -344,7 +344,7 @@ func CheckAgentSession(protocol, agentEnv, wantEnv string, dialErr error) Result
 	if dialErr != nil {
 		r.Status = Fail
 		r.Detail = dialErr.Error()
-		r.Next = "check the tetherd-agent sidecar is running in the task and listening on its control port (see docs/dev-env.md)"
+		r.Next = "check the tetherd-agent sidecar is running in the task and listening on its control port (see deploy/dev-env)"
 		return r
 	}
 	if agentEnv != wantEnv {
