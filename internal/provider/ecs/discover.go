@@ -42,9 +42,20 @@ func (e *NotReadyError) Error() string {
 	return "no attachable task:\n        " + strings.Join(e.Reasons, "\n        ")
 }
 
-// Discover returns the oldest RUNNING task that has the agent container,
-// ECS Exec enabled and its ExecuteCommandAgent running (spec §6.2).
-func Discover(ctx context.Context, api ECSAPI, t Target) (transport.Task, error) {
+// DiscoverAll returns every eligible RUNNING task - RUNNING, with the agent
+// container present, ECS Exec enabled and its ExecuteCommandAgent running
+// (spec §6.2) - sorted oldest first by StartedAt.
+//
+// Oldest-first is not just tidy: it fixes which task is "the primary".
+// Later session-layer code designates the oldest attached task as the one
+// that serves dial, DNS and the task environment, so a deploy adding a
+// newer task never moves the primary out from under an attached session.
+//
+// The returned slice is never empty with a nil error: zero eligible tasks
+// is always an error, either "no RUNNING tasks in service ..." or a
+// *NotReadyError carrying the per-task reasons. Callers - including
+// Discover below - may read all[0] unchecked on success.
+func DiscoverAll(ctx context.Context, api ECSAPI, t Target) ([]transport.Task, error) {
 	if t.AgentContainer == "" {
 		t.AgentContainer = "tetherd-agent"
 	}
@@ -54,14 +65,14 @@ func Discover(ctx context.Context, api ECSAPI, t Target) (transport.Task, error)
 		DesiredStatus: types.DesiredStatusRunning,
 	})
 	if err != nil {
-		return transport.Task{}, fmt.Errorf("ListTasks %s/%s: %w", t.Cluster, t.Service, err)
+		return nil, fmt.Errorf("ListTasks %s/%s: %w", t.Cluster, t.Service, err)
 	}
 	if len(list.TaskArns) == 0 {
-		return transport.Task{}, fmt.Errorf("no RUNNING tasks in service %s/%s", t.Cluster, t.Service)
+		return nil, fmt.Errorf("no RUNNING tasks in service %s/%s", t.Cluster, t.Service)
 	}
 	desc, err := api.DescribeTasks(ctx, &awsecs.DescribeTasksInput{Cluster: aws.String(t.Cluster), Tasks: list.TaskArns})
 	if err != nil {
-		return transport.Task{}, fmt.Errorf("DescribeTasks: %w", err)
+		return nil, fmt.Errorf("DescribeTasks: %w", err)
 	}
 
 	var eligible []transport.Task
@@ -137,12 +148,23 @@ func Discover(ctx context.Context, api ECSAPI, t Target) (transport.Task, error)
 	}
 	if len(eligible) == 0 {
 		if t.TaskID != "" && len(reasons) == 0 {
-			return transport.Task{}, fmt.Errorf("task %s is not RUNNING in %s/%s", t.TaskID, t.Cluster, t.Service)
+			return nil, fmt.Errorf("task %s is not RUNNING in %s/%s", t.TaskID, t.Cluster, t.Service)
 		}
-		return transport.Task{}, &NotReadyError{Reasons: reasons}
+		return nil, &NotReadyError{Reasons: reasons}
 	}
 	sort.Slice(eligible, func(i, j int) bool { return eligible[i].StartedAt.Before(eligible[j].StartedAt) })
-	return eligible[0], nil
+	return eligible, nil
+}
+
+// Discover returns the oldest eligible RUNNING task - the primary, which
+// is where dial, resolve and the task environment come from. Steal needs
+// every task (the ALB chooses), so the session layer uses DiscoverAll.
+func Discover(ctx context.Context, api ECSAPI, t Target) (transport.Task, error) {
+	all, err := DiscoverAll(ctx, api, t)
+	if err != nil {
+		return transport.Task{}, err
+	}
+	return all[0], nil
 }
 
 // taskID is the last path segment of a task ARN.
