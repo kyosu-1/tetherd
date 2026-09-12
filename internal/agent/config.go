@@ -3,7 +3,13 @@
 // traffic. It never calls AWS APIs.
 package agent
 
-import "errors"
+import (
+	"errors"
+	"net"
+	"strconv"
+
+	"github.com/kyosu-1/tetherd/internal/proto"
+)
 
 // Config comes from environment variables only.
 type Config struct {
@@ -44,9 +50,20 @@ type Config struct {
 const (
 	defaultControl      = "127.0.0.1:9900"
 	defaultAppContainer = "app"
-	defaultProxy        = "0.0.0.0:8080"
 	defaultAppAddr      = "127.0.0.1:8081"
 )
+
+// defaultProxy is every interface on proto.DefaultProxyPort, and the port
+// half is not written here: `tetherd doctor` compares the ALB target
+// group's port against the same number, so it lives in internal/proto where
+// both packages read it. A literal here as well would be the second copy,
+// and the one that drifts.
+//
+// A var rather than a const only because the address is assembled from that
+// port; nothing assigns to it. The host is 0.0.0.0 and not loopback because
+// the ALB reaches the task over the VPC network - the opposite of
+// defaultControl, which is loopback on purpose (see Config.Control).
+var defaultProxy = net.JoinHostPort("0.0.0.0", strconv.Itoa(proto.DefaultProxyPort))
 
 // withDefaults fills in what a Config built by hand would otherwise hand on
 // empty. New applies it, so the paths that do not go through ConfigFromEnv

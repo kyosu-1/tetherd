@@ -9,6 +9,27 @@ import "time"
 // rejected with CodeVersionMismatch.
 const Version = "1"
 
+// The agent's default ports, one constant each and nowhere else.
+//
+// They live in this package rather than in internal/agent because both
+// sides read them and neither side may hold its own copy. The agent applies
+// them (internal/agent's Config.withDefaults); `tetherd doctor` compares the
+// deployment against them, because a fact about the deployment - which port
+// the ALB's target group sends to - is only a finding next to the port the
+// agent actually serves. A literal in both places is a literal that drifts,
+// and the copy that drifts is the one no task definition mentions.
+//
+// This is the wire-adjacent package rather than a new one because it is
+// already imported by the agent, the CLI and internal/doctor, so no import
+// edge has to be added to reach it.
+const (
+	// DefaultProxyPort is the port tetherd-agent serves the ALB on unless
+	// TETHERD_PROXY says otherwise: the agent sits on the ALB's data path
+	// and reverse-proxies to the application behind it (spec §5.1), so
+	// this is the port the task's target group is expected to name.
+	DefaultProxyPort = 8080
+)
+
 // Message types.
 //
 // Stream types are additive: an agent built before a given stream type
