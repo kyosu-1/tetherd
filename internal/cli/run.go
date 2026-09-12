@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -52,16 +53,19 @@ type RunOptions struct {
 	ConfigPath     string // the .tetherd.yml read; shown in the status line
 }
 
-// ParseRemoteCIDRs parses IPv4 prefixes.
-func ParseRemoteCIDRs(in []string) ([]netip.Prefix, error) {
+// ParseRemoteCIDRs parses IPv4 prefixes. source names where the values came
+// from ("--remote-cidr", "network.local_cidrs", ...) so a parse failure
+// reads correctly regardless of which flag or config key produced it,
+// instead of every source's errors being mislabelled as "--remote-cidr".
+func ParseRemoteCIDRs(source string, in []string) ([]netip.Prefix, error) {
 	out := make([]netip.Prefix, 0, len(in))
 	for _, s := range in {
 		p, err := netip.ParsePrefix(s)
 		if err != nil {
-			return nil, fmt.Errorf("--remote-cidr %q: %w", s, err)
+			return nil, fmt.Errorf("%s %q: %w", source, s, err)
 		}
 		if !p.Addr().Is4() {
-			return nil, fmt.Errorf("--remote-cidr %q: only IPv4 is supported in v1", s)
+			return nil, fmt.Errorf("%s %q: only IPv4 is supported in v1", source, s)
 		}
 		out = append(out, p.Masked())
 	}
@@ -187,34 +191,91 @@ func emptyAWSConfigFile() (string, func(), error) {
 	return name, func() { os.Remove(name) }, nil
 }
 
-// Subtract removes every prefix that a local_cidrs range covers, so a part
-// of the VPC range that the laptop must reach directly (an overlapping home
-// network, a service pinned to the machine) stays off the captured set.
-func Subtract(all []netip.Prefix, exclude []netip.Prefix) []netip.Prefix {
-	if len(exclude) == 0 {
-		return all
+// errLocalCIDRsExcludeEverything is returned when network.local_cidrs
+// subtracts every prefix a remote set would otherwise have contained: with
+// no fix, the privileged helper would be asked to install pf rules for zero
+// remote ranges (surfacing as its own, much less useful, "no remote cidrs"
+// failure two round trips later), so this is caught and named at the source
+// instead.
+var errLocalCIDRsExcludeEverything = errors.New("network.local_cidrs excludes the entire remote set; nothing would be captured")
+
+// subtractOne removes e from p, returning the pieces of p left afterwards:
+// nothing (e covers p entirely), p unchanged (no overlap), or - when e is
+// strictly narrower than p and overlaps somewhere inside it - the
+// concatenation of subtracting e from each half of p, halved by extending
+// p's mask by one bit and setting that bit for the upper half. Recursing
+// this way (rather than pf's native "!" table negation) keeps the result an
+// explicit list of the exact prefixes captured, which is what both pf and
+// `doctor` must agree on - a negated table would make the printed set a lie
+// about what pf actually enforces.
+//
+// IPv4 only: v1 captures no IPv6, so an IPv6 p is returned untouched rather
+// than run through the byte-indexing below, which assumes a 4-byte address.
+func subtractOne(p, e netip.Prefix) []netip.Prefix {
+	if !p.Addr().Is4() {
+		return []netip.Prefix{p}
 	}
-	out := make([]netip.Prefix, 0, len(all))
-	for _, p := range all {
-		covered := false
-		for _, e := range exclude {
-			if e.Overlaps(p) && e.Bits() <= p.Bits() {
-				covered = true
-				break
-			}
-		}
-		if !covered {
-			out = append(out, p)
-		}
+	if !e.Overlaps(p) {
+		return []netip.Prefix{p}
 	}
-	return out
+	if e.Bits() <= p.Bits() {
+		// e is at least as wide as p and they overlap, so e covers p
+		// entirely.
+		return nil
+	}
+	bits := p.Bits() + 1
+	lower := netip.PrefixFrom(p.Addr(), bits)
+	addr4 := p.Addr().As4()
+	byteIdx := (bits - 1) / 8
+	bitIdx := 7 - (bits-1)%8
+	addr4[byteIdx] |= 1 << bitIdx
+	upper := netip.PrefixFrom(netip.AddrFrom4(addr4), bits)
+	return append(subtractOne(lower, e), subtractOne(upper, e)...)
 }
 
-// remoteSet is everything that goes to the task: the VPC, the credential
-// endpoint, the configured extras and any gateway-endpoint service ranges,
-// minus the ranges the laptop must keep for itself (spec §4.1).
+// Subtract removes the portion of each prefix in all that any prefix in
+// exclude covers. A narrower exclude (VPC 10.0.0.0/16, local_cidrs
+// 10.0.5.0/24 - the sample in both config test fixtures) carves exactly
+// that /24 out rather than being a no-op or dropping the whole /16: the
+// result is 8 canonical prefixes covering 10.0.0.0/16 minus 10.0.5.0/24.
+// Always returns a freshly allocated slice, even with no exclusions, so the
+// caller's own slice is never handed back for the next append to corrupt.
+func Subtract(all []netip.Prefix, exclude []netip.Prefix) []netip.Prefix {
+	cur := slices.Clone(all)
+	for _, e := range exclude {
+		var next []netip.Prefix
+		for _, p := range cur {
+			next = append(next, subtractOne(p, e)...)
+		}
+		cur = next
+	}
+	return cur
+}
+
+// applyLocalCIDRs subtracts local (already-parsed network.local_cidrs
+// prefixes) from cidrs, then adds back floor - prefixes local_cidrs can
+// never remove because they are required infrastructure, not part of the
+// operator-tunable remote set (ssm's TaskRoleCIDR; direct has none). It
+// fails loudly if nothing survives even including floor, instead of
+// silently handing the helper zero remote ranges to capture.
+func applyLocalCIDRs(cidrs, local, floor []netip.Prefix) ([]netip.Prefix, error) {
+	out := append(Subtract(cidrs, local), floor...)
+	if len(out) == 0 {
+		return nil, errLocalCIDRsExcludeEverything
+	}
+	return out, nil
+}
+
+// remoteSet is everything that goes to the task: the VPC, the configured
+// extras and any gateway-endpoint service ranges, minus the ranges the
+// laptop must keep for itself (spec §4.1), plus the credential endpoint.
 func remoteSet(ctx context.Context, opts RunOptions, prov awsProvider, task transport.Task, logf func(string, ...any)) ([]netip.Prefix, error) {
-	extra, err := ParseRemoteCIDRs(opts.RemoteCIDRs)
+	extra, err := ParseRemoteCIDRs("--remote-cidr", opts.RemoteCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	// Parsed before any AWS call, so a local_cidrs typo costs no round trip.
+	local, err := ParseRemoteCIDRs("network.local_cidrs", opts.LocalCIDRs)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +283,11 @@ func remoteSet(ctx context.Context, opts RunOptions, prov awsProvider, task tran
 	if err != nil {
 		return nil, err
 	}
-	cidrs := append(append(vpc, ecsprov.TaskRoleCIDR), extra...)
+	// slices.Concat, not append(vpc, extra...): vpc is the provider's own
+	// slice (kept and reused across calls by at least one implementation),
+	// and appending onto it would silently overwrite its backing array
+	// whenever it has spare capacity.
+	cidrs := slices.Concat(vpc, extra)
 	if len(opts.RemoteServices) > 0 {
 		svc, err := prov.ServiceCIDRs(ctx, opts.RemoteServices)
 		if err != nil {
@@ -231,11 +296,10 @@ func remoteSet(ctx context.Context, opts RunOptions, prov awsProvider, task tran
 		cidrs = append(cidrs, svc...)
 		logf("           remote_services %s → %d prefixes", strings.Join(opts.RemoteServices, ", "), len(svc))
 	}
-	local, err := ParseRemoteCIDRs(opts.LocalCIDRs)
-	if err != nil {
-		return nil, fmt.Errorf("network.local_cidrs: %w", err)
-	}
-	return Subtract(cidrs, local), nil
+	// TaskRoleCIDR is passed as floor, not appended before the subtraction:
+	// an overly broad local_cidrs entry ("169.254.0.0/16", or even
+	// "0.0.0.0/0") must never drop the credential endpoint.
+	return applyLocalCIDRs(cidrs, local, []netip.Prefix{ecsprov.TaskRoleCIDR})
 }
 
 // ecsTarget is the discovery target the flags and the config describe.
@@ -259,7 +323,7 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 	if opts.ConfigPath != "" {
 		logf("config     %s", opts.ConfigPath)
 	}
-	extra, err := ParseRemoteCIDRs(opts.RemoteCIDRs)
+	extra, err := ParseRemoteCIDRs("--remote-cidr", opts.RemoteCIDRs)
 	if err != nil {
 		return 2, err
 	}
@@ -278,6 +342,21 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 			return 2, errors.New("no --remote-cidr given (or use --no-network)")
 		}
 		tr, task, cidrs = direct.Transport{}, transport.Task{ID: "direct", Addr: opts.AgentAddr}, extra
+		if !opts.NoNetwork {
+			// direct has no AWS session, so remote_services (a prefix-list
+			// lookup) cannot be resolved here - only local_cidrs applies.
+			local, err := ParseRemoteCIDRs("network.local_cidrs", opts.LocalCIDRs)
+			if err != nil {
+				return 1, err
+			}
+			cidrs, err = applyLocalCIDRs(cidrs, local, nil)
+			if err != nil {
+				return 1, err
+			}
+			if len(opts.RemoteServices) > 0 {
+				logf("           remote_services %s ignored under --transport direct (prefix lists need an AWS session)", strings.Join(opts.RemoteServices, ", "))
+			}
+		}
 	case "ssm":
 		if opts.Cluster == "" || opts.Service == "" {
 			return 2, errors.New("--transport ssm needs --cluster and --service")
@@ -376,7 +455,7 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 		}()
 		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s", joinPrefixes(cidrs))
 		if taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "" && !taskRoleReachable(taskEnv, cidrs) {
-			logf("⚠ iam      the task advertises a role but %s is not captured; the child keeps your own AWS credentials (add --remote-cidr %s to use the task role)", ecsprov.TaskRoleCIDR, ecsprov.TaskRoleCIDR)
+			logf("⚠ iam      the task advertises a role but %s is not captured; the child keeps your own AWS credentials (with --transport direct, pass --remote-cidr %s and make sure network.local_cidrs does not exclude it)", ecsprov.TaskRoleCIDR, ecsprov.TaskRoleCIDR)
 		}
 
 		// 5. task role: fetch credentials the way the child's SDK will.

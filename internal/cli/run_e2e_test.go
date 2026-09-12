@@ -69,6 +69,11 @@ type fakeProvider struct {
 	discErr   error
 	vpcErr    error
 	agentAddr string
+
+	// vpcCalls and svcCalls count invocations, so a test can assert an AWS
+	// round trip was (or, for a local_cidrs typo, was not) made.
+	vpcCalls int
+	svcCalls int
 }
 
 func (f *fakeProvider) Region() string { return f.region }
@@ -76,9 +81,11 @@ func (f *fakeProvider) Discover(context.Context, ecsprov.Target) (transport.Task
 	return f.task, f.discErr
 }
 func (f *fakeProvider) VPCCIDRs(context.Context, string) ([]netip.Prefix, error) {
+	f.vpcCalls++
 	return f.vpc, f.vpcErr
 }
 func (f *fakeProvider) ServiceCIDRs(context.Context, []string) ([]netip.Prefix, error) {
+	f.svcCalls++
 	return f.svc, nil
 }
 func (f *fakeProvider) Transport(func(string, ...any)) transport.Transport {
@@ -337,6 +344,79 @@ func TestRunFailsOnBadLocalCIDRs(t *testing.T) {
 	opts.ExecPath = "/usr/bin/true"
 	opts.LocalCIDRs = []string{"not-a-cidr"}
 	code, err := RunWithDeps(context.Background(), opts, io.Discard, d)
+	if code != 1 || err == nil || !strings.Contains(err.Error(), "network.local_cidrs") {
+		t.Fatalf("code=%d err=%v, want code 1 and a network.local_cidrs error", code, err)
+	}
+}
+
+// TestRunDirectAppliesLocalCIDRs pins item 6 of the fix-round-1 review:
+// --transport direct has no AWS session to compute remote_services or a VPC
+// set from, but network.local_cidrs needs neither, so it must still apply.
+func TestRunDirectAppliesLocalCIDRs(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	cap := newFakeCapturer()
+	d := Deps{
+		DialHelper:  func(string) (HelperClient, error) { return &fakeHelperClient{}, nil },
+		NewCapturer: func(HelperClient, func(string, ...any)) Capturer { return cap },
+	}
+
+	opts := RunOptions{
+		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
+		RemoteCIDRs: []string{"10.0.0.0/16"}, LocalCIDRs: []string{"10.0.5.0/24"},
+		ExecPath: "/usr/bin/true", Command: []string{"true"},
+	}
+	var out strings.Builder
+	code, err := RunWithDeps(context.Background(), opts, &out, d)
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if addrIn(cap.spec.RemoteCIDRs, "10.0.5.42") {
+		t.Fatalf("10.0.5.42 (excluded by local_cidrs) must not be captured under --transport direct: %v", cap.spec.RemoteCIDRs)
+	}
+	if !addrIn(cap.spec.RemoteCIDRs, "10.0.4.42") {
+		t.Fatalf("10.0.4.42 (same /16, outside local_cidrs) must still be captured: %v", cap.spec.RemoteCIDRs)
+	}
+}
+
+// TestRunDirectIgnoresRemoteServicesWithALogLine pins the rest of item 6:
+// remote_services needs an AWS session to resolve a managed prefix list, so
+// --transport direct cannot honour it - but it must say so, not silently
+// drop it with no trace.
+func TestRunDirectIgnoresRemoteServicesWithALogLine(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	d := Deps{
+		DialHelper:  func(string) (HelperClient, error) { return &fakeHelperClient{}, nil },
+		NewCapturer: func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() },
+	}
+
+	opts := RunOptions{
+		Transport: "direct", AgentAddr: ag.addr, TargetEnv: "dev", User: "tester",
+		RemoteCIDRs: []string{"10.0.0.0/16"}, RemoteServices: []string{"s3"},
+		ExecPath: "/usr/bin/true", Command: []string{"true"},
+	}
+	var out strings.Builder
+	code, err := RunWithDeps(context.Background(), opts, &out, d)
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if !strings.Contains(out.String(), "remote_services") || !strings.Contains(out.String(), "ignored") {
+		t.Fatalf("expected a remote_services-ignored line under --transport direct: %s", out.String())
+	}
+}
+
+// TestRunDirectRejectsLocalCIDRsExcludingEverything pins item 7 (the branch
+// where it is actually reachable): --transport direct has no TaskRoleCIDR
+// floor the way ssm's remoteSet does, so local_cidrs wiping out every
+// --remote-cidr really does leave zero remote ranges, which must be a loud
+// error naming local_cidrs rather than a silent hand-off to the helper. This
+// fails before the agent is ever dialed, so a bogus address is enough.
+func TestRunDirectRejectsLocalCIDRsExcludingEverything(t *testing.T) {
+	opts := RunOptions{
+		Transport: "direct", AgentAddr: "127.0.0.1:1", TargetEnv: "dev", User: "tester",
+		RemoteCIDRs: []string{"10.0.0.0/16"}, LocalCIDRs: []string{"10.0.0.0/8"},
+		ExecPath: "/usr/bin/true", Command: []string{"true"},
+	}
+	code, err := RunWithDeps(context.Background(), opts, io.Discard, Deps{})
 	if code != 1 || err == nil || !strings.Contains(err.Error(), "network.local_cidrs") {
 		t.Fatalf("code=%d err=%v, want code 1 and a network.local_cidrs error", code, err)
 	}

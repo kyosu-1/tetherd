@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -31,26 +32,56 @@ func ServiceCIDRs(ctx context.Context, api PrefixListAPI, region string, service
 			return nil, fmt.Errorf("network.remote_services: %q has no managed prefix list; only s3 and dynamodb do (interface endpoints are reached through network.remote_domains instead)", s)
 		}
 		name := fmt.Sprintf("com.amazonaws.%s.%s", region, s)
+		// prefix-list-name is not unique across owners: a customer-managed
+		// prefix list can be given the same name as the AWS-managed one, so
+		// filtering on the name alone would let a same-named list from
+		// another owner (potentially containing 0.0.0.0/0) stand in for it.
 		desc, err := api.DescribeManagedPrefixLists(ctx, &awsec2.DescribeManagedPrefixListsInput{
-			Filters: []types.Filter{{Name: aws.String("prefix-list-name"), Values: []string{name}}},
+			Filters: []types.Filter{
+				{Name: aws.String("prefix-list-name"), Values: []string{name}},
+				{Name: aws.String("owner-id"), Values: []string{"AWS"}},
+			},
 		})
 		if err != nil {
 			return nil, fmt.Errorf("DescribeManagedPrefixLists %s: %w", name, err)
 		}
-		if len(desc.PrefixLists) == 0 {
-			return nil, fmt.Errorf("no managed prefix list named %s in this region", name)
+		// The response order is unspecified and the owner-id filter above is
+		// belt, not braces (a name collision within "AWS"-owned lists is not
+		// something this code can rule out on its own), so require exactly
+		// one match rather than trusting PrefixLists[0].
+		if len(desc.PrefixLists) != 1 {
+			if len(desc.PrefixLists) == 0 {
+				return nil, fmt.Errorf("no AWS-managed prefix list named %s in this region", name)
+			}
+			var ids []string
+			for _, pl := range desc.PrefixLists {
+				ids = append(ids, aws.ToString(pl.PrefixListId))
+			}
+			return nil, fmt.Errorf("expected exactly one AWS-managed prefix list named %s, found %d: %s", name, len(desc.PrefixLists), strings.Join(ids, ", "))
 		}
 		id := aws.ToString(desc.PrefixLists[0].PrefixListId)
-		entries, err := api.GetManagedPrefixListEntries(ctx, &awsec2.GetManagedPrefixListEntriesInput{PrefixListId: aws.String(id)})
-		if err != nil {
-			return nil, fmt.Errorf("GetManagedPrefixListEntries %s: %w", id, err)
-		}
-		for _, e := range entries.Entries {
-			p, err := netip.ParsePrefix(aws.ToString(e.Cidr))
-			if err != nil || !p.Addr().Is4() {
-				continue
+
+		// GetManagedPrefixListEntries caps at 100 entries per call and the
+		// real com.amazonaws.<region>.s3 list has hundreds, so this must
+		// follow NextToken to the end rather than reading only the first
+		// page.
+		var token *string
+		for {
+			entries, err := api.GetManagedPrefixListEntries(ctx, &awsec2.GetManagedPrefixListEntriesInput{PrefixListId: aws.String(id), NextToken: token})
+			if err != nil {
+				return nil, fmt.Errorf("GetManagedPrefixListEntries %s: %w", id, err)
 			}
-			out = append(out, p.Masked())
+			for _, e := range entries.Entries {
+				p, err := netip.ParsePrefix(aws.ToString(e.Cidr))
+				if err != nil || !p.Addr().Is4() {
+					continue
+				}
+				out = append(out, p.Masked())
+			}
+			if entries.NextToken == nil {
+				break
+			}
+			token = entries.NextToken
 		}
 	}
 	return out, nil

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -17,15 +18,26 @@ import (
 )
 
 func TestParseRemoteCIDRs(t *testing.T) {
-	got, err := ParseRemoteCIDRs([]string{"10.0.0.0/16", "169.254.170.0/24"})
+	got, err := ParseRemoteCIDRs("--remote-cidr", []string{"10.0.0.0/16", "169.254.170.0/24"})
 	if err != nil || len(got) != 2 || got[1].String() != "169.254.170.0/24" {
 		t.Fatalf("got %v, err %v", got, err)
 	}
-	if _, err := ParseRemoteCIDRs([]string{"10.0.0.0"}); err == nil {
+	if _, err := ParseRemoteCIDRs("--remote-cidr", []string{"10.0.0.0"}); err == nil {
 		t.Fatal("bare address must fail")
 	}
-	if _, err := ParseRemoteCIDRs([]string{"fd00::/8"}); err == nil {
+	if _, err := ParseRemoteCIDRs("--remote-cidr", []string{"fd00::/8"}); err == nil {
 		t.Fatal("ipv6 must fail in v1")
+	}
+}
+
+// TestParseRemoteCIDRsNamesItsSource pins that the error names the caller's
+// label (a flag or a config key), not a hardcoded "--remote-cidr": with only
+// one label ever used, a local_cidrs parse failure would misleadingly read
+// as a --remote-cidr problem.
+func TestParseRemoteCIDRsNamesItsSource(t *testing.T) {
+	_, err := ParseRemoteCIDRs("network.local_cidrs", []string{"not-a-cidr"})
+	if err == nil || !strings.Contains(err.Error(), "network.local_cidrs") || strings.Contains(err.Error(), "--remote-cidr") {
+		t.Fatalf("err = %v, want it to name network.local_cidrs and not --remote-cidr", err)
 	}
 }
 
@@ -354,23 +366,126 @@ func TestTaskRoleEnvOverridesLocalSharedConfig(t *testing.T) {
 	}
 }
 
+// addrIn reports whether any prefix in set contains addr - used instead of a
+// hardcoded prefix list so a test survives Subtract choosing a different
+// (but equally correct) split into pieces.
+func addrIn(set []netip.Prefix, addr string) bool {
+	a := netip.MustParseAddr(addr)
+	for _, p := range set {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+func sortedPrefixStrings(ps []netip.Prefix) []string {
+	out := make([]string, len(ps))
+	for i, p := range ps {
+		out[i] = p.String()
+	}
+	slices.Sort(out)
+	return out
+}
+
 func TestSubtract(t *testing.T) {
-	all := []netip.Prefix{
-		netip.MustParsePrefix("10.0.0.0/16"),
-		netip.MustParsePrefix("10.0.5.0/24"),
-		netip.MustParsePrefix("169.254.170.0/24"),
-	}
-	got := Subtract(all, []netip.Prefix{netip.MustParsePrefix("10.0.5.0/24")})
-	if len(got) != 2 || got[0].String() != "10.0.0.0/16" || got[1].String() != "169.254.170.0/24" {
-		t.Fatalf("got %v", got)
-	}
-	// A local range that contains a remote one removes it entirely.
-	got = Subtract(all, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
-	if len(got) != 1 || got[0].String() != "169.254.170.0/24" {
-		t.Fatalf("got %v", got)
-	}
-	if len(Subtract(all, nil)) != 3 {
-		t.Fatal("without exclusions nothing changes")
+	t.Run("no overlap leaves the prefix untouched", func(t *testing.T) {
+		all := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}
+		got := Subtract(all, []netip.Prefix{netip.MustParsePrefix("192.168.0.0/16")})
+		if len(got) != 1 || got[0] != all[0] {
+			t.Fatalf("got %v", got)
+		}
+	})
+
+	t.Run("exact equality removes it", func(t *testing.T) {
+		p := netip.MustParsePrefix("10.0.5.0/24")
+		got := Subtract([]netip.Prefix{p}, []netip.Prefix{p})
+		if len(got) != 0 {
+			t.Fatalf("got %v", got)
+		}
+	})
+
+	t.Run("a wider exclude removes it", func(t *testing.T) {
+		got := Subtract([]netip.Prefix{netip.MustParsePrefix("10.0.5.0/24")}, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
+		if len(got) != 0 {
+			t.Fatalf("got %v", got)
+		}
+	})
+
+	// The primary use case (spec §4.1, and the sample in both config test
+	// fixtures): a narrower exclude must carve an exact hole out of a wider
+	// remote range, not be a no-op (old containment-only bug) and not drop
+	// the whole range either.
+	t.Run("a narrower exclude carves an exact hole out of a wider range", func(t *testing.T) {
+		all := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16"), netip.MustParsePrefix("10.1.0.0/16")}
+		got := Subtract(all, []netip.Prefix{netip.MustParsePrefix("10.0.5.0/24")})
+		if addrIn(got, "10.0.5.42") {
+			t.Fatalf("10.0.5.42 (inside the excluded /24) must not be covered: %v", got)
+		}
+		if !addrIn(got, "10.0.4.42") {
+			t.Fatalf("10.0.4.42 (same /16, outside the excluded /24) must still be covered: %v", got)
+		}
+		if !addrIn(got, "10.1.0.1") {
+			t.Fatalf("10.1.0.1 (an unrelated remote range) must still be covered: %v", got)
+		}
+		// 10.0.0.0/16 minus 10.0.5.0/24 splits into exactly 8 canonical
+		// prefixes (24-16 halvings), plus the untouched 10.1.0.0/16.
+		if len(got) != 9 {
+			t.Fatalf("got %d prefixes, want 9 (8 from the split + the untouched /16): %v", len(got), got)
+		}
+	})
+
+	t.Run("several excludes at once", func(t *testing.T) {
+		all := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}
+		got := Subtract(all, []netip.Prefix{
+			netip.MustParsePrefix("10.0.5.0/24"),
+			netip.MustParsePrefix("10.0.9.0/24"),
+		})
+		for _, bad := range []string{"10.0.5.1", "10.0.9.1"} {
+			if addrIn(got, bad) {
+				t.Fatalf("%s must be excluded: %v", bad, got)
+			}
+		}
+		if !addrIn(got, "10.0.1.1") {
+			t.Fatalf("10.0.1.1 must still be covered: %v", got)
+		}
+	})
+
+	t.Run("empty exclude list changes nothing", func(t *testing.T) {
+		all := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16"), netip.MustParsePrefix("169.254.170.0/24")}
+		got := Subtract(all, nil)
+		if len(got) != 2 {
+			t.Fatalf("got %v", got)
+		}
+	})
+
+	t.Run("duplicate excludes are idempotent", func(t *testing.T) {
+		all := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}
+		e := netip.MustParsePrefix("10.0.5.0/24")
+		got := Subtract(all, []netip.Prefix{e, e})
+		if addrIn(got, "10.0.5.1") {
+			t.Fatalf("10.0.5.1 must be excluded: %v", got)
+		}
+		if !addrIn(got, "10.0.1.1") {
+			t.Fatalf("10.0.1.1 must still be covered: %v", got)
+		}
+	})
+}
+
+// TestSubtractDoesNotAliasInput pins that Subtract, even with no exclusions
+// at all, hands back a slice the caller can freely append to without
+// corrupting all's backing array - the same bug class as remoteSet's own
+// VPCCIDRs aliasing (TestRemoteSetDoesNotMutateTheProvidersVPCSlice below).
+func TestSubtractDoesNotAliasInput(t *testing.T) {
+	all := make([]netip.Prefix, 1, 4) // spare capacity an append could reuse
+	all[0] = netip.MustParsePrefix("10.0.0.0/16")
+	full := all[:cap(all)] // exposes any write past len(all) into its backing array
+
+	got := Subtract(all, nil)
+	got = append(got, netip.MustParsePrefix("192.168.0.0/16"))
+
+	if full[1].IsValid() {
+		t.Fatalf("Subtract's result aliases the input slice: appending to it wrote into all's backing array: %v", full[1])
 	}
 }
 
@@ -379,7 +494,9 @@ func TestSubtract(t *testing.T) {
 // network.remote_services prefixes - minus what network.local_cidrs claims
 // for the laptop. Deleting any one term from remoteSet's assembly (the VPC
 // append, the TaskRoleCIDR append, the extra append, the ServiceCIDRs call,
-// or the closing Subtract) changes this set and fails the test.
+// or the closing Subtract) changes this set and fails the test. Comparing
+// sorted slices, not a map keyed by string, means a duplicated prefix cannot
+// mask a missing one the way an equal len(map) could.
 func TestRemoteSet(t *testing.T) {
 	p := &fakeProvider{
 		vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
@@ -396,14 +513,49 @@ func TestRemoteSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]bool{"10.0.0.0/16": true, "169.254.170.0/24": true, "52.219.0.0/20": true}
-	if len(got) != len(want) {
-		t.Fatalf("got %v, want exactly %v", got, want)
+	want := []string{"10.0.0.0/16", "169.254.170.0/24", "52.219.0.0/20"}
+	slices.Sort(want)
+	if !slices.Equal(sortedPrefixStrings(got), want) {
+		t.Fatalf("got %v, want %v", sortedPrefixStrings(got), want)
 	}
-	for _, p := range got {
-		if !want[p.String()] {
-			t.Fatalf("unexpected %s in %v", p, got)
-		}
+}
+
+// TestRemoteSetTaskRoleCIDRSurvivesLocalCIDRs pins that TaskRoleCIDR cannot
+// be removed via network.local_cidrs, even by the most extreme possible
+// entry: it is required infrastructure (the child's only path to the task's
+// AWS credentials), not part of the operator-tunable remote set. Before this
+// fix, TaskRoleCIDR was unioned in *before* the subtraction, so
+// "0.0.0.0/0" - or the more plausible "169.254.0.0/16" the review called
+// out - silently dropped it and left the child with the developer's own AWS
+// identity while the status line still printed a green iam line.
+func TestRemoteSetTaskRoleCIDRSurvivesLocalCIDRs(t *testing.T) {
+	p := &fakeProvider{vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}}
+	opts := RunOptions{LocalCIDRs: []string{"0.0.0.0/0"}}
+	got, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !addrIn(got, "169.254.170.2") {
+		t.Fatalf("the task-role endpoint must survive local_cidrs 0.0.0.0/0: %v", got)
+	}
+}
+
+// TestRemoteSetDoesNotMutateTheProvidersVPCSlice pins the aliasing fix: the
+// old append(append(vpc, ecsprov.TaskRoleCIDR), extra...) wrote into
+// VPCCIDRs' own returned slice whenever it had spare capacity, silently
+// corrupting a provider that reuses or caches that slice across calls.
+func TestRemoteSetDoesNotMutateTheProvidersVPCSlice(t *testing.T) {
+	vpc := make([]netip.Prefix, 1, 4) // spare capacity an aliasing append could reuse
+	vpc[0] = netip.MustParsePrefix("10.0.0.0/16")
+	full := vpc[:cap(vpc)] // exposes any write past len(vpc) into vpc's backing array
+
+	p := &fakeProvider{vpc: vpc}
+	opts := RunOptions{RemoteCIDRs: []string{"10.9.0.0/16"}}
+	if _, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	if full[1].IsValid() {
+		t.Fatalf("remoteSet wrote into the provider's VPC slice's spare capacity: %v", full[1])
 	}
 }
 
@@ -418,5 +570,42 @@ func TestRemoteSetRejectsBadLocalCIDRs(t *testing.T) {
 	_, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {})
 	if err == nil || !strings.Contains(err.Error(), "network.local_cidrs") {
 		t.Fatalf("err = %v, want it to mention network.local_cidrs", err)
+	}
+}
+
+// TestRemoteSetParsesLocalCIDRsBeforeAnyAWSCall pins that a local_cidrs typo
+// is caught before VPCCIDRs (or ServiceCIDRs) is ever called, so it costs no
+// AWS round trip.
+func TestRemoteSetParsesLocalCIDRsBeforeAnyAWSCall(t *testing.T) {
+	p := &fakeProvider{vpc: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")}}
+	opts := RunOptions{LocalCIDRs: []string{"not-a-cidr"}, RemoteServices: []string{"s3"}}
+	if _, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {}); err == nil {
+		t.Fatal("expected an error")
+	}
+	if p.vpcCalls != 0 {
+		t.Fatalf("VPCCIDRs called %d times, want 0: a local_cidrs typo must be caught first", p.vpcCalls)
+	}
+	if p.svcCalls != 0 {
+		t.Fatalf("ServiceCIDRs called %d times, want 0: a local_cidrs typo must be caught first", p.svcCalls)
+	}
+}
+
+// TestRemoteSetNeverEmptiesOutUnderSSM documents the flip side of
+// TestRemoteSetTaskRoleCIDRSurvivesLocalCIDRs: under ssm, TaskRoleCIDR is an
+// unconditional floor, so remoteSet's result can never be truly empty and
+// errLocalCIDRsExcludeEverything can never fire here even when local_cidrs
+// wipes out every VPC/extra/service range. The same "excludes everything"
+// scenario is a real, reachable error under --transport direct instead,
+// which has no such floor (see TestRunDirectRejectsLocalCIDRsExcludingEverything
+// in run_e2e_test.go).
+func TestRemoteSetNeverEmptiesOutUnderSSM(t *testing.T) {
+	p := &fakeProvider{} // no VPC CIDRs at all
+	opts := RunOptions{RemoteCIDRs: []string{"10.9.0.0/16"}, LocalCIDRs: []string{"10.9.0.0/16"}}
+	got, err := remoteSet(context.Background(), opts, p, transport.Task{}, func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !addrIn(got, "169.254.170.2") {
+		t.Fatalf("only TaskRoleCIDR should remain: %v", got)
 	}
 }
