@@ -186,16 +186,42 @@ the directory beside it has no `tetherd-exec` in it.
   `Sockets` key, and with no `Sockets` key nothing but `RunAtLoad` would ever
   start the helper. spec §8 has been amended to say so; the socket-activation
   paragraph is still the intended design.
-- **`KeepAlive: {SuccessfulExit: false}`, not a bare `true`.** spec §8
-  specifies this shape, and there are two concrete reasons for it. A bare
-  `true` restarts the helper after a clean `launchctl bootout`, so `install`
-  could never replace it. And `cmd/tetherd-helper` exits 1 when it cannot
-  create the group or install the setgid wrapper - an unrecoverable failure -
-  which a bare `true` would retry forever, filling the log with the same line
-  and burying the cause. `SuccessfulExit: false` raises it again only when it
-  died badly.
-- **`ThrottleInterval` is written out** rather than left to launchd's default
-  (10 seconds), so the interval is visible in the file an operator reads.
+- **`KeepAlive: {SuccessfulExit: false}` means "restart on a non-zero exit".**
+  `man launchd.plist` (measured on Darwin 25.6.0): *"If true, the job will be
+  restarted as long as the program exits and with an exit status of zero. If
+  false, the job will be restarted in the inverse condition."* So every
+  non-zero exit brings the helper back after `ThrottleInterval`, and
+  `cmd/tetherd-helper` exits 1 on each of its unrecoverable startup failures
+  (the `tetherd` group, the setgid wrapper, and `listen` on the socket).
+  **A startup failure that does not clear therefore retries every 10 seconds
+  indefinitely, appending the same line to `/var/log/tetherd-helper.log` -
+  which is where to look when the daemon is not up.** An earlier version of
+  this document claimed the opposite, that this shape spared those paths. It
+  did not; the key does not distinguish between kinds of non-zero exit.
+
+  The retry is deliberate rather than merely noisy. By the time launchd starts
+  the daemon, `sudo tetherd-helper install` has already validated the
+  destination's ownership, copied both binaries and created the group as root,
+  so the daemon's own startup repeats work that succeeded seconds earlier - a
+  failure there is much more likely to be transient (`dscl` not answering yet
+  early in boot) than permanent. Nothing makes a real failure exit 0 in order
+  to stop the loop: reporting success for a failure would be worse than a
+  throttled retry.
+
+  It is also the key the intended design needs. Under socket activation the
+  helper exits **0** when it goes idle; `SuccessfulExit: false` leaves that
+  exit alone while still restarting a crash, where a bare `true` would restart
+  the helper the moment it idled out.
+
+  (`man launchd.plist` also notes that `KeepAlive` "implicitly implies
+  `RunAtLoad`", so the explicit `RunAtLoad` key above is redundant. It is
+  written out so the reader does not have to know that.)
+- **`ThrottleInterval` is written out** rather than left to launchd's default,
+  so the restart interval above is visible in the file an operator reads. The
+  value **is** that default - `man launchd.plist`: *"by default, jobs will not
+  be spawned more than once every 10 seconds"* - and is kept, because raising
+  it would slow recovery from a transient failure as much as it slows the log
+  growth of a permanent one.
 - **The log paths are there** because the worst moment to have nowhere to look
   is a first install that failed. `/var/log/tetherd-helper.log`.
 - The plist is written `root:wheel 0644` into a `0755` directory. launchd

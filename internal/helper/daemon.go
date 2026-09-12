@@ -32,8 +32,15 @@ const DaemonLogPath = "/var/log/tetherd-helper.log"
 const HelperName = "tetherd-helper"
 
 // daemonThrottleInterval is how long launchd waits before restarting a helper
-// that died badly. It is written into the plist rather than left to launchd's
-// default so the interval is visible in the file an operator reads.
+// that exited non-zero - i.e. the period of the retry loop the KeepAlive dict
+// in Plist sets up.
+//
+// 10 is launchd's own default, measured in `man launchd.plist` (Darwin
+// 25.6.0): "by default, jobs will not be spawned more than once every 10
+// seconds". It is written into the plist anyway so the interval is visible in
+// the file an operator reads. Raising it would only slow the log growth of a
+// permanently failing install while also slowing recovery from a transient
+// one, so the default value is kept.
 const daemonThrottleInterval = 10
 
 // Paths is the layout Install writes and Uninstall removes.
@@ -104,15 +111,41 @@ func Plist(label, helperPath, socket, execSrc, installDir, logPath string) []byt
 	// the first connection - which needs launch_activate_socket() through
 	// purego and an idle-exit lifecycle. Until that exists there is no
 	// Sockets key, so nothing but RunAtLoad would ever start the helper.
+	//
+	// Strictly this key is redundant: `man launchd.plist` (Darwin 25.6.0)
+	// says the use of KeepAlive "implicitly implies RunAtLoad", and
+	// SuccessfulExit repeats it ("This key implies that RunAtLoad is set to
+	// true, since the job needs to run at least once before an exit status
+	// can be determined"). It is written out anyway so that the reader of
+	// the plist does not have to know that.
 	plistText(&b, 1, "key", "RunAtLoad")
 	b.WriteString("\t<true/>\n")
 
-	// A bare `KeepAlive: true` would restart the helper after a clean
-	// `launchctl bootout`, and would also loop on an unrecoverable startup
-	// failure - cmd/tetherd-helper exits 1 when the tetherd group or the
-	// setgid wrapper cannot be set up - filling the log with the same
-	// failure and burying its cause. SuccessfulExit: false (spec §8's own
-	// shape) raises it again only when it died badly.
+	// KeepAlive: {SuccessfulExit: false} is spec §8's shape and is kept.
+	// What it actually does, measured in `man launchd.plist` on Darwin
+	// 25.6.0: "If true, the job will be restarted as long as the program
+	// exits and with an exit status of zero. If false, the job will be
+	// restarted in the inverse condition." So this restarts the helper
+	// after every *non-zero* exit, which includes the log.Fatalf paths in
+	// cmd/tetherd-helper (EnsureGroup, InstallExec, ListenAndServe): each
+	// of those is retried once per ThrottleInterval for as long as it keeps
+	// failing. An earlier version of this comment claimed the opposite -
+	// that the dict form spared those paths - and it was wrong.
+	//
+	// Retrying them is reasonable rather than merely noisy. `install` has
+	// already, as root, validated the destination's ownership, copied both
+	// binaries and ensured the tetherd group, so the daemon's own startup
+	// repeats work that succeeded seconds earlier; a failure there is far
+	// more likely to be transient (dscl not answering yet early in boot)
+	// than permanent. A permanent one does retry forever, appending the
+	// same line to DaemonLogPath - which is what that log is for. Nothing
+	// here makes a real failure exit 0 to stop the loop: reporting success
+	// for a failure is worse than a throttled retry.
+	//
+	// It is also the shape the intended design needs. Under socket
+	// activation the helper exits 0 when it goes idle, and only this form
+	// leaves an idle exit alone while still restarting a crash; a bare
+	// `true` would fight the idle-exit lifecycle.
 	plistText(&b, 1, "key", "KeepAlive")
 	b.WriteString("\t<dict>\n")
 	plistText(&b, 2, "key", "SuccessfulExit")

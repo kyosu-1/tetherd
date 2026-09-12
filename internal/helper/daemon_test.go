@@ -240,8 +240,13 @@ func TestPlistKeepsTheHelperResidentButOnlyRestartsAFailedOne(t *testing.T) {
 		t.Fatal("no KeepAlive key")
 	}
 	if ka.kind != "dict" {
-		t.Fatalf("KeepAlive is a <%s>; a bare <true/> restarts the helper after a clean `launchctl bootout` "+
-			"and after every unrecoverable startup failure (cmd/tetherd-helper exits 1), which buries the cause in a restart loop", ka.kind)
+		// `man launchd.plist` (Darwin 25.6.0): SuccessfulExit false means
+		// "the job will be restarted in the inverse condition", i.e. on a
+		// non-zero exit only. A bare <true/> restarts it on a zero exit
+		// too, which is the idle exit the intended socket-activation
+		// design depends on.
+		t.Fatalf("KeepAlive is a <%s>, want a dict: a bare <true/> also restarts the helper after a clean "+
+			"exit 0, which fights the idle-exit lifecycle socket activation needs", ka.kind)
 	}
 	se, ok := ka.dict["SuccessfulExit"]
 	if !ok || se.kind != "false" {
