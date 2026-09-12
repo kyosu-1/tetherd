@@ -226,7 +226,7 @@ design.md §9 のものに EC2 の読み取り 4 つを追加。
 - ALB はターゲットへの接続を keep-alive で使い回すので、振り分けは**リクエスト単位**。agent はセッションの有無にかかわらず常に HTTP/1.1 リバースプロキシ（`net/http` + `httputil.ReverseProxy`）。「素通し」= 全リクエストが app へ
 - ヘルスチェックはヘッダーが無いので常に app へ
 - WebSocket は upgrade を app にそのまま通す。steal はしない
-- ターゲットグループが gRPC / HTTP2 のものは対象外（`doctor` が検出）
+- ターゲットグループが gRPC / HTTP2 のものは対象外（agent は HTTP/1.1 サーバなので steal も素通しも成立しない。**検出する `doctor` の行はまだ無い** — §6.5）
 - `X-Forwarded-*`、`traceparent`、`X-Amzn-Trace-Id` は素通し
 
 ### 5.2 steal
