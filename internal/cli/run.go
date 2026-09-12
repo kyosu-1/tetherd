@@ -574,12 +574,14 @@ func discoverTasks(ctx context.Context, opts RunOptions, d Deps, logf func(strin
 // targetLine is the first line `tetherd run` prints: the service, and which
 // task or tasks it is attached to.
 //
-// The one-task form is byte-for-byte what it has always been - `tetherd
-// env`, `tetherd doctor` and the AWS e2e script all read it, and a pinned
-// `--task ID` is this form too. Two or more tasks name the primary, because
-// which task serves dial, DNS and the task environment is the difference
-// between "my DNS stopped working" being one task's problem or the whole
-// service's (spec §6.3, docs/design.md §5).
+// The one-task form is byte-for-byte what it has always been - it is what
+// `tetherd env` and `tetherd doctor` print through discoverTask, and a
+// pinned `--task ID` is this form too.
+//
+// Two or more tasks name the primary, because which task serves dial, DNS
+// and the task environment is the difference between "my DNS stopped
+// working" being one task's problem or the whole service's (spec §6.3,
+// docs/design.md §5).
 //
 // tasks must not be empty; every producer is a discovery call that reports
 // zero tasks as an error.
@@ -678,14 +680,20 @@ func (l *sessionLoss) watch(s *session.Client) {
 		<-s.Done()
 		l.mu.Lock()
 		l.live--
-		last := l.live == 0
-		l.mu.Unlock()
-		if last {
+		if l.live == 0 {
+			// Sent while the lock is still held, so that a watch()
+			// incrementing and draining cannot slip between this decision
+			// and the send and leave the report behind while a live
+			// session is attached - which would end the run in the middle
+			// of the deploy this whole change exists to survive. A
+			// non-blocking send on a buffered channel cannot block, so
+			// holding the lock across it cannot deadlock.
 			select {
 			case l.ch <- s.Err():
 			default:
 			}
 		}
+		l.mu.Unlock()
 	}()
 }
 
@@ -694,9 +702,11 @@ func (l *sessionLoss) watch(s *session.Client) {
 func (l *sessionLoss) lost() <-chan error { return l.ch }
 
 // followPollInterval is how often `tetherd run` re-reads the service's task
-// list. A var, not a const, only so a test can shorten it: 15 seconds is
-// the production value (see followInterval) and far too long to test
-// against.
+// list. A var, not a const, only so a test can pin it: production is
+// followInterval (10 seconds, spec §6.2), which is both far too long to
+// wait for in a test and - for a test about the sessions opened at startup
+// - short enough to let the follower satisfy the assertion instead, so
+// tests name the value they need in both directions.
 var followPollInterval = followInterval
 
 // Run connects to the agent, installs capture, runs the command and cleans
@@ -833,19 +843,27 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 		loss.watch(s)
 		set.Add(tk, s)
 	}
-	if set.Len() == 0 {
-		// Unchanged: no session at all is fatal, with the failure that
-		// caused it. The guard is for the one way that failure can be
-		// missing - every dial succeeded and the set took none of them,
-		// which needs discovery to have named the same task twice - because
-		// exiting 1 with nothing to read would be worse than a dull
-		// message.
+	// Primary(), not Len(): Len counts entries and Primary skips a session
+	// whose Done has fired, so a set holding nothing but dead sessions is
+	// non-empty and has no primary. That is reachable here without any
+	// follower - attaching two tasks takes an SSM forward and a handshake
+	// each, seconds during which a rolling deploy can stop the task the
+	// first session was opened to - and dereferencing the nil would panic
+	// where a developer should be told their deploy outran the attach.
+	primarySess := set.Primary()
+	if primarySess == nil {
+		// Unchanged for the case that has always existed (nothing
+		// attached): the failure that caused it. errEverySessionGone
+		// covers the two ways there can be no failure to report - every
+		// dial succeeded and every session then died, or the set took none
+		// of them - because exiting 1 with nothing to read would be worse
+		// than a dull message.
 		if firstDialErr == nil {
 			firstDialErr = errEverySessionGone
 		}
 		return 1, firstDialErr
 	}
-	w := set.Primary().Welcome()
+	w := primarySess.Welcome()
 	if err := checkTargetEnv(w, opts); err != nil {
 		return 1, err
 	}

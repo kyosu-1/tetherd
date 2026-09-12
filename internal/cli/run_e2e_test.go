@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2524,15 +2525,311 @@ func reachedWithin(d time.Duration, cond func() bool) bool {
 	return cond()
 }
 
-// shortenFollowInterval makes the task-list poll fast enough to test
-// against. Only the tests that are about following a deploy call it: the one
-// below is about the sessions opened at startup, and a fast poll would let a
-// run that attached to a single task look correct one interval later.
-func shortenFollowInterval(t *testing.T) {
+// pinFollowInterval fixes how often the run re-reads the task list, and
+// restores it when the test ends. Every test here that runs the follower
+// names a value, in one direction or the other, because the production
+// interval is wrong for both kinds of test: too long to wait for when the
+// follower is the thing under test, and short enough to *hide* a missing
+// startup attach when it is not.
+//
+// Measured, and the reason this is not a shortcut: with the production
+// interval (10s, spec §6.2) and a `tasks[:1]` mutation,
+// TestRunAttachesToEveryTaskSoStealCannotMissOne came out 5 FAIL / 3 ok
+// over 8 runs - the follower's first poll and the test's own 10s waits sit
+// on the same boundary, so the test was deciding a coin flip rather than
+// whether the startup attach covered every task.
+func pinFollowInterval(t *testing.T, d time.Duration) {
 	t.Helper()
 	restore := followPollInterval
-	followPollInterval = 20 * time.Millisecond
+	followPollInterval = d
 	t.Cleanup(func() { followPollInterval = restore })
+}
+
+// followNever is an interval no test can reach: a run under it attaches at
+// startup and never polls again, so an assertion that a task is attached
+// can only be satisfied by the attach the test is about.
+const followNever = time.Hour
+
+// followFast is for the tests that are about the poll itself.
+const followFast = 20 * time.Millisecond
+
+// stealingOpts is ssmOpts with steal on. Every test below that asks an
+// agent "is this developer attached to you?" uses it, for two reasons: a
+// session that takes requests is what these tests are actually about (the
+// ALB chooses which task a request lands on), and the agent's registry is
+// the steal routing table, so a session that declares no Incoming is not
+// something a test may assume appears in Sessions().
+//
+// Nothing has to listen on the local port: no request is sent, and
+// stealSettings only checks that the port is a port. The token is what makes
+// a session that takes requests legal at all.
+func stealingOpts(cmd ...string) RunOptions {
+	o := ssmOpts(cmd...)
+	o.NoIncoming = false
+	o.Token = "tok-tester"
+	return o
+}
+
+// --- sessionLoss, the "every session is gone" decision ---------------------
+//
+// The interleaving these two tests cannot reach is the one inside watch: a
+// report published between the decrement releasing the lock and the send.
+// That is why the send happens under the lock rather than after it, and it
+// needs a synchronisation hook in production code to exercise, which is not
+// worth having. What these do pin is the same invariant from the outside -
+// a report exists only while every watched session is dead - in the two
+// orderings a deploy actually produces.
+
+func TestSessionLossSaysNothingUntilTheLastSessionEnds(t *testing.T) {
+	// One of two sessions dying is a rolling deploy doing its job; the run
+	// must hear nothing about it.
+	ag1 := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	ag2 := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	l := newSessionLoss()
+	s1, s2 := dialInto(t, ag1, "one"), dialInto(t, ag2, "two")
+	l.watch(s1)
+	l.watch(s2)
+
+	s1.Close()
+	<-s1.Done()
+	if reachedWithin(300*time.Millisecond, func() bool { return len(l.ch) > 0 }) {
+		t.Fatal("one session of two ended and the run was told everything was gone")
+	}
+
+	s2.Close()
+	<-s2.Done()
+	if !reachedWithin(10*time.Second, func() bool { return len(l.ch) > 0 }) {
+		t.Fatal("every session ended and the run was never told")
+	}
+}
+
+func TestSessionLossForgetsItsReportWhenASessionComesBack(t *testing.T) {
+	// The last session died and the follower re-attached: the run reads
+	// that channel exactly once and ends on whatever it finds, so a report
+	// left over from before the re-attach would end a run that has a
+	// working session.
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	l := newSessionLoss()
+	s1 := dialInto(t, ag, "one")
+	l.watch(s1)
+	s1.Close()
+	// len, not a receive: the report has to still be there for the next
+	// step to mean anything.
+	waitFor(t, func() bool { return len(l.ch) > 0 }, "the report that every session has ended")
+
+	l.watch(dialInto(t, ag, "two"))
+	if len(l.ch) != 0 {
+		t.Fatal("the report survived a re-attach; the run would end while a live session is attached")
+	}
+}
+
+// deployingTransport dials each task's own agent, and on the dial after the
+// first one it hands control to the test: the test kills the session that
+// dial already produced, then lets this one fail. That is a rolling deploy
+// stopping the task a run has just attached to while the next forward is
+// still being set up - an SSM StartSession, a plugin launch and a handshake,
+// seconds on a real task.
+type deployingTransport struct {
+	mu      sync.Mutex
+	conns   []net.Conn
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (d *deployingTransport) Dial(ctx context.Context, t transport.Task) (net.Conn, error) {
+	d.mu.Lock()
+	first := len(d.conns) == 0
+	d.mu.Unlock()
+	if !first {
+		d.once.Do(func() { close(d.reached) })
+		<-d.release
+		return nil, errors.New("the task was stopped while its forward was being set up")
+	}
+	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", t.Addr)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	d.conns = append(d.conns, c)
+	d.mu.Unlock()
+	return c, nil
+}
+
+// breakFirst cuts the session the first dial produced.
+func (d *deployingTransport) breakFirst() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, c := range d.conns {
+		c.Close()
+	}
+}
+
+func TestRunFailsWhenEverySessionDiesDuringTheAttach(t *testing.T) {
+	// The set is not empty and yet has no live session: SessionSet.Primary
+	// skips a session whose Done has fired, so it answers nil while Len is
+	// still 1. A run that read its primary unchecked would panic on the nil
+	// exactly where the developer has to be told that their deploy outran
+	// the attach - and it needs no follower to get there, only the seconds
+	// two forwards take.
+	pinFollowInterval(t, followNever)
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	tr := &deployingTransport{reached: make(chan struct{}), release: make(chan struct{})}
+	p := &fakeProvider{region: "r", tasks: []transport.Task{
+		{ID: "older", StartedAt: time.Unix(1000, 0), Addr: ag.addr},
+		{ID: "newer", StartedAt: time.Unix(2000, 0), Addr: ag.addr},
+	}, tr: tr}
+
+	var out safeLog
+	done, _ := runWithCancel(t, stealingOpts("sleep", "30"), &out, depsFor(p))
+	select {
+	case <-tr.reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the second task was never dialed; this test proves nothing")
+	}
+	tr.breakFirst()
+	// The agent unregistering is the sequencing point: the session the run
+	// is holding is provably gone before the second dial is allowed to
+	// fail, so the set the run then reads holds one dead entry and nothing
+	// else.
+	waitFor(t, func() bool { return len(ag.a.Sessions()) == 0 }, "the first task's session to end")
+	close(tr.release)
+
+	select {
+	case r := <-done:
+		if r.code != 1 || r.err == nil {
+			t.Fatalf("a run with no live session must fail: code=%d err=%v\n%s", r.code, r.err, out.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never returned")
+	}
+	if strings.Contains(out.String(), "▶ ") {
+		t.Errorf("the child must not run with no live session:\n%s", out.String())
+	}
+}
+
+func TestTargetLine(t *testing.T) {
+	// Every byte of this line is read by someone: the one-task form is what
+	// `tetherd env` and `tetherd doctor` print, and the plural form is
+	// spec §6.3 / docs/design.md §5. The cases below pin the two forms, the
+	// two-space separators, the age clause and - the one a reader will not
+	// think of - that there is no age clause at all when the task has no
+	// StartedAt, which is every task that reached this line without a
+	// DescribeTasks behind it. Without that case, dropping the guard prints
+	// "(started 497006h23m0s ago)" and no test notices.
+	opts := RunOptions{Cluster: "tetherd-dev", Service: "api"}
+	started := time.Now().Add(-14 * time.Minute)
+	long, other, third := "fbc1abc4-1111", "a17e1234-2222", "c0ffee00-3333"
+	for _, tc := range []struct {
+		name  string
+		tasks []transport.Task
+		want  string
+	}{
+		{
+			name:  "one task, no start time",
+			tasks: []transport.Task{{ID: long}},
+			want:  "tetherd-dev/api  task fbc1abc4…",
+		},
+		{
+			name:  "one task",
+			tasks: []transport.Task{{ID: long, StartedAt: started}},
+			want:  "tetherd-dev/api  task fbc1abc4…  (started 14m0s ago)",
+		},
+		{
+			name: "two tasks",
+			tasks: []transport.Task{
+				{ID: long, StartedAt: started},
+				{ID: other, StartedAt: time.Now().Add(-time.Minute)},
+			},
+			want: "tetherd-dev/api  2 tasks (fbc1abc4… primary, a17e1234…)  (started 14m0s ago)",
+		},
+		{
+			name:  "two tasks, no start time",
+			tasks: []transport.Task{{ID: long}, {ID: other}},
+			want:  "tetherd-dev/api  2 tasks (fbc1abc4… primary, a17e1234…)",
+		},
+		{
+			name: "three tasks",
+			tasks: []transport.Task{
+				{ID: long, StartedAt: started},
+				{ID: other, StartedAt: time.Now().Add(-2 * time.Minute)},
+				{ID: third, StartedAt: time.Now().Add(-time.Minute)},
+			},
+			want: "tetherd-dev/api  3 tasks (fbc1abc4… primary, a17e1234…, c0ffee00…)  (started 14m0s ago)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := targetLine(opts, tc.tasks); got != tc.want {
+				t.Errorf("targetLine =\n  %q\nwant\n  %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// gatedProvider is a fakeProvider whose task-list reads after the first one
+// signal and then block until the test releases them, so a test can hold one
+// of the follower's polls open and ask what the run does about it.
+//
+// The first read is the run's own discovery (discoverTasks), which must not
+// be held or nothing would start.
+type gatedProvider struct {
+	*fakeProvider
+	calls   atomic.Int32
+	held    chan struct{} // closed when a poll is first being held
+	release chan struct{} // closed by the test
+	once    sync.Once
+}
+
+func newGatedProvider(p *fakeProvider) *gatedProvider {
+	return &gatedProvider{fakeProvider: p, held: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *gatedProvider) DiscoverAll(ctx context.Context, t ecsprov.Target) ([]transport.Task, error) {
+	if g.calls.Add(1) > 1 {
+		g.once.Do(func() { close(g.held) })
+		<-g.release
+	}
+	return g.fakeProvider.DiscoverAll(ctx, t)
+}
+
+func TestRunWaitsForTheTaskListPollItStarted(t *testing.T) {
+	// The follower's attach runs inside its poll, so a poll in flight when
+	// the run ends can open a session after the set has been closed: that
+	// session is never closed, the agent keeps this developer registered on
+	// a task nobody is using, and the next `tetherd run` is refused with
+	// duplicate_user. Run therefore waits for the poll it started.
+	//
+	// The gate holds a poll open and the assertion is that RunWithDeps has
+	// not returned while it is held.
+	pinFollowInterval(t, followFast)
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	g := newGatedProvider(&fakeProvider{region: "r", tasks: []transport.Task{
+		{ID: "older", StartedAt: time.Unix(1000, 0), Addr: ag.addr},
+	}})
+	d := Deps{NewAWSProvider: func(context.Context, RunOptions) (awsProvider, error) { return g, nil }}
+
+	var out safeLog
+	done, cancel := runWithCancel(t, ssmOpts("sleep", "30"), &out, d)
+	waitFor(t, func() bool { return strings.Contains(out.String(), "▶ ") }, "the child to start")
+	select {
+	case <-g.held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no poll was ever held; the follower is not reading the task list")
+	}
+
+	cancel()
+	select {
+	case r := <-done:
+		t.Fatalf("the run returned (code=%d err=%v) while a task-list poll was still in flight; the session that poll may be opening would be stranded at the agent\n%s", r.code, r.err, out.String())
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	close(g.release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never returned after the poll was released")
+	}
 }
 
 func TestRunAttachesToEveryTaskSoStealCannotMissOne(t *testing.T) {
@@ -2541,9 +2838,11 @@ func TestRunAttachesToEveryTaskSoStealCannotMissOne(t *testing.T) {
 	// the defect v0.3b exists to fix, so the assertion is the developer's
 	// own: a request arriving at *either* task reaches their process.
 	//
-	// The poll interval is left at its production value on purpose (see
-	// shortenFollowInterval): what has to work here is the attach at
-	// startup, not the follower catching up fifteen seconds later.
+	// The poll is pinned out of reach (see pinFollowInterval): what has to
+	// work here is the attach at startup, and with a reachable interval the
+	// follower catching up one poll later would satisfy every assertion
+	// below just as well.
+	pinFollowInterval(t, followNever)
 	port := localApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "LOCAL %s", r.URL.Path)
 	}))
@@ -2607,7 +2906,11 @@ func TestRunSurvivesASecondaryTaskGoingAway(t *testing.T) {
 	//
 	// The child ignores SIGINT and blocks until this test releases it, so
 	// whether the run ended is decided by files and by its result, not by a
-	// sleep race.
+	// sleep race. The poll is pinned out of reach for two reasons: the
+	// secondary must be attached by the startup attach for its loss to mean
+	// anything, and a follower that re-attached it would leave the run
+	// surviving for a reason this test is not about.
+	pinFollowInterval(t, followNever)
 	primary := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
 	secondary := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
 	tr := &breakableTransport{} // no addr: each task's own Addr is dialed
@@ -2627,7 +2930,7 @@ func TestRunSurvivesASecondaryTaskGoingAway(t *testing.T) {
 		"echo done > "+finished+"\n")
 
 	var out safeLog
-	done, _ := runWithCancel(t, ssmOpts("/bin/sh", script), &out, depsFor(p))
+	done, _ := runWithCancel(t, stealingOpts("/bin/sh", script), &out, depsFor(p))
 
 	waitFor(t, func() bool { return len(secondary.a.Sessions()) == 1 }, "the secondary task to be attached")
 	waitForFile(t, started)
@@ -2707,7 +3010,7 @@ func TestRunFollowsADeployByAttachingToANewTask(t *testing.T) {
 	// A deploy adds a task after the run started. The ALB will send it
 	// requests whether or not tetherd noticed, so the run has to attach to
 	// it while it is live - which is the follower, running inside Run.
-	shortenFollowInterval(t)
+	pinFollowInterval(t, followFast)
 	first := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
 	second := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
 	older := transport.Task{ID: "older", StartedAt: time.Unix(1000, 0), Addr: first.addr}
@@ -2715,7 +3018,7 @@ func TestRunFollowsADeployByAttachingToANewTask(t *testing.T) {
 	p := &fakeProvider{region: "r", tasks: []transport.Task{older}}
 
 	var out safeLog
-	done, cancel := runWithCancel(t, ssmOpts("sleep", "30"), &out, depsFor(p))
+	done, cancel := runWithCancel(t, stealingOpts("sleep", "30"), &out, depsFor(p))
 	waitFor(t, func() bool { return len(first.a.Sessions()) == 1 }, "the service's only task to be attached")
 
 	// The one-task status line is what `tetherd env`, `tetherd doctor` and
@@ -2742,14 +3045,14 @@ func TestRunPinnedToOneTaskAttachesToThatTaskOnly(t *testing.T) {
 	// --task ID is how a developer debugs one task of several - the point
 	// of it is that the other tasks are left alone, so neither the attach
 	// at startup nor the follower may reach them.
-	shortenFollowInterval(t)
+	pinFollowInterval(t, followFast)
 	pinned := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
 	other := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
 	p := &fakeProvider{region: "r", tasks: []transport.Task{
 		{ID: "older", StartedAt: time.Unix(1000, 0), Addr: other.addr},
 		{ID: "newer", StartedAt: time.Unix(2000, 0), Addr: pinned.addr},
 	}}
-	opts := ssmOpts("sleep", "30")
+	opts := stealingOpts("sleep", "30")
 	opts.TaskID = "newer"
 	var out safeLog
 	done, cancel := runWithCancel(t, opts, &out, depsFor(p))
@@ -2775,7 +3078,7 @@ func TestRunKeepsItsSessionsWhenTheTaskListCannotBeRead(t *testing.T) {
 	// instead of an error, which would detach from every task and end the
 	// run - so the warning line is asserted too, because its absence is
 	// what that mistake looks like from here.
-	shortenFollowInterval(t)
+	pinFollowInterval(t, followFast)
 	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
 	p := &fakeProvider{region: "r", tasks: []transport.Task{
 		{ID: "older", StartedAt: time.Unix(1000, 0), Addr: ag.addr},
@@ -2788,7 +3091,7 @@ func TestRunKeepsItsSessionsWhenTheTaskListCannotBeRead(t *testing.T) {
 		"echo done > "+finished+"\n")
 
 	var out safeLog
-	done, _ := runWithCancel(t, ssmOpts("/bin/sh", script), &out, depsFor(p))
+	done, _ := runWithCancel(t, stealingOpts("/bin/sh", script), &out, depsFor(p))
 	waitFor(t, func() bool { return len(ag.a.Sessions()) == 1 }, "the task to be attached")
 	waitForFile(t, started)
 
