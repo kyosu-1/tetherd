@@ -499,7 +499,11 @@ func taskRow(task transport.Task, taskErr, idErr error) doctor.Result {
 			Next:   "name the service to check (--cluster/--service, or target.cluster / target.service in .tetherd.yml)",
 		}
 	case idErr != nil:
-		return notChecked("attachable task", "the AWS identity above failed, so nothing could be asked of ECS")
+		// The identity row above already failed and already names the fix, so
+		// this row must not hand out ECS advice for what is an authentication
+		// problem. But ECS did answer, and saying "nothing could be asked"
+		// would be untrue - so carry what it said without advising on it.
+		return notChecked("attachable task", "the AWS identity above failed; ECS said: "+taskErr.Error())
 	default:
 		return doctor.CheckTask(task, taskErr)
 	}

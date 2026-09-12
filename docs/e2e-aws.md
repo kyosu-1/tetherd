@@ -38,7 +38,7 @@ v0.2b から、cluster / service / profile / region / env は `.tetherd.yml` か
 | 15 | `.tetherd.yml` の `service` を `nope` にして `./bin/tetherd doctor` | `✗ attachable task` に `no RUNNING tasks in service tetherd-dev/nope` が出て exit 1。他の行は出続ける | 1 つ失敗しても残りの検査が走る（1 問ずつ直して再実行させない） |
 | 16 | `.tetherd.yml` に `remote_services: [s3]` を足して `$RUN -- sh -c 'aws s3 ls && curl -s -o /dev/null -w "%{http_code}\n" https://example.com'` | `aws s3 ls` が成功し `example.com` も 200。`✓ network` 行に S3 の prefix が並ぶ（ap-northeast-1 では 15 件） | prefix list 由来の CIDR が捕捉範囲に入る。件数はリージョンごとに違い、API は 1 ページ 100 件で切るので、ページングしていなければ大きいリージョンで静かに取りこぼす。それ以外の宛先はラップトップから直接出る |
 | 17 | `ipconfig getifaddr en0` の /24 を `local_cidrs` に足して `$RUN -- true` と `./bin/tetherd doctor` | 起動時の重なり警告が消え、doctor の `local addresses` が `!` → `✓` | 分割による引き算（VPC /16 から自宅 /24 だけを抜く）が効いている |
-| 18 | `local_cidrs: [10.0.0.0/8]`（VPC を丸ごと消す）で `$RUN -- true` | `network.local_cidrs excludes the entire remote set` で exit 1 | 設定ミスで捕捉範囲が空になったら黙って起動しない。タスクロールのエンドポイントを足し戻して「1 件あるから OK」にしない |
+| 18 | `local_cidrs: [10.0.0.0/8]`（VPC を丸ごと消す）で `$RUN -- true` | `network.local_cidrs excludes the entire remote set` で exit 2（設定の誤りなので usage 扱い） | 設定ミスで捕捉範囲が空になったら黙って起動しない。タスクロールのエンドポイントを足し戻して「1 件あるから OK」にしない |
 | 19 | `$RUN -- python3 -c "import socket,time; t=time.time()\ntry: socket.gethostbyname('nope.myapp.internal')\nexcept socket.gaierror as e: print('gaierror in %.1fs' % (time.time()-t))"` | 1 秒未満で `gaierror` | 存在しない名前が NXDOMAIN として返る。SERVFAIL だと macOS がリトライして数秒待たされる |
 
 所要時間の目安: `StartSession` → `welcome` まで 2〜4 秒、psql の接続確立 +50〜100 ms。

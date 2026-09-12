@@ -434,6 +434,11 @@ func TestDoctorBlamesTheRightRowWhenCredentialsExpire(t *testing.T) {
 			if strings.Contains(task.next, "ECS Exec") || strings.Contains(task.next, "sidecar") {
 				t.Errorf("a credential failure must not send the developer to redeploy their ECS service: %q", task.next)
 			}
+			// ECS did answer, so the row must not claim nothing was asked -
+			// carry what it said, just without advising on it.
+			if !strings.Contains(task.detail, c.discEr.Error()) {
+				t.Errorf("attachable task detail = %q, want it to carry what ECS actually said (%q)", task.detail, c.discEr)
+			}
 		})
 	}
 }
