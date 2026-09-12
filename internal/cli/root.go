@@ -50,8 +50,10 @@ func newRunCommand() *cobra.Command {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.Command = args
-			if opts.User == "" {
-				opts.User = os.Getenv("USER")
+			// Fill in what the flags did not set: personal file, then the
+			// shared file, then the defaults already on the flags (spec §6.7).
+			if err := applyConfig(cmd, &opts); err != nil {
+				return err
 			}
 			code, err := runFn(opts)
 			if err != nil {
@@ -81,6 +83,7 @@ func newRunCommand() *cobra.Command {
 	f.StringVar(&opts.User, "user", "", "user name sent to the agent (default $USER)")
 	f.BoolVar(&opts.NoNetwork, "no-network", false, "do not capture traffic (only connect to the agent)")
 	f.BoolVar(&opts.NoEnv, "no-env", false, "do not inject the task's environment into the command")
+	f.StringVar(&configPath, "config", "", "path to .tetherd.yml (default: the nearest one above the working directory)")
 	return cmd
 }
 

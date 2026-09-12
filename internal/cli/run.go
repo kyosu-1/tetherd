@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -42,6 +43,13 @@ type RunOptions struct {
 	TaskID    string
 	TargetEnv string
 	NoEnv     bool
+
+	LocalCIDRs     []string
+	RemoteServices []string
+	RemoteDomains  []string
+	EnvOverride    map[string]string
+	EnvExclude     []string
+	ConfigPath     string // the .tetherd.yml read; shown in the status line
 }
 
 // ParseRemoteCIDRs parses IPv4 prefixes.
@@ -191,6 +199,9 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 	logf := func(format string, args ...any) { fmt.Fprintf(stderr, "tetherd  "+format+"\n", args...) }
 	if len(opts.Command) == 0 {
 		return 2, errors.New("no command given")
+	}
+	if opts.ConfigPath != "" {
+		logf("config     %s", opts.ConfigPath)
 	}
 	extra, err := ParseRemoteCIDRs(opts.RemoteCIDRs)
 	if err != nil {
@@ -351,10 +362,16 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 		child = exec.CommandContext(ctx, opts.ExecPath, append([]string{"--"}, opts.Command...)...)
 	}
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
-	mergeOpts := env.Options{DropAWSContainer: opts.NoNetwork}
+	override := maps.Clone(opts.EnvOverride)
+	for k, v := range overrideEnv {
+		if override == nil {
+			override = map[string]string{}
+		}
+		override[k] = v
+	}
+	mergeOpts := env.Options{DropAWSContainer: opts.NoNetwork, Exclude: opts.EnvExclude, Override: override}
 	if !opts.NoNetwork && taskRoleReachable(taskEnv, cidrs) {
 		mergeOpts.StripLocal = env.LocalAWSCredentialVars
-		mergeOpts.Override = overrideEnv
 		var found []string
 		for _, name := range env.LocalAWSCredentialVars {
 			if _, ok := os.LookupEnv(name); ok {
