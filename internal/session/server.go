@@ -73,6 +73,19 @@ type ServeOptions struct {
 	// take before serveStream gives up and answers with an error, so a
 	// handler that hangs cannot leak a stream forever. Default 5s.
 	ResolveTimeout time.Duration
+	// RefusalReadWait bounds how long a refused session waits for the
+	// client to read the refusal before the transport is torn down anyway
+	// (see refuse). Default 2s. It only has to cover the refusal's flight
+	// time plus one scheduling of the client's dialing goroutine, so it is
+	// far shorter than the 20s of silence ControlTimeout already tolerates
+	// while waiting for a hello - the same goroutine and the same conn,
+	// parked for the same kind of reason.
+	//
+	// An option rather than a package var so that a test can shorten or
+	// lengthen it without writing to state another test's Serve goroutine
+	// is still reading: measured, a var here is a data race between one
+	// test's pin and the previous test's refusal wait.
+	RefusalReadWait time.Duration
 }
 
 // Serve runs the agent side of one session until the client says bye, the
@@ -83,6 +96,9 @@ func Serve(ctx context.Context, conn net.Conn, h Handler, opts ServeOptions) err
 	}
 	if opts.ResolveTimeout == 0 {
 		opts.ResolveTimeout = 5 * time.Second
+	}
+	if opts.RefusalReadWait == 0 {
+		opts.RefusalReadWait = 2 * time.Second
 	}
 	cfg := yamux.DefaultConfig()
 	cfg.LogOutput = io.Discard
@@ -112,22 +128,20 @@ func Serve(ctx context.Context, conn net.Conn, h Handler, opts ServeOptions) err
 		return fmt.Errorf("session: read hello: %w", err)
 	}
 	if typ != proto.TypeHello {
-		enc.Encode(proto.TypeError, proto.Error{Code: proto.CodeBadHello, Message: "expected hello, got " + typ})
-		return errors.New("session: expected hello")
+		return refuse(control, enc, opts.RefusalReadWait, proto.Error{Code: proto.CodeBadHello, Message: "expected hello, got " + typ},
+			errors.New("session: expected hello"))
 	}
 	var hello proto.Hello
 	if err := proto.Unmarshal(raw, &hello); err != nil {
-		enc.Encode(proto.TypeError, proto.Error{Code: proto.CodeBadHello, Message: err.Error()})
-		return err
+		return refuse(control, enc, opts.RefusalReadWait, proto.Error{Code: proto.CodeBadHello, Message: err.Error()}, err)
 	}
 	if hello.Version != proto.Version {
-		enc.Encode(proto.TypeError, proto.Error{Code: proto.CodeVersionMismatch, Message: "agent speaks protocol " + proto.Version})
-		return errors.New("session: version mismatch")
+		return refuse(control, enc, opts.RefusalReadWait, proto.Error{Code: proto.CodeVersionMismatch, Message: "agent speaks protocol " + proto.Version},
+			errors.New("session: version mismatch"))
 	}
 	welcome, rej := h.Hello(hello, conn.RemoteAddr().String(), muxOpener{mux: mux})
 	if rej != nil {
-		enc.Encode(proto.TypeError, *rej)
-		return fmt.Errorf("session: rejected: %s", rej.Code)
+		return refuse(control, enc, opts.RefusalReadWait, *rej, fmt.Errorf("session: rejected: %s", rej.Code))
 	}
 	defer h.Closed()
 	if err := enc.Encode(proto.TypeWelcome, welcome); err != nil {
@@ -161,6 +175,50 @@ func Serve(ctx context.Context, conn net.Conn, h Handler, opts ServeOptions) err
 			return nil
 		}
 	}
+}
+
+// refuse writes the reason this session is being turned down and then waits
+// for the client to read it, because Serve's `defer mux.Close()` runs the
+// moment refuse returns and closing the transport under an unread refusal
+// is what loses it.
+//
+// What is lost is not the refusal frame. yamux delivers it and the client's
+// stream buffer keeps it across the teardown (measured: with the client's
+// read held back 20ms behind the close, 20 of 20 refusals still arrived).
+// What the close loses is the client's *hello write*. yamux reports a
+// write's success on one channel and the session's death on another, and
+// Dial's goroutine - which has been parked in that select since it queued
+// the hello - takes whichever is ready. A close that has already landed
+// makes it return ErrSessionShutdown for a write that in fact succeeded, so
+// session.Dial returns "session shutdown" and never reads the refusal
+// already sitting in its buffer. Measured on loopback TCP before this fix:
+// 2 to 5 of every 3000 refusals, every one of them at the hello write and
+// not one at the read of the refusal itself.
+//
+// That matters beyond the wire: run.go's duplicate_user retry is an
+// errors.As on *RejectedError, so a refusal arriving as a transport error
+// silently skips the whole of DefaultAttachRetryBudget, and a
+// protocol-version mismatch reaches `tetherd doctor`'s helper row as a
+// generic "session shutdown".
+//
+// The wait ends on the client, not on the clock: session.Dial closes the
+// mux the moment it decodes a TypeError, which closes the conn, which is
+// what makes this read fail. ctx cancellation ends it too, through the
+// goroutine Serve starts to close mux when ctx is done. wait is only the
+// backstop for a peer that reads the refusal and then sits there, or never
+// reads at all: nothing else in the session waits on this read - the
+// refusal is already on the wire, and a refused hello is never registered
+// (h.Closed is not deferred until after this point) - but it must not park
+// a goroutine and a conn on the agent indefinitely.
+func refuse(control net.Conn, enc *proto.Encoder, wait time.Duration, e proto.Error, err error) error {
+	if encErr := enc.Encode(proto.TypeError, e); encErr != nil {
+		// Nothing reached the client, so there is nothing to wait for.
+		return err
+	}
+	control.SetReadDeadline(time.Now().Add(wait))
+	var b [1]byte
+	control.Read(b[:]) // for the error: the client going away is the answer
+	return err
 }
 
 func serveStream(ctx context.Context, s net.Conn, h Handler, resolveTimeout time.Duration) {
