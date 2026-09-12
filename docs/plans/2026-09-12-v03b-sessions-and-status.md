@@ -941,7 +941,18 @@ Expected: PASS
 
 **Interfaces:**
 - Consumes: Task 1〜3 のすべて
-- Produces: なし（配線）
+- Produces:
+  ```go
+  // internal/cli/deps.go — awsProvider インターフェースに追加。
+  // sdkProvider と directProvider の両方に実装する。
+  //   DiscoverAll(ctx context.Context, t ecsprov.Target) ([]transport.Task, error)
+
+  // internal/cli/run.go — discoverTask の複数形。Task 5 の `status` も
+  // これを使う（自前でタスク探索を複製しないこと）。
+  func discoverTasks(ctx context.Context, opts RunOptions, d Deps, logf func(string, ...any)) (awsProvider, []transport.Task, error)
+  ```
+  `discoverTasks` は `ssm` で `prov.DiscoverAll` を呼び、`direct` では 1 件のスライスを返す。
+  `discoverTask`（単数）は**残す** — `env` と `doctor` が使っている。
 
 **やること**
 
