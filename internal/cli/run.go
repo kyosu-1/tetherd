@@ -16,6 +16,7 @@ import (
 
 	"github.com/kyosu-1/tetherd/internal/awsid"
 	"github.com/kyosu-1/tetherd/internal/capture"
+	"github.com/kyosu-1/tetherd/internal/dnsproxy"
 	"github.com/kyosu-1/tetherd/internal/env"
 	"github.com/kyosu-1/tetherd/internal/helper"
 	"github.com/kyosu-1/tetherd/internal/proto"
@@ -467,7 +468,26 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 				logf("✗ capture stopped: %v", err)
 			}
 		}()
-		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s", joinPrefixes(cidrs))
+
+		// DNS: names that only the VPC resolver knows (Cloud Map, private
+		// hosted zones). macOS routes them per-domain through
+		// /etc/resolver files that point at this loopback resolver, which
+		// forwards each question to the agent (spec §3.4).
+		dnsStatus := "local"
+		if len(opts.RemoteDomains) > 0 {
+			dsrv := &dnsproxy.Server{Resolve: sess.Resolve, Logf: logf}
+			daddr, err := dsrv.StartPreferring(ctx, dnsproxy.DefaultPort)
+			if err != nil {
+				return 1, fmt.Errorf("start the DNS resolver: %w", err)
+			}
+			defer dsrv.Close()
+			if err := hc.ResolverSet(opts.RemoteDomains, int(daddr.Port())); err != nil {
+				return 1, fmt.Errorf("point %s at the agent: %w", strings.Join(opts.RemoteDomains, ", "), err)
+			}
+			defer hc.ResolverClear()
+			dnsStatus = fmt.Sprintf("local (+ %s via the VPC resolver on 127.0.0.1:%d)", strings.Join(opts.RemoteDomains, ", "), daddr.Port())
+		}
+		logf("✓ network  transparent (pf rdr, gid tetherd) · remote: %s · DNS: %s", joinPrefixes(cidrs), dnsStatus)
 		if taskEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "" && !taskRoleReachable(taskEnv, cidrs) {
 			logf("⚠ iam      the task advertises a role but %s is not captured; the child keeps your own AWS credentials (with --transport direct, pass --remote-cidr %s and make sure network.local_cidrs does not exclude it)", ecsprov.TaskRoleCIDR, ecsprov.TaskRoleCIDR)
 		}

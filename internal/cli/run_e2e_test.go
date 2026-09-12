@@ -440,6 +440,67 @@ func TestRunWarnsWhenTheCredentialEndpointIsNotCaptured(t *testing.T) {
 	}
 }
 
+// TestRunPointsRemoteDomainsAtTheAgent pins the wiring in Run's transparent
+// branch: network.remote_domains must start a loopback DNS resolver, point
+// it at the agent's own Resolve, and hand the helper the domains and the
+// port it actually bound so /etc/resolver gets written - and the status
+// line must say what is routed there, since that line is the only thing an
+// operator sees this happened at all.
+func TestRunPointsRemoteDomainsAtTheAgent(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{
+		region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"},
+		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		agentAddr: ag.addr,
+	}
+	hcFake := &fakeHelperClient{}
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) { return hcFake, nil }
+	d.NewCapturer = func(HelperClient, func(string, ...any)) Capturer { return newFakeCapturer() }
+
+	opts := ssmOpts("true")
+	opts.NoNetwork = false
+	opts.ExecPath = "/usr/bin/true"
+	opts.RemoteDomains = []string{"myapp.internal"}
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if len(hcFake.domains) != 1 || hcFake.domains[0] != "myapp.internal" {
+		t.Fatalf("resolver.set was called with %v", hcFake.domains)
+	}
+	if !strings.Contains(out.String(), "myapp.internal via the VPC resolver") {
+		t.Errorf("the status line must say what is routed: %s", out.String())
+	}
+}
+
+// TestRunNoNetworkSkipsTheResolverEvenWithRemoteDomains pins that
+// --no-network must not touch the helper (and so not /etc/resolver) at all,
+// even when the config sets network.remote_domains: --no-network is the
+// escape hatch for "no privileged helper involved", and a resolver started
+// behind its back would both dial a helper it promised not to and leave a
+// stray listener nothing tells the operator about.
+func TestRunNoNetworkSkipsTheResolverEvenWithRemoteDomains(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"A": "1"}, nil, nil)
+	p := &fakeProvider{region: "r", task: transport.Task{ID: "t1", SubnetID: "subnet-a"}, agentAddr: ag.addr}
+	dialed := false
+	d := depsFor(p)
+	d.DialHelper = func(string) (HelperClient, error) {
+		dialed = true
+		return &fakeHelperClient{}, nil
+	}
+
+	opts := ssmOpts("true")
+	opts.RemoteDomains = []string{"myapp.internal"}
+	var out strings.Builder
+	if code, err := RunWithDeps(context.Background(), opts, &out, d); err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v log=%s", code, err, out.String())
+	}
+	if dialed {
+		t.Fatalf("--no-network must never dial the helper, even with remote_domains set")
+	}
+}
+
 // --- fakes for the helper and the capturer ---
 
 type fakeHelperClient struct {
