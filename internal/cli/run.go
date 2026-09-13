@@ -925,6 +925,11 @@ func RunWithDeps(ctx context.Context, opts RunOptions, stderr io.Writer, d Deps)
 	// steal roughly half of what the developer asked for and leave the
 	// rest at the deployed application, silently.
 	set := &SessionSet{Logf: logf}
+	// Test observability only, and nil in production; see
+	// Deps.ObserveSessionSet for why a test needs the set itself.
+	if d.ObserveSessionSet != nil {
+		d.ObserveSessionSet(set)
+	}
 	defer set.Close()
 	loss := newSessionLoss()
 	var firstDialErr error
