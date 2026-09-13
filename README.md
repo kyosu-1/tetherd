@@ -288,15 +288,18 @@ again the next time the helper starts.
   whatever a cask downloads, so the cask strips that attribute during install;
   a binary fetched from GitHub Releases by hand keeps it, and running tetherd
   that way is not supported.
-- **The root helper stays resident.** `sudo tetherd-helper install` registers a
-  LaunchDaemon that runs whether or not you are using tetherd. Having launchd
-  hold the socket and start the helper only on demand is the intended design
-  (spec §8) and is not implemented yet.
+- **A local process can make a root helper start.** The helper is no longer
+  resident - launchd holds its socket and starts it on the first connection,
+  and it exits about 30 seconds after the last one - but the socket is
+  world-writable, so any process on the machine can cause that start. It
+  cannot make the helper *do* anything: every request is checked against the
+  caller's identity, and the helper touches `pf` and `/etc/resolver` only for
+  a session it authorised. See the trust boundary below.
 
 ## Trust boundary
 
-Two things on your laptop are reachable by every local process during a
-session, not just the one tetherd started for you. First, the loopback
+Three things on your laptop are reachable by every local process, not just
+the one tetherd started for you. First, the loopback
 endpoint tetherd opens to hand your child process the task's IAM credentials
 is unauthenticated — its port changes every run and isn't advertised, but any
 process on the machine that finds it can request those credentials, with no
@@ -307,3 +310,11 @@ the task, so knowing (or guessing) a teammate's username alone gets you
 nothing. Treat the `token` field in `~/.tetherd/config.yml`, and anywhere you
 copy it to (a ModHeader profile, for instance), with the same care as a
 credential — for the duration of a live session, it functions as one.
+
+Third, the helper's socket at `/var/run/tetherd.sock` is world-writable and
+exists whether or not a helper is running, so any local process can connect
+and thereby cause launchd to start the helper as root. That is inherent to
+having launchd hold the socket, and it is the trade for not keeping a root
+process alive around the clock. What it buys an attacker is a process, not an
+action: the helper authorises each request against the calling user before it
+changes any `pf` or resolver state.
