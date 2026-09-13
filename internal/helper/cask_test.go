@@ -97,16 +97,19 @@ func TestCaskAgreesWithTheGoConstants(t *testing.T) {
 	if !strings.Contains(c.Caveats, "sudo tetherd-helper install") {
 		t.Errorf("caveats do not tell the user to run `sudo tetherd-helper install`:\n%s", c.Caveats)
 	}
-	// Without the plugin the SSM transport cannot open a session, so tetherd
-	// can do nothing at all. doctor has a row for it, but a row that tells
-	// you to install what the package was supposed to bring is a worse
-	// first run than one that never happens.
-	var deps []string
-	for _, d := range c.Dependencies {
-		deps = append(deps, d.Formula)
-	}
-	if len(deps) != 1 || deps[0] != "session-manager-plugin" {
-		t.Errorf("dependencies = %v, want exactly [session-manager-plugin]", deps)
+	// v0.4.0 declared `formula: session-manager-plugin` here and `brew
+	// install` failed: it is a cask, and `brew info --formula` says so. The
+	// old assertion read the value straight back out of the same YAML and
+	// passed, because nothing in it referred to Homebrew at all.
+	//
+	// It is now declared neither way. `depends_on` asks whether Homebrew
+	// installed something, while tetherd needs it on PATH, and AWS's own
+	// installer puts it at /usr/local/sessionmanagerplugin where Homebrew
+	// cannot see it - so the dependency would demand a duplicate copy from
+	// anyone who followed AWS's instructions. doctor's CheckPlugin measures
+	// PATH and prints the remedy.
+	if len(c.Dependencies) != 0 {
+		t.Errorf("dependencies = %+v, want none: see the comment above", c.Dependencies)
 	}
 }
 

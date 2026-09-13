@@ -79,6 +79,25 @@ v0.4 の主張は「tetherd が入っていない Mac で、`brew install` か�
 
 | # | コマンド | 期待 | 確認すること |
 |---|---|---|---|
+### v0.4 の実施結果（2026-09-13、v0.4.0 のリリース直後）
+
+`docs/uninstall.md` を実行して開発機を未インストール状態に戻したうえで実施。**戻ったことは実測で確認した**: `dscl . -read /Groups/tetherd` が `eDSRecordNotFound`、`/usr/local/libexec/tetherd` と plist が両方不在、`/etc/resolver/` 空、`netstat -rn | grep 169.254.170` が該当なし。`sudo ./bin/tetherd-helper uninstall` 1 コマンドで、これが `helper.Uninstall` の**史上初の実行**（4 段すべて、対象が無い `bootout` と plist 削除を成功として扱う経路を含めて通った）。
+
+| # | 結果 |
+|---|---|
+| 32 | **代替手段で通った。**`brew install kyosu-1/tap/tetherd` は**失敗する** — v0.4.0 の cask が `depends_on formula: ["session-manager-plugin"]` を宣言しているが、それは formula ではなく cask（`brew info --formula` が「Found a cask named ... instead」と答える）。公開済みの v0.4.0 アーカイブに、この依存だけ外した cask を一時ローカル tap 経由で当てて残りを検証した。3 本とも `/opt/homebrew/bin` に symlink、caveats も表示。**修正は v0.4.1 で配る** |
+| 33 | **通った。**`group tetherd: gid 309` / 両バイナリのコピー / plist / `launchd: bootstrapped system/dev.tetherd.helper, resident` が順に出た |
+| 34 | **通った**（`sudo launchctl print` は使わず、同じことを別経路で測った）。`ps` でデーモンは **uid 0 / ppid 1 / `/usr/local/libexec/tetherd/tetherd-helper`** から走っており、**Homebrew の prefix ではない**。`plutil -p` で plist の 7 キーを確認: `Label`、`ProgramArguments` の 4 パスすべてが `/usr/local/libexec/tetherd` 配下、`KeepAlive {SuccessfulExit: false}`、`RunAtLoad true`、`ThrottleInterval 10`、ログ 2 本。**`EvalSymlinks` の前提も実測で成立**: `/opt/homebrew/bin/tetherd-helper` → `Caskroom/tetherd/0.4.0/tetherd-helper` で `tetherd-exec` が同じディレクトリに実在した |
+| 35 | **通った。14 行すべて `✓`、exit 0。**`helper answered, protocol 2`。quarantine は `postflight` で除去済み（`xattr` に残るのは無害な `com.apple.provenance` のみ） |
+| 36 | **通った。**`aws sts get-caller-identity` が**タスクロール**の ARN（`assumed-role/tetherd-dev-api-task/4baaff64…`）を返した。helper ログに `pf enabled → pf applied for pid 77544 → pf cleared for pid 77544` の全ライフサイクル。終了後 `/etc/resolver/` は空、route の pin も無し。デーモンは常駐のまま（v0.4 の設計どおり） |
+| 37 | **未実施**（root が要る） |
+| 38 | **未実施**（v0.4.1 を real tap から入れ直すときに併せて実施する） |
+
+**この実施で見つかった欠陥 2 件:**
+
+1. **32 行のもの（修正済み）。** 上記。原因は計画に「`session-manager-plugin` は formula として実在する（`brew info` で確認済み）」と書いたこと。`brew info` は formula と cask を横断して解決するので、**主張した区別ができないコマンドで確認したことになっていた**。正解はリポジトリ内にあり、`internal/doctor/checks.go` は v0.2b から `brew install --cask session-manager-plugin` と書いていた。pin するはずの `cask_test.go` は `d.Formula` を同じ YAML から読み戻すだけで、Homebrew に言及していなかった
+2. **`postflight` は Homebrew 6.x で deprecated**（`Warning: Calling postflight is deprecated! Use postflight_steps instead.`）。GoReleaser のテンプレートが生成する部分なので設定から変えられない。現状は警告のみで**機能している**が、Homebrew が削除したら quarantine の除去が黙って止まる — cask を選んだ理由そのものなので持ち越し課題
+
 | 32 | `docs/uninstall.md` を全部実行して開発機を未インストール状態に戻す → `brew install kyosu-1/tap/tetherd` | `tetherd` / `tetherd-helper` / `tetherd-exec` の**3 本**が `PATH` に入る（`which -a` で 3 つとも Homebrew prefix 配下を指す） | リリースアーカイブの中身が `.goreleaser.yml` の `archives.ids`（`tetherd`, `tetherd-helper`, `tetherd-exec`）および cask の `binaries`（同じ 3 つ）と一致していること（spec §8「3 バイナリを prefix に置くだけ」）。`internal/helper`'s `TestCaskAgreesWithTheGoConstants` は `.goreleaser.yml` の記述しか見ないので、実際に配られたアーカイブの中身と一致するかはこの行でしか確認できない |
 | 33 | `sudo tetherd-helper install` | ログに `group tetherd: gid <n>`、`tetherd-helper: /usr/local/libexec/tetherd/tetherd-helper`、`tetherd-exec: ... (setgid tetherd)`、`plist: /Library/LaunchDaemons/dev.tetherd.helper.plist`、`launchd: bootstrapped ...` が出て（`cmd/tetherd-helper`の`doInstall`）、`/usr/local/libexec/tetherd/` に **2 本**（`tetherd-helper` と `tetherd-exec`）が入り、daemon が上がる | **`filepath.EvalSymlinks` が効いていること** — Homebrew は `tetherd-helper` を `bin` から staged path への symlink として置くので、`os.Executable()` の結果をそのまま使うと隣に `tetherd-exec` が見つからない（`cmd/tetherd-helper/main.go` の `doInstall`）。**シミュレーションでは検証できず、実機の brew install でしか分からない** |
 | 34 | `sudo launchctl print system/dev.tetherd.helper` | 走っている状態で表示される。起動コマンドが `/usr/local/libexec/tetherd/tetherd-helper --socket /var/run/tetherd.sock --exec-src /usr/local/libexec/tetherd/tetherd-exec --install-dir /usr/local/libexec/tetherd` を指す | **Homebrew の prefix（`/opt/homebrew/...` や `/usr/local/Cellar/...`）を指していないこと** — plist が指すのは `install` が作った root 所有のコピーで、Homebrew 側の `tetherd-helper` ではない（`internal/helper/daemon.go`: root の LaunchDaemon がユーザ書き込み可能なパスを起動しないための構成）。**`RunAtLoad: true` で常駐していること**（Ruling S。plist に `Sockets` が無いので `RunAtLoad` 以外に起動するものが無い）。ソケットアクティベーションを実装したら、この行の期待値（「常駐している」）は変わる |

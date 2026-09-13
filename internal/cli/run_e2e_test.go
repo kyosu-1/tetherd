@@ -2954,7 +2954,20 @@ func (d *deployingTransport) Dial(ctx context.Context, t transport.Task) (net.Co
 	d.mu.Unlock()
 	if !first {
 		d.once.Do(func() { close(d.reached) })
-		<-d.release
+		// ctx as well as release, because the real transport's Dial takes
+		// one and honours it. Without this arm a caller that fails before
+		// it releases the park - every t.Fatal in the test below - leaves
+		// Run's goroutine here for good, and runWithCancel's cleanup waits
+		// on that goroutine: the failure arrives as a ten-minute package
+		// timeout and a stack dump instead of the message the test wrote.
+		// Measured, because the obvious repair does not work: a t.Cleanup
+		// that closes release still timed out, since cleanups run LIFO and
+		// runWithCancel registers its wait after the test registers that.
+		select {
+		case <-d.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 		return nil, errors.New("the task was stopped while its forward was being set up")
 	}
 	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", t.Addr)
@@ -2992,48 +3005,60 @@ func TestRunFailsWhenEverySessionDiesDuringTheAttach(t *testing.T) {
 	}, tr: tr}
 
 	var out safeLog
-	done, _ := runWithCancel(t, stealingOpts("sleep", "30"), &out, depsFor(p))
+	// The run hands its own SessionSet over here, which is what lets the
+	// wait below be the predicate this test asserts on rather than a proxy
+	// for it (see Deps.ObserveSessionSet, and the comment on that wait). A
+	// channel rather than a variable because the set is built on the run's
+	// goroutine and read on this one.
+	sets := make(chan *SessionSet, 1)
+	deps := depsFor(p)
+	deps.ObserveSessionSet = func(s *SessionSet) { sets <- s }
+	done, _ := runWithCancel(t, stealingOpts("sleep", "30"), &out, deps)
+	var set *SessionSet
+	select {
+	case set = <-sets:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never published a session set; this test proves nothing")
+	}
 	select {
 	case <-tr.reached:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the second task was never dialed; this test proves nothing")
 	}
 	tr.breakFirst()
-	// This wait is not a sequencing point, and the comment that claimed it
-	// was is what this test's flakiness hid behind. It waits on the agent's
-	// session count while the assertion below is about the client's:
-	// Primary() skips a session whose Done has fired, Done belongs to
-	// session.Client, and follow.go:66-69 already says in those words that
-	// the agent's count answers a different question, because unregistering
-	// is asynchronous. breakFirst cuts the conn under both ends, so the
-	// agent can get there first, and the run then reads a set whose one
-	// entry nobody has yet declared dead.
+	// Wait on the predicate the assertion rests on, and on nothing that
+	// merely correlates with it. Run decides whether to start the child on
+	// set.Primary(); once this holds it cannot stop holding, because
+	// Primary() skips a session whose Done has fired and a closed Done
+	// never reopens, and nothing re-adds a session (the second dial is
+	// still parked in <-release and fails when it is let go). So the run's
+	// own read of Primary() below is ordered after this one by the set's
+	// mutex, and the child cannot start.
 	//
-	// Measured rather than reasoned about, and the condition is part of the
-	// measurement: 20 rounds of `-race -count=5` with this test alone, 0
-	// red; the same 20 rounds with sixteen more busy cores, 2 red - both at
-	// the assertion below, both with the child started. (The first row is
-	// not a quiet machine either: it had most of fifteen cores already
-	// spoken for. This test is a coin whose weighting is the machine's load,
-	// which is exactly what a scheduling race looks like from outside.)
+	// What this wait used to be, and why it is worth a comment this long:
+	// `len(ag.a.Sessions()) == 0`, the *agent's* session count, while the
+	// assertion is about the *client's* Done. follow.go:66-69 already says
+	// in those words that the two answer different questions, because
+	// unregistering is asynchronous - breakFirst cuts the conn under both
+	// ends, so the agent can reach zero while the client has not begun
+	// tearing down, and the run then reads a set whose one entry nobody
+	// has yet declared dead. Measured on that version, rounds of `-race
+	// -count=5`: this test alone 1 of 20 red at ambient load and 3 of 20
+	// with ten more busy cores; the whole package 1 of 20 under that same
+	// load. Every failure was the assertion below, with the child started.
 	//
-	// Waiting on the client instead does not fix it, which is the part
-	// worth leaving here. A conn wrapper recording session.Client's own
-	// teardown closing the mux - the last client-side event a test can see
-	// - still went 4 of 20 rounds red under that load. What is left is one
-	// goroutine: close(c.done) is the final statement of
-	// session.Client.finish, and every act of the client a test can observe
-	// (its reads, its writes, its Close, and so the agent's unregister)
-	// happens before it, so nothing outside the client can order itself
-	// after it. A 200ms sleep here goes to 0 of 20, which confirms that
-	// scheduling is all that remains - and a sleep is not a fix.
-	//
-	// Sound needs the predicate the assertion rests on: the run's own set,
-	// reachable from here, so that this wait is `set.Primary() == nil`.
-	// That is a real edge - Primary is mutex-guarded and a closed Done
-	// never reopens - and it is a field on Deps plus a line in run.go,
-	// neither of which is this file.
-	waitFor(t, func() bool { return len(ag.a.Sessions()) == 0 }, "the first task's session to end")
+	// Two things that look like fixes and are not, so nobody re-derives
+	// them. Waiting on the client's own teardown instead - a conn wrapper
+	// recording session.Client closing the mux, the last client-side event
+	// a wrapper can see - was measured at 4 of 20 by the investigation
+	// that found this, no better than the agent's count, and the reason is
+	// structural: close(c.done) is the final statement of
+	// session.Client.finish (client.go:322-330), so every act of the
+	// client a test can observe happens strictly before it and can be
+	// reordered against it. A 200ms sleep here reached 0 of 20, which only
+	// confirms that what remains is one unscheduled goroutine. A sleep is
+	// not a fix; reading the channel the assertion reads is.
+	waitFor(t, func() bool { return set.Primary() == nil }, "the run's set to have no live session")
 	close(tr.release)
 
 	select {

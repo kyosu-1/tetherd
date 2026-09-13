@@ -146,6 +146,23 @@ type Deps struct {
 	// fixed so that the test of the give-up path costs milliseconds
 	// instead of the whole budget.
 	AttachRetryBudget time.Duration
+
+	// ObserveSessionSet exists so that a test can get at the run's
+	// SessionSet. It is not a production feature: nothing in the CLI sets
+	// it, Run calls it once if it is non-nil and does nothing else with
+	// it, and the set it hands over is the run's own - a test that closed
+	// it would break the run.
+	//
+	// It is here because Run decides whether to start the child on
+	// set.Primary(), and no other signal a test can see says what
+	// Primary() will answer. Primary() skips a session whose Done has
+	// fired, Done is closed by session.Client as the last statement of its
+	// teardown, and every other observable - the agent's session count,
+	// the client's own conn closing - happens strictly before that close
+	// and so can be reordered against it by the scheduler. A test holding
+	// the set can wait on the predicate itself; see
+	// TestRunFailsWhenEverySessionDiesDuringTheAttach.
+	ObserveSessionSet func(*SessionSet)
 }
 
 func (d Deps) withDefaults() Deps {

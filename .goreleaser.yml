@@ -64,10 +64,24 @@ homebrew_casks:
       - tetherd
       - tetherd-helper
       - tetherd-exec
-    # Not optional: without the plugin the SSM transport cannot open a
-    # session, so tetherd can do nothing at all.
-    dependencies:
-      - formula: session-manager-plugin
+    # No `depends_on` for session-manager-plugin, deliberately. Two reasons,
+    # both measured on a real machine:
+    #
+    #  - It is a **cask**, not a formula: `brew info --formula
+    #    session-manager-plugin` answers "No available formula with the name
+    #    ... Found a cask named ... instead". v0.4.0 shipped
+    #    `dependencies: [formula: session-manager-plugin]` and `brew install`
+    #    of this cask therefore failed outright.
+    #  - `depends_on` asks "did Homebrew install it?", but what tetherd needs
+    #    is "is it on PATH?". AWS documents its own installer, which puts it
+    #    at /usr/local/sessionmanagerplugin with a symlink in
+    #    /usr/local/bin - invisible to Homebrew. Declaring the dependency
+    #    would demand a second, brew-managed copy from everyone who followed
+    #    AWS's own instructions.
+    #
+    # internal/doctor's CheckPlugin measures the condition that actually
+    # matters (LookPath) and already prints the right remedy,
+    # `brew install --cask session-manager-plugin`.
     hooks:
       post:
         install: |
@@ -89,6 +103,11 @@ homebrew_casks:
       tetherd needs a root helper for pf, /etc/resolver and the tetherd group:
 
         sudo tetherd-helper install
+
+      Then run `tetherd doctor`. It checks everything else this needs,
+      including the SSM session-manager-plugin, which is not installed as a
+      dependency because AWS's own installer puts it somewhere Homebrew
+      cannot see.
 
       Run that again after every upgrade - it reinstalls both binaries into a
       root-owned directory and restarts the daemon.
