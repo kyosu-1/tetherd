@@ -12,6 +12,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.78.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.50.0
 	github.com/aws/smithy-go v1.28.1
+	github.com/ebitengine/purego v0.10.0
 	github.com/hashicorp/yamux v0.1.2
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/miekg/dns v1.1.73
