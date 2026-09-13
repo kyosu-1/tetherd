@@ -47,7 +47,7 @@ changelog:
 # homebrew_casks, not homebrew_formulae: a formula cannot strip the quarantine
 # attribute Homebrew puts on what it downloads (Library/Homebrew/cask/
 # download.rb quarantines every cask download), and these binaries are neither
-# signed nor notarized. A cask can, in a postflight hook.
+# signed nor notarized. A cask can, in postflight_steps.
 homebrew_casks:
   - repository:
       owner: kyosu-1
@@ -82,10 +82,44 @@ homebrew_casks:
     # internal/doctor's CheckPlugin measures the condition that actually
     # matters (LookPath) and already prints the right remedy,
     # `brew install --cask session-manager-plugin`.
-    hooks:
-      post:
-        install: |
-          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", staged_path]
+
+    # THE QUARANTINE STRIP. This is the reason the package is a cask.
+    #
+    # It is written as a `custom_block`, not as `hooks.post.install`, because
+    # `hooks.post.install` is the only thing in GoReleaser's cask template
+    # that emits `postflight do`, and `postflight` is deprecated:
+    # Library/Homebrew/cask/dsl.rb calls
+    # odeprecated on the dsl_key for all four flight stanzas, replacement
+    # `<key>_steps`. `odeprecated` defaults to `disable_for_developers: true`
+    # and then does `disable = true if ... Homebrew::EnvConfig.developer?` and
+    # `raise MethodDeprecatedError` - so with HOMEBREW_DEVELOPER set this is
+    # not a warning, it is a failure. Measured on Homebrew 7.0.0:
+    # `HOMEBREW_DEVELOPER=1 brew info --cask kyosu-1/tap/tetherd` exits 1 with
+    # MethodDeprecatedError, while the same command without it only warns.
+    # GoReleaser v2.18.1's template (and its main branch) has no
+    # `postflight_steps`, so the workaround is ours.
+    #
+    # `custom_block` is rendered immediately after `cask "tetherd" do`, which
+    # puts this before `version` rather than in Cask-Cookbook stanza order.
+    # That is the only placement GoReleaser offers and Homebrew evaluates the
+    # DSL in file order, so it works.
+    #
+    # `{{"{{"}}staged_path}}`, not `staged_path`: the block passed to
+    # `postflight_steps` is `instance_eval`d against
+    # Homebrew::InstallSteps::DSL, not against the cask DSL, so a bare
+    # `staged_path` raises NameError (measured). Install steps take the path
+    # as one of install_steps.rb's template tokens instead -
+    # `staged_path` is in its ABSOLUTE_TEMPLATE_TOKENS and
+    # CONTENT_PATH_TOKENS - and `run` expands tokens in `args`
+    # (`run_serialised_command` maps `expand_template_tokens` over them).
+    # The `{{"{{"}}` is a Go-template escape: GoReleaser runs its own
+    # templater over the *whole* generated cask (cask.go's
+    # `tmpl.New(ctx).Apply(out.String())`), so a literal `{{` here would be
+    # parsed as a GoReleaser action and fail the release.
+    custom_block: |
+      postflight_steps do
+        run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{"{{"}}staged_path}}"]
+      end
     # These two paths are the one duplication the design cannot remove: a cask
     # is configuration and cannot read helper.DaemonLabel or
     # helper.ExecInstallDir. internal/helper's TestCaskAgreesWithTheGoConstants
