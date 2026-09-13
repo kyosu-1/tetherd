@@ -545,6 +545,35 @@ design.md §10 に加えて:
 
 ## 12. 先に潰す検証（順序つき）
 
+### v0.5.0 の実機検証（2026-09-13）
+
+**ソケットアクティベーションが実機で成立した。**この節の主張のうち唯一 man page を読んだだけだったもの（`KeepAlive` が `RunAtLoad` を含意するので plist ロードごとに 1 回起動し、それをアイドル終了が閉じる）も裏付けられた。
+
+helper のログが完全なサイクルを残している:
+
+```
+22:58:16 serving the socket launchd handed over as "Listeners"; exiting after 30s with no connection
+22:58:46 no connection for 30s; exiting     ← install 直後の投機的起動が自分で閉じた
+22:59:02 serving the socket launchd handed over as "Listeners"   ← doctor の接続で起動
+22:59:32 no connection for 30s; exiting
+```
+
+`ps` を 5 秒間隔でサンプリングして遷移も捉えた: `22:59:28 helper=1` → `22:59:33 helper=0`。
+
+| 検証した主張 | 結果 |
+|---|---|
+| launchd が `Sockets` を honour し、`launch_activate_socket()` が `purego` 経由で fd を受け取る | **成立**（ログの `serving the socket launchd handed over as "Listeners"`） |
+| `RunAtLoad` を消しても `KeepAlive` の含意で 1 回起動し、アイドル終了が閉じる | **成立**（22:58:16 の起動は誰も接続していない。30 秒ちょうどで終了）。**これが「アイドル中は root が居ない、ただしロードごとに 1 窓」という narrow な主張の根拠** |
+| 接続で起動する | **成立**（`doctor` が `✓ helper answered, protocol 2`） |
+| アイドルで消える | **成立**。30 秒きっかり、2 回とも |
+| ソケットは helper 無しでも存在する | **成立**（`srw-rw-rw- root /var/run/tetherd.sock` が helper ゼロの状態で） |
+| plist の内容 | `Sockets`（`SockPathName` + `SockPathMode: 438`）、`RunAtLoad` 無し、`KeepAlive {SuccessfulExit: false}`、`ThrottleInterval 10` |
+| `/var/run/tetherd-helper.lock` | 作られる（`rw------- root`） |
+
+**この時点で dev 環境は destroy 済み**なので `doctor` の AWS 行は落ちるが、**この検証は AWS を必要としない** — helper 行が `✓` になることが「接続で起動した」証拠である。
+
+**未検証のまま残るもの:** `HOMEBREW_DEVELOPER=1` での `brew install` は cask を読む段階（`brew info`）までは確認済みだが、**インストール自体は v0.5.0 の cask では実行していない**（このマシンは `brew upgrade` で入れた）。
+
 ### v0.4 の実機検証（2026-09-13）
 
 **配布経路が他人の Mac で成立することを確認した。**`docs/e2e-aws.md` の 32〜38 行、リリース v0.4.0 と v0.4.1 に対して実施。
