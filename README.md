@@ -130,26 +130,24 @@ forward, so there is no VPN, no inbound port on the task, and no
 security-group change beyond the ALB's target port.
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph mac["Your Mac"]
     child["your command<br/>(gid tetherd)"]
-    cli["tetherd"]
     helper["tetherd-helper<br/>(root)"]
+    cli["tetherd"]
   end
   ssm(["AWS SSM"])
+  alb(["ALB"])
   subgraph task["ECS task (one network namespace)"]
-    ssmagent["ssm-agent<br/>(ECS Exec)"]
-    agent["tetherd-agent<br/>:9900 control, loopback only<br/>:8080 behind the ALB"]
+    agent["tetherd-agent<br/>:9900 control (loopback)<br/>:8080 behind the ALB"]
     app["app<br/>:8081"]
   end
-  alb(["ALB"])
   vpc[("RDS, Cloud Map,<br/>anything in the VPC")]
 
   child -- "VPC-bound TCP,<br/>redirected by pf" --> cli
-  cli -- "pf rules, /etc/resolver,<br/>natlook" --> helper
+  helper -- "pf rules, /etc/resolver,<br/>natlook" --- cli
   cli <== "one TCP connection,<br/>multiplexed with yamux" ==> ssm
-  ssm <==> ssmagent
-  ssmagent -- "127.0.0.1:9900" --> agent
+  ssm <== "ECS Exec's ssm-agent,<br/>to 127.0.0.1:9900" ==> agent
   alb --> agent
   agent -- "every request<br/>nobody claimed" --> app
   agent -- "dials from<br/>the task's ENI" --> vpc
