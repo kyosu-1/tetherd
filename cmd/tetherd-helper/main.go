@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -12,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/kyosu-1/tetherd/internal/helper"
 	"github.com/kyosu-1/tetherd/internal/version"
@@ -54,7 +56,7 @@ func refuseUnusableFlags(sub string, usable ...string) {
 		}
 	})
 	if len(bad) > 0 {
-		log.Fatalf("%s cannot act on %s; it takes --%s (the rest apply to the resident daemon)",
+		log.Fatalf("%s cannot act on %s; it takes --%s (the rest apply to the daemon launchd starts)",
 			sub, strings.Join(bad, ", "), strings.Join(usable, ", --"))
 	}
 }
@@ -81,7 +83,7 @@ func doInstall(p helper.Paths) {
 	log.Printf("%s: %s", helper.HelperName, res.HelperPath)
 	log.Printf("%s: %s (setgid %s)", helper.ExecName, res.ExecPath, helper.GroupName)
 	log.Printf("plist: %s", res.PlistPath)
-	log.Printf("launchd: bootstrapped system/%s, resident, logging to %s", helper.DaemonLabel, p.LogPath)
+	log.Printf("launchd: bootstrapped system/%s; it holds %s and starts the helper on the first connection, logging to %s", helper.DaemonLabel, p.Socket, p.LogPath)
 	log.Printf("run this again after every `brew upgrade tetherd`; then: tetherd doctor")
 }
 
@@ -118,8 +120,8 @@ func main() {
 		log.Fatal("must run as root (sudo tetherd-helper, or via launchd)")
 	}
 
-	// install and uninstall are one-shot; no arguments means the resident
-	// daemon, which is what launchd starts from the plist install writes.
+	// install and uninstall are one-shot; no arguments means the daemon,
+	// which is what launchd starts from the plist install writes.
 	switch sub := flag.Arg(0); sub {
 	case "install":
 		refuseUnusableFlags(sub, "socket", "install-dir")
@@ -132,6 +134,18 @@ func main() {
 	case "":
 	default:
 		log.Fatalf("unknown subcommand %q (want install, uninstall or version)", sub)
+	}
+
+	// The descriptor launchd is holding, before the slower startup work: it
+	// decides whether this process may bind *socket at all, and under
+	// activation a client is already waiting on the far end of it.
+	inherited, err := helper.InheritedListener(helper.LaunchdActivator, helper.ActivationSocketName)
+	if err != nil {
+		// Not a fallback to binding our own: the errors that mean "launchd
+		// is holding nothing" are already reported as no listener, so
+		// anything left is a real failure, and binding here would replace
+		// the socket launchd is watching with one it is not.
+		log.Fatalf("launchd socket activation: %v", err)
 	}
 
 	gid, err := helper.EnsureGroup(runCmd, helper.GroupName)
@@ -160,12 +174,72 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	log.Printf("listening on %s", *socket)
-	err = srv.ListenAndServe(ctx, *socket)
-	if serr := platform.Shutdown(); serr != nil {
-		log.Printf("shutdown: %v", serr)
+	d := daemon{
+		platform:  platform,
+		srv:       srv,
+		inherited: inherited,
+		socket:    *socket,
+		idle:      helper.DefaultIdleTimeout,
+		logf:      log.Printf,
+	}
+	os.Exit(d.run(ctx))
+}
+
+// daemon is the long-running path: what launchd starts on the first
+// connection, and what `sudo tetherd-helper` with no subcommand runs in the
+// foreground.
+//
+// It is a struct with a run method rather than the tail of main so that the
+// two things the plist depends on - which listener is served, and what exit
+// code each ending produces - can be asserted without root and without
+// launchd.
+type daemon struct {
+	platform platform
+	srv      *helper.Server
+	// inherited is the listener launchd handed over, or nil when launchd
+	// handed over none and the socket has to be bound here.
+	inherited net.Listener
+	socket    string
+	// idle is how long the activated helper stays up with no connection
+	// open. It is applied only to the inherited listener: on the foreground
+	// path nothing would start the helper again, and hack/e2e-local.sh has
+	// expected its `sudo tetherd-helper` to stay up since v0.2b.
+	idle time.Duration
+	logf func(string, ...any)
+}
+
+// run serves until ctx is cancelled or the helper goes idle, cleans the
+// machine up, and returns the process's exit code.
+//
+// The exit code is one half of the plist's KeepAlive contract. `man
+// launchd.plist` (Darwin 25.6.0), SuccessfulExit false: "the job will be
+// restarted in the inverse condition", i.e. after a non-zero exit. So the
+// idle exit has to be 0 - at 1, launchd would restart the helper every
+// ThrottleInterval and it would be resident again, on a 10-second cycle of
+// sweeping and exiting.
+func (d daemon) run(ctx context.Context) int {
+	var err error
+	if d.inherited != nil {
+		d.srv.IdleTimeout = d.idle
+		d.logf("serving the socket launchd handed over as %q; exiting after %s with no connection", helper.ActivationSocketName, d.idle)
+		err = d.srv.Serve(ctx, d.inherited)
+	} else {
+		// Only here, and never when a listener was inherited: launchd owns
+		// the path and ListenAndServe would unlink it, leaving this
+		// process serving a socket launchd is not watching.
+		d.logf("listening on %s", d.socket)
+		err = d.srv.ListenAndServe(ctx, d.socket)
+	}
+	// Every ending, the idle one included: pf, /etc/resolver and the pinned
+	// host route are the state that outlives this process, and under
+	// activation the idle exit is now the *usual* ending rather than a
+	// shutdown nobody sees.
+	if serr := d.platform.Shutdown(); serr != nil {
+		d.logf("shutdown: %v", serr)
 	}
 	if err != nil {
-		log.Fatalf("serve: %v", err)
+		d.logf("serve: %v", err)
+		return 1
 	}
+	return 0
 }

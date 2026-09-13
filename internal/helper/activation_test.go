@@ -11,36 +11,30 @@ import (
 	"testing"
 )
 
-// nextHandOver is the next descriptor number handOverFD will use.
+// handOverFD copies fd into a plain int descriptor, which is the ownership
+// launchd's descriptors actually have: InheritedListener closes what it is
+// handed, so nothing else may own it.
 //
-// Deliberately far above anything a test binary reaches. Two things go wrong
-// with a low number, and this file shipped both of them:
+// An os.File will not do, and this file shipped the reason. os.File closes
+// its descriptor both from Close and from a finalizer, so handing over
+// int(f.Fd()) and then closing f - or simply dropping f and letting the
+// garbage collector reach it - closes a *number* that the code under test
+// already closed. The kernel hands out the lowest free number, so by then
+// it belongs to something else: TestApplyAndDisconnectClears and
+// TestResolverNeedsPfNotJustAPinnedRoute, neither of which touches socket
+// activation, lost the socket under a live client and sat out the client's
+// 10-second call timeout in two runs out of five.
 //
-//   - "is the handed-over descriptor closed now?" is unanswerable about a
-//     low number. The kernel hands out the lowest free descriptor, so
-//     net.FileListener's own dup(2) lands on exactly the number that was
-//     just freed, and a closed descriptor reads as open.
-//   - Worse, a descriptor closed by the code under test and then closed
-//     again by a t.Cleanup closes whatever the runtime has since put on
-//     that number. That is what made tests elsewhere in this package fail:
-//     TestApplyAndDisconnectClears and TestResolverNeedsPfNotJustAPinnedRoute
-//     lost the socket under a live client and sat out the client's
-//     10-second call timeout, in two runs out of five, with nothing in
-//     either test touching socket activation. Measured by bisecting to the
-//     commit that added this file.
-var nextHandOver = 300
-
-// handOverFD copies fd to a high, fixed number and returns it as a plain
-// int: a raw descriptor has no os.File finalizer behind it, so the only
-// close is the one the code under test performs, which is the ownership
-// launchd's descriptors actually have.
+// syscall.Dup and not syscall.Dup2: Dup2 does not exist on linux/arm64, and
+// `GOOS=linux go vet ./...` has to stay clean because the agent is a Linux
+// binary.
 func handOverFD(t *testing.T, fd int) int {
 	t.Helper()
-	nextHandOver++
-	if err := syscall.Dup2(fd, nextHandOver); err != nil {
-		t.Fatalf("dup2 %d -> %d: %v", fd, nextHandOver, err)
+	dup, err := syscall.Dup(fd)
+	if err != nil {
+		t.Fatalf("dup %d: %v", fd, err)
 	}
-	return nextHandOver
+	return dup
 }
 
 // unixListenerFD returns a listening UNIX socket's descriptor, standing in
@@ -75,6 +69,11 @@ func unixListenerFD(t *testing.T) (fd int, path string) {
 }
 
 // fdIsOpen reports whether fd is still a descriptor of this process.
+//
+// Sound here because InheritedListener dups before it closes: the listener's
+// own descriptor is allocated while ours is still open, so it cannot be the
+// number ours is freed from, and nothing between that close and this call
+// allocates one.
 func fdIsOpen(fd int) bool {
 	var st syscall.Stat_t
 	return syscall.Fstat(fd, &st) == nil
