@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -219,5 +220,68 @@ func TestDaemonExitsOneWhenItCannotServeAtAll(t *testing.T) {
 	}
 	if got := fm.shutdownCount(); got != 1 {
 		t.Errorf("Shutdown ran %d times, want 1 even on the failure path", got)
+	}
+}
+
+// --- the startup sweep's lock ---------------------------------------------
+
+// ClearLeftovers is machine-global, and under socket activation the helper
+// starts whenever a tetherd command connects rather than once per boot. The
+// lock is what stops a cold start from flushing the pf anchor, deleting the
+// /etc/resolver files and removing the pinned route of a session another
+// helper - hack/e2e-local.sh's foreground one, on its own socket - is in the
+// middle of serving.
+func TestTakeSweepLockLetsOnlyTheFirstHelperSweep(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lock")
+
+	first, maySweep, err := takeSweepLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !maySweep {
+		t.Fatal("the first helper on the machine may not sweep; a leftover pin on 169.254.170.2 would stay and every AWS SDK on the machine would hang on the credential endpoint")
+	}
+
+	// A second helper, while the first is still serving.
+	second, maySweep, err := takeSweepLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if maySweep {
+		t.Fatal("a helper that started while another one holds the lock was allowed to sweep; it would destroy the running session's pf rules, resolver files and pinned route with no error at either end")
+	}
+	second.Close()
+
+	// The kernel releases the lock when a helper dies, which is precisely
+	// the case the sweep exists for: a SIGKILLed helper holds no lock, so
+	// the next one does sweep.
+	first.Close()
+	third, maySweep, err := takeSweepLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer third.Close()
+	if !maySweep {
+		t.Fatal("no helper holds the lock any more, but the sweep was still skipped: leftovers from a killed helper would never be cleaned")
+	}
+}
+
+// The shared lock has to outlive takeSweepLock, and it is held by the
+// descriptor rather than by any bookkeeping - so a helper that keeps the
+// file keeps the lock.
+func TestTakeSweepLockIsHeldByTheDescriptorItReturns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lock")
+	f, _, err := takeSweepLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	probe, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Close()
+	if err := syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+		t.Fatal("an exclusive lock succeeded while the helper's descriptor is open, so nothing is holding the shared lock")
 	}
 }

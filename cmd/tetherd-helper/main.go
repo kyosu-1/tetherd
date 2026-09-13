@@ -164,11 +164,28 @@ func main() {
 	log.Printf("group %s gid=%d, %s installed at %s", helper.GroupName, gid, helper.ExecName, execPath)
 
 	platform := newPlatform(*resolver, log.Printf)
-	// Not Shutdown: a helper that was killed rather than stopped left pf,
-	// /etc/resolver and a pinned host route behind, and the route is the one
-	// piece that cannot be found from this process's own state.
-	if err := platform.ClearLeftovers(); err != nil {
-		log.Printf("startup cleanup: %v", err)
+	// The assignment to the package-level sweepLockFile is what keeps the
+	// lock: see its comment.
+	var sweep bool
+	sweepLockFile, sweep, err = takeSweepLock(sweepLockPath)
+	if err != nil {
+		// The lock is an improvement on v0.4's unconditional sweep, not a
+		// safety gate, so a machine where it cannot be taken keeps v0.4's
+		// behaviour rather than skipping the cleanup that stops a leftover
+		// pin from black-holing the credential endpoint.
+		log.Printf("startup cleanup: %s: %v; sweeping anyway", sweepLockPath, err)
+		sweep = true
+	}
+	if sweep {
+		// Not Shutdown: a helper that was killed rather than stopped left
+		// pf, /etc/resolver and a pinned host route behind, and the route
+		// is the one piece that cannot be found from this process's own
+		// state.
+		if err := platform.ClearLeftovers(); err != nil {
+			log.Printf("startup cleanup: %v", err)
+		}
+	} else {
+		log.Printf("startup cleanup: skipped, another tetherd-helper is running; what is on this machine is its session, not a leftover")
 	}
 	srv := &helper.Server{Platform: platform, Allow: helper.AllowAdmin, Logf: log.Printf}
 
@@ -242,4 +259,69 @@ func (d daemon) run(ctx context.Context) int {
 		return 1
 	}
 	return 0
+}
+
+// sweepLockPath is where the startup sweep takes its lock. /var/run, beside
+// the socket and the route pin file, and root-only: every helper runs as
+// root.
+const sweepLockPath = "/var/run/tetherd-helper.lock"
+
+// sweepLockFile holds takeSweepLock's descriptor for the life of the
+// process on purpose, and is a package-level variable rather than a local
+// for the same reason: os.File carries a finalizer that closes the
+// descriptor, closing it releases the flock, and a local that nothing
+// references after its last use is eligible for that finalizer - which would
+// silently let a later helper sweep this one's live session away.
+var sweepLockFile *os.File
+
+// takeSweepLock reports whether this helper may run the startup sweep, and
+// takes a shared lock that it keeps for the rest of the process's life.
+//
+// Why there is a lock at all. ClearLeftovers is machine-global: it flushes
+// the pf anchor, removes every "# managed by tetherd" file in /etc/resolver,
+// and deletes every host route recorded in the pin file. Under v0.4's
+// resident daemon that ran once per boot. Under socket activation the helper
+// starts whenever a tetherd command connects, so an unconditional sweep runs
+// while another helper - the foreground `sudo tetherd-helper` that
+// hack/e2e-local.sh starts on its own socket - is in the middle of a
+// session, and takes that session's capture down with no error at either
+// end: the rules are gone, the /etc/resolver files are gone, the credential
+// endpoint's pin is gone, and the pin record is truncated so even a later
+// recovery cannot find what was lost. Running `tetherd doctor` in a second
+// terminal is enough to trigger it. This did not exist while the daemon was
+// resident, because a resident daemon never starts twice.
+//
+// Why flock(2): the kernel releases it when the process dies, which is
+// exactly the case the sweep exists for. A helper that was SIGKILLed holds
+// no lock, so the next one does sweep.
+//
+// Measured on Darwin 25.6.0 with a throwaway program: LOCK_EX|LOCK_NB fails
+// with EWOULDBLOCK while any other descriptor holds LOCK_SH - another
+// process's or another descriptor of the same file in this one - and a
+// descriptor that holds LOCK_EX can be downgraded to LOCK_SH in place.
+//
+// The returned file must be kept reachable for as long as the helper serves;
+// the caller assigns it to sweepLockFile.
+func takeSweepLock(path string) (*os.File, bool, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, false, err
+	}
+	// The exclusive lock succeeds only when no other helper holds the
+	// shared one, i.e. when nothing on this machine is anybody's live
+	// session.
+	maySweep := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil
+	how := syscall.LOCK_SH
+	if !maySweep {
+		// Another helper is running. Non-blocking, because it may be
+		// inside its own exclusive probe, and a root daemon must not block
+		// its startup on that: serving without the shared lock is safe,
+		// and skipping the sweep is the part that matters.
+		how |= syscall.LOCK_NB
+	}
+	if err := syscall.Flock(int(f.Fd()), how); err != nil && maySweep {
+		f.Close()
+		return nil, false, err
+	}
+	return f, maySweep, nil
 }
