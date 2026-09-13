@@ -87,6 +87,13 @@ would have swept it is a **new** helper's startup call to `ClearLeftovers`
 (`internal/helper/platform_darwin.go`), and after `uninstall` there isn't a
 new helper. So don't assume clean; check.
 
+`/var/run/tetherd-helper.lock` is left behind, and that is deliberate. It is an
+empty lock file the helper `flock`s for its lifetime so that a socket-activated
+cold start does not sweep a live foreground session's `pf` anchor and resolver
+files out from under it. It holds no state, so removing it is unnecessary; if
+you want the machine byte-identical to a fresh one, `sudo rm
+/var/run/tetherd-helper.lock` after the daemon is stopped.
+
 `~/.tetherd/config.yml` is not part of this at all — it is per-user, not
 machine state, and spec §8's four removals don't mention it. See the last
 section.
