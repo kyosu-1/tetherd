@@ -32,6 +32,10 @@ control it.
 Run the exact same command again after every `brew upgrade tetherd` —
 `sudo tetherd-helper install` is idempotent and doubles as the upgrade step.
 
+Releases start at `v0.4.0`. `v0.1` through `v0.3b` are development
+milestones in [`docs/plans/`](docs/plans), not published releases — there was
+nothing to install before this one, which is what `v0.4.0` adds.
+
 ## What your infrastructure needs
 
 tetherd only works against a task definition that has been adapted for it;
