@@ -20,9 +20,9 @@ sudo tetherd-helper install        # again, every time
 ```
 
 `install` is idempotent and is also the upgrade path. It rewrites both
-binaries and the plist and restarts the daemon, so the new code is what ends
-up resident. If you skip it, the CLI you just upgraded talks to the old
-daemon; it notices, and its error tells you this command.
+binaries and the plist and reloads the launchd job, so the next connection
+starts the new code. If you skip it, the CLI you just upgraded talks to the
+old helper; it notices, and its error tells you this command.
 
 **Uninstalling:** `sudo tetherd-helper uninstall`, then
 `brew uninstall --cask tetherd`. See `docs/uninstall.md` for what to check if
@@ -63,8 +63,8 @@ cask "tetherd" do
   binary "tetherd-helper"
   binary "tetherd-exec"
 
-  postflight do
-    system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", staged_path]
+  postflight_steps do
+    run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{staged_path}}"]
   end
 
   uninstall launchctl: [
@@ -90,10 +90,50 @@ end
 
 Notes on the parts that are not obvious:
 
-- **A cask, not a formula.** Homebrew quarantines everything a cask
-  downloads (`Library/Homebrew/cask/download.rb`), and these binaries are
-  neither signed nor notarized, so something has to strip
-  `com.apple.quarantine`. A cask can, in `postflight`. A formula cannot.
+- **A cask, not a formula, and the quarantine strip is load-bearing.**
+  Homebrew quarantines everything a cask downloads
+  (`Library/Homebrew/cask/download.rb`), and these binaries are neither
+  signed nor notarized. **Measured, because it was worth knowing whether a
+  command-line binary escapes Gatekeeper: it does not.** A binary copied out
+  of the Caskroom with `com.apple.quarantine` set back on it does not run -
+  macOS puts up a modal dialog saying it could not verify the binary is free
+  of malware, and the process never starts. So stripping the attribute is not
+  a tidiness step; without it tetherd does not launch at all. A cask can do
+  that in a post-install step. A formula has no such hook, and that is the
+  entire reason this project ships a cask.
+- **`postflight_steps`, not `postflight`, and this is a trade rather than a
+  cleanup.** The older `postflight` stanza is deprecated
+  (`Library/Homebrew/cask/dsl.rb`), and Homebrew's deprecation helper takes
+  `disable_for_developers: true` by default, which turns the warning into a
+  raised `MethodDeprecatedError`. **So with `HOMEBREW_DEVELOPER` set,
+  `brew install` of a cask using `postflight` fails outright** - measured
+  against the published v0.4.1 cask, which exits 1, while the same command
+  without that variable exits 0 with only a warning. That asymmetry is why
+  v0.4's hardware verification never saw it.
+
+  The cost: `postflight_steps` needs **Homebrew 5.1.14 or newer** (released
+  2026-05-24); older Homebrew raises `NoMethodError` instead. There is no way
+  to declare that floor - a cask's `depends_on` accepts only `formula`,
+  `cask`, `macos`, `maximum_macos`, `linux` and `arch`
+  (`Library/Homebrew/cask/dsl/depends_on.rb`), with no key for Homebrew's own
+  version - so it lives here in prose. In practice `brew` auto-updates once
+  every 24 hours before commands like `install`, so this reaches only someone
+  who has set `HOMEBREW_NO_AUTO_UPDATE` and not updated in about four months.
+- **Why `"{{staged_path}}"` is quoted and braced.** Two ways to get this
+  wrong, both measured. GoReleaser templates the entire rendered cask, so an
+  unescaped `{{` fails the release with `function "staged_path" not defined`;
+  in `.goreleaser.yml` the value is written `"{{"{{"}}staged_path}}"` so that
+  a literal `{{staged_path}}` survives into the file. And a bare, unquoted
+  `staged_path` fails at load time with `NameError`, because
+  `postflight_steps` evaluates against Homebrew's install-steps DSL rather
+  than the cask body, where that method does not exist. `brew ruby` confirms
+  the loaded cask expands to the same effective `xattr` command the older
+  stanza ran.
+- **GoReleaser cannot emit this, so `custom_block` does.** Its cask template
+  still renders `postflight do`, on `main` as well as in the pinned version,
+  so `hooks.post.install` is deliberately left unused and the stanza is
+  injected as a raw block instead. **All four `hooks` keys must stay unused**;
+  any of them would reintroduce a deprecated stanza.
 - **`binary` three times is the Cask DSL, not a mistake.** The GoReleaser key
   is `binaries:` (a list); the singular `binary:` key is deprecated. The Cask
   DSL it generates has one `binary` stanza per binary, which is how a cask
@@ -193,8 +233,16 @@ the directory beside it has no `tetherd-exec` in it.
 		<string>--install-dir</string>
 		<string>/usr/local/libexec/tetherd</string>
 	</array>
-	<key>RunAtLoad</key>
-	<true/>
+	<key>Sockets</key>
+	<dict>
+		<key>Listener</key>
+		<dict>
+			<key>SockPathName</key>
+			<string>/var/run/tetherd.sock</string>
+			<key>SockPathMode</key>
+			<integer>438</integer>
+		</dict>
+	</dict>
 	<key>KeepAlive</key>
 	<dict>
 		<key>SuccessfulExit</key>
@@ -210,15 +258,27 @@ the directory beside it has no `tetherd-exec` in it.
 </plist>
 ```
 
-- **`RunAtLoad: true` - the helper is resident in v0.4.** spec §8's design is
-  launchd socket activation: launchd holds `/var/run/tetherd.sock` and starts
-  the helper on the first connection, and the helper exits after 30 idle
-  seconds. That needs `launch_activate_socket()` through `purego`, which is a
-  new dependency this version does not take, plus an inherited-fd path into
-  `helper.Server` and an idle lifecycle. Until that exists there is no
-  `Sockets` key, and with no `Sockets` key nothing but `RunAtLoad` would ever
-  start the helper. spec §8 has been amended to say so; the socket-activation
-  paragraph is still the intended design.
+- **`Sockets` is what makes the helper non-resident.** launchd creates,
+  binds and listens on `/var/run/tetherd.sock` itself, and starts the helper
+  as root only when something connects. The helper then asks for that
+  descriptor with `launch_activate_socket()`, called through `purego` rather
+  than cgo so `CGO_ENABLED=0` still holds, and serves it without binding
+  anything of its own. `SockPathMode` is `438` decimal, which is `0666`: the
+  socket has to be writable by the developer who runs `tetherd`, and it now
+  exists whether or not a helper does. That is a real consequence and it is
+  written up in the spec's safety section rather than buried here.
+- **Removing `RunAtLoad` is cosmetic, and the honest claim is narrower than
+  "no root process".** `man launchd.plist` states that `KeepAlive`
+  *"implicitly implies RunAtLoad"*, and that implication belongs to
+  `KeepAlive` itself rather than to any sub-key, so no arrangement of
+  `SuccessfulExit` avoids it: launchd still starts the helper once per plist
+  load. What actually keeps a root process from lingering is the **idle
+  exit**. So the accurate statement is *no root process while tetherd is
+  idle, after one bounded window of about 30 seconds per plist load* - at
+  boot, and after each `sudo tetherd-helper install`. **This particular point
+  is read from the man page, not measured**: confirming it needs
+  `launchctl bootstrap`, which is a hardware step. Treat it as the claim most
+  worth checking against a real machine first.
 - **`KeepAlive: {SuccessfulExit: false}` means "restart on a non-zero exit".**
   `man launchd.plist` (measured on Darwin 25.6.0): *"If true, the job will be
   restarted as long as the program exits and with an exit status of zero. If
@@ -241,14 +301,43 @@ the directory beside it has no `tetherd-exec` in it.
   to stop the loop: reporting success for a failure would be worse than a
   throttled retry.
 
-  It is also the key the intended design needs. Under socket activation the
-  helper exits **0** when it goes idle; `SuccessfulExit: false` leaves that
-  exit alone while still restarting a crash, where a bare `true` would restart
-  the helper the moment it idled out.
-
-  (`man launchd.plist` also notes that `KeepAlive` "implicitly implies
-  `RunAtLoad`", so the explicit `RunAtLoad` key above is redundant. It is
-  written out so the reader does not have to know that.)
+  **This key is now the right one, which it was not before.** The helper's
+  normal ending is an idle exit with status **0**, so `SuccessfulExit: false`
+  leaves that alone while still restarting a crash. A bare `KeepAlive: true`
+  would fight the design directly, restarting the helper the moment it idled
+  out. Earlier versions of tetherd kept the helper resident, where this key
+  bought nothing and cost the retry loop described above.
+- **The idle exit, and why the timeout is injectable.** `Server.IdleTimeout`
+  makes `Serve` return once no connection has been open for that long;
+  `cmd/tetherd-helper` sets it to `helper.DefaultIdleTimeout`, 30 seconds.
+  The process then runs `platform.Shutdown()` on the way out, so `pf` and
+  `/etc/resolver` are cleaned up exactly as they were when the daemon was
+  resident. An open connection holds the timer off, which matters because a
+  `tetherd run` can last hours. The constant is a field rather than a literal
+  because no test can wait 30 seconds for it.
+- **A cold start is paid inside the client's handshake.** Under activation the
+  first connection is what starts the helper, so that connection now waits for
+  the group lookup and the binary copy that `install` used to have done long
+  beforehand. It fits inside the CLI's handshake timeout, but it is the reason
+  the first `tetherd` command after boot feels slower than the second.
+- **`--socket` is a fallback now, not the normal path.** When
+  `launch_activate_socket()` reports that there is no launchd-provided socket
+  (`ESRCH` when the process is not launchd-managed, `ENOENT` when the job has
+  no such socket), the helper binds `--socket` itself. That is what a
+  foreground `sudo tetherd-helper` and `hack/e2e-local.sh` do, and it is the
+  development loop, so it stays supported.
+- **`/var/run/tetherd-helper.lock` exists because activation made the startup
+  sweep dangerous.** The helper sweeps leftover `pf` anchors, `/etc/resolver`
+  files and the pinned credential route when it starts, which was harmless
+  when it started once. Under activation it starts often - and the sweep is
+  machine-global while a helper's identity is per socket. Running
+  `tetherd doctor` while a foreground `hack/e2e-local.sh` session was live
+  would cold-start the daemon, which would then flush that session's `pf`
+  anchor, delete its resolver files and drop its route pin, silently, with the
+  saved pin record truncated so it could not be put back. The helper now holds
+  a shared `flock` on that file for its lifetime and sweeps only if it can
+  take the lock exclusively. One consequence to know: a foreground helper
+  started while the daemon is up will skip its own sweep.
 - **`ThrottleInterval` is written out** rather than left to launchd's default,
   so the restart interval above is visible in the file an operator reads. The
   value **is** that default - `man launchd.plist`: *"by default, jobs will not
