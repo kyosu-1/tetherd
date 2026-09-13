@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -22,6 +23,20 @@ type Server struct {
 	// PeerFunc extracts peer credentials. nil uses PeerCredentials.
 	PeerFunc func(net.Conn) (Peer, error)
 	Logf     func(string, ...any)
+	// IdleTimeout, when positive, makes Serve return nil once no
+	// connection has been open for that long - the idle exit spec §8's
+	// socket activation needs, so that no root process exists while
+	// tetherd is not in use.
+	//
+	// It is a field rather than a constant because no test can wait
+	// DefaultIdleTimeout's 30 seconds. cmd/tetherd-helper sets it only for
+	// the listener launchd handed over: on the foreground path there is
+	// nothing to restart the helper on the next connection, and
+	// hack/e2e-local.sh expects its `sudo tetherd-helper` to stay up.
+	//
+	// Zero means never, which is what every caller that binds its own
+	// socket wants.
+	IdleTimeout time.Duration
 
 	mu     sync.Mutex
 	active *connState
@@ -35,6 +50,23 @@ type Server struct {
 	conns   map[net.Conn]struct{}
 	closing bool
 	serving sync.WaitGroup
+	// idleLn and idleFor are the idle exit's state, set once by Serve and
+	// read by untrackConn. They live under connMu because the decision is
+	// exactly "did conns just become empty".
+	idleLn  deadlineListener
+	idleFor time.Duration
+}
+
+// deadlineListener is the part of *net.UnixListener that the idle exit
+// needs.
+//
+// Accept's own deadline, rather than a timer that closes the listener, is
+// what makes the decision race-free: it is Accept that reports the timeout,
+// so a connection that arrived during the idle window is returned instead of
+// being dropped by a listener that is already closing.
+type deadlineListener interface {
+	net.Listener
+	SetDeadline(t time.Time) error
 }
 
 type connState struct {
@@ -45,14 +77,28 @@ type connState struct {
 	routeSet    bool
 }
 
-// ListenAndServe listens on a UNIX socket (mode 0666) until ctx is done.
+// socketMode is the mode of the helper's UNIX socket. Plist writes the same
+// value into SockPathMode (in decimal, as launchd requires), so that the
+// socket launchd binds and the one this function binds are identical: the
+// permissions are part of the protocol - internal/doctor and the CLI's "not
+// running" advice both assume any admin user can connect, and the actual
+// authorization is Server.Allow, not the file mode.
+const socketMode = 0o666
+
+// ListenAndServe binds its own UNIX socket and serves until ctx is done.
+//
+// This is the path taken when launchd handed over no listener: the
+// foreground `sudo tetherd-helper` of hack/e2e-local.sh, and a launchd start
+// from a plist with no Sockets entry. Under socket activation the caller
+// passes the inherited listener to Serve instead and nothing here runs -
+// binding would unlink the socket launchd owns.
 func (s *Server) ListenAndServe(ctx context.Context, socketPath string) error {
 	os.Remove(socketPath)
 	ln, err := net.Listen("unix", socketPath)
 	if err != nil {
 		return err
 	}
-	if err := os.Chmod(socketPath, 0o666); err != nil {
+	if err := os.Chmod(socketPath, socketMode); err != nil {
 		ln.Close()
 		return err
 	}
@@ -60,8 +106,13 @@ func (s *Server) ListenAndServe(ctx context.Context, socketPath string) error {
 	return s.Serve(ctx, ln)
 }
 
-// Serve accepts on ln until ctx is done. ln may come from launchd socket
-// activation (v0.4) or from ListenAndServe.
+// Serve accepts on ln until ctx is done, or - when IdleTimeout is positive
+// - until no connection has been open for that long. ln may be the listener
+// launchd handed over (see InheritedListener) or one ListenAndServe bound.
+//
+// Both endings return nil, so that the helper's process exits 0 and the
+// plist's KeepAlive: {SuccessfulExit: false} leaves it alone. Only a serve
+// failure returns an error, which is the exit launchd does retry.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	go func() {
 		<-ctx.Done()
@@ -72,6 +123,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		// below finite.
 		s.stopConns()
 	}()
+	idle := s.armIdleExit(ln)
 	peerFn := s.PeerFunc
 	if peerFn == nil {
 		peerFn = PeerCredentials
@@ -83,6 +135,34 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 				// Every connection's cleanup has run by the time this
 				// returns, so the caller's platform shutdown sees the
 				// machine as the sessions left it.
+				s.serving.Wait()
+				return nil
+			}
+			if idle > 0 && errors.Is(err, os.ErrDeadlineExceeded) {
+				if !s.noConnections() {
+					// A connection is open, so this window belongs to a
+					// session that is still running - `tetherd run` holds
+					// one connection for hours and may send nothing on it
+					// for most of that. The deadline is taken off until
+					// untrackConn arms the next window, when the last
+					// connection closes.
+					//
+					// This is the only place the deadline is cleared. An
+					// earlier version also cleared it on every accepted
+					// connection, and the two made each other dead code:
+					// with the clear in place the deadline never expired
+					// while a connection was open, so removing this guard
+					// changed nothing any test could see, and vice versa.
+					// Both mutations survived. One mechanism, exercised
+					// by every connection that outlives a window.
+					s.clearIdleDeadline()
+					continue
+				}
+				s.logf("no connection for %s; exiting (launchd starts the helper again on the next one)", idle)
+				// Same wait as the cancel path: the caller's platform
+				// shutdown runs the moment this returns, and it must not
+				// race a session's cleanup.
+				s.stopConns()
 				s.serving.Wait()
 				return nil
 			}
@@ -121,10 +201,72 @@ func (s *Server) trackConn(c net.Conn) bool {
 	return true
 }
 
+// untrackConn deregisters a connection and, when it was the last one, starts
+// the idle window.
+//
+// It runs from the serving goroutine's defer, after ServeConn's own
+// `defer s.cleanup(st)`, so the session's pf rules, resolver files and route
+// are already off the machine before the clock that ends the process starts.
 func (s *Server) untrackConn(c net.Conn) {
 	s.connMu.Lock()
-	defer s.connMu.Unlock()
 	delete(s.conns, c)
+	var dl deadlineListener
+	if len(s.conns) == 0 {
+		dl = s.idleLn
+	}
+	d := s.idleFor
+	s.connMu.Unlock()
+	if dl != nil && d > 0 {
+		// SetDeadline wakes an Accept that is already blocked, which is
+		// what turns "the last client left" into the accept loop's
+		// decision rather than a separate timer's.
+		dl.SetDeadline(time.Now().Add(d))
+	}
+}
+
+// armIdleExit records the idle exit's state and starts the first window,
+// returning the timeout actually in force.
+//
+// The window is armed before the first connection rather than after the
+// first disconnect: launchd starts this daemon speculatively as well as on
+// demand - `man launchd.plist` (Darwin 25.6.0): the use of KeepAlive
+// "implicitly implies RunAtLoad, causing launchd to speculatively launch the
+// job" - and a start nobody ever connects to has to end by itself, or the
+// helper is resident again by the back door.
+func (s *Server) armIdleExit(ln net.Listener) time.Duration {
+	if s.IdleTimeout <= 0 {
+		return 0
+	}
+	dl, ok := ln.(deadlineListener)
+	if !ok {
+		// Every listener in production is a *net.UnixListener, which has
+		// SetDeadline. Refusing to serve over this would be worse than
+		// staying up.
+		s.logf("idle exit after %s is unavailable on a %T listener; staying up until the context is cancelled", s.IdleTimeout, ln)
+		return 0
+	}
+	s.connMu.Lock()
+	s.idleLn, s.idleFor = dl, s.IdleTimeout
+	s.connMu.Unlock()
+	dl.SetDeadline(time.Now().Add(s.IdleTimeout))
+	return s.IdleTimeout
+}
+
+// noConnections reports whether nothing is connected right now.
+func (s *Server) noConnections() bool {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return len(s.conns) == 0
+}
+
+// clearIdleDeadline takes the idle window off the listener.
+func (s *Server) clearIdleDeadline() {
+	s.connMu.Lock()
+	dl := s.idleLn
+	s.connMu.Unlock()
+	if dl != nil {
+		dl.SetDeadline(time.Time{})
+	}
 }
 
 // stopConns disconnects every live client and refuses new ones.

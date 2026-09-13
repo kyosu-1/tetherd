@@ -106,46 +106,100 @@ func Plist(label, helperPath, socket, execSrc, installDir, logPath string) []byt
 	}
 	b.WriteString("\t</array>\n")
 
-	// Ruling S: v0.4 ships a resident daemon. spec §8's design is launchd
-	// socket activation - launchd holds the socket and starts the helper on
-	// the first connection - which needs launch_activate_socket() through
-	// purego and an idle-exit lifecycle. Until that exists there is no
-	// Sockets key, so nothing but RunAtLoad would ever start the helper.
+	// Sockets is what makes the helper non-resident: launchd creates, binds
+	// and listens on the socket at load time, and starts the helper as root
+	// on the first connection. The helper asks for the descriptor with
+	// launch_activate_socket(3) (see activation.go) and never binds the
+	// path itself.
 	//
-	// Strictly this key is redundant: `man launchd.plist` (Darwin 25.6.0)
-	// says the use of KeepAlive "implicitly implies RunAtLoad", and
-	// SuccessfulExit repeats it ("This key implies that RunAtLoad is set to
-	// true, since the job needs to run at least once before an exit status
-	// can be determined"). It is written out anyway so that the reader of
-	// the plist does not have to know that.
-	plistText(&b, 1, "key", "RunAtLoad")
-	b.WriteString("\t<true/>\n")
+	// `man launchd.plist` (Darwin 25.6.0): "The keys of the top level
+	// Sockets dictionary can be anything", and the job "must check-in to
+	// get a copy of the file descriptors using the launch_activate_socket(3)
+	// API". ActivationSocketName is that key, shared with the call so the
+	// two cannot drift.
+	plistText(&b, 1, "key", "Sockets")
+	b.WriteString("\t<dict>\n")
+	plistText(&b, 2, "key", ActivationSocketName)
+	b.WriteString("\t\t<dict>\n")
+	// SockPathName "implies SockFamily is set to Unix" (same man page), so
+	// the family is not written out.
+	plistText(&b, 3, "key", "SockPathName")
+	plistText(&b, 3, "string", socket)
+	// The mode the helper's own ListenAndServe chmods to, so that the
+	// activated socket and the foreground one have the same permissions.
+	// Decimal on purpose - same man page, under SockPathMode: "Known bug:
+	// Property lists don't support octal, so please convert the value to
+	// decimal." 438 is 0666.
+	plistText(&b, 3, "key", "SockPathMode")
+	plistText(&b, 3, "integer", fmt.Sprint(socketMode))
+	// Both are launchd's defaults ("The default is stream", "The default is
+	// true, to listen for new connections"), written out for the same
+	// reason ThrottleInterval is: the operator reading this file should not
+	// have to know them.
+	plistText(&b, 3, "key", "SockType")
+	plistText(&b, 3, "string", "stream")
+	plistText(&b, 3, "key", "SockPassive")
+	b.WriteString("\t\t\t<true/>\n")
+	b.WriteString("\t\t</dict>\n")
+	b.WriteString("\t</dict>\n")
+
+	// No RunAtLoad. It is gone because a socket-activated daemon should not
+	// be started speculatively - but removing the key is *not* what stops
+	// the speculative start, and this is worth being exact about because
+	// the opposite was assumed twice on this project.
+	//
+	// `man launchd.plist` (Darwin 25.6.0) states the implication twice, and
+	// it is unconditional - it is a property of KeepAlive itself, not of
+	// the sub-key chosen:
+	//
+	//   KeepAlive: "The use of this key implicitly implies RunAtLoad,
+	//   causing launchd to speculatively launch the job."
+	//   SuccessfulExit: "This key implies that "RunAtLoad" is set to true,
+	//   since the job needs to run at least once before an exit status can
+	//   be determined."
+	//
+	// So as long as KeepAlive is present - in any form - launchd still
+	// starts the helper once when the plist is loaded, i.e. at `install`
+	// and at every boot. What makes the helper non-resident anyway is the
+	// idle exit: that speculative start finds no connection, waits
+	// DefaultIdleTimeout, and exits 0, which the dict below explicitly does
+	// not restart. The window is bounded (one 30-second root process per
+	// load) instead of forever, and the sweep it does on the way in is
+	// wanted there: a boot after an unclean shutdown is exactly when
+	// leftover pf anchors and /etc/resolver files need removing.
+	//
+	// This was settled by reading the man page, not by execution: measuring
+	// it needs `launchctl bootstrap`, and this machine's installed v0.4.1
+	// daemon is the verified baseline for the hardware checks, so it was
+	// left alone.
 
 	// KeepAlive: {SuccessfulExit: false} is spec §8's shape and is kept.
 	// What it actually does, measured in `man launchd.plist` on Darwin
 	// 25.6.0: "If true, the job will be restarted as long as the program
 	// exits and with an exit status of zero. If false, the job will be
 	// restarted in the inverse condition." So this restarts the helper
-	// after every *non-zero* exit, which includes the log.Fatalf paths in
-	// cmd/tetherd-helper (EnsureGroup, InstallExec, ListenAndServe): each
-	// of those is retried once per ThrottleInterval for as long as it keeps
-	// failing. An earlier version of this comment claimed the opposite -
-	// that the dict form spared those paths - and it was wrong.
+	// after every *non-zero* exit and leaves a zero exit alone. (A v0.4
+	// comment claimed the opposite - that the dict form spared the failure
+	// paths - and was wrong.)
 	//
-	// Retrying them is reasonable rather than merely noisy. `install` has
-	// already, as root, validated the destination's ownership, copied both
-	// binaries and ensured the tetherd group, so the daemon's own startup
-	// repeats work that succeeded seconds earlier; a failure there is far
-	// more likely to be transient (dscl not answering yet early in boot)
-	// than permanent. A permanent one does retry forever, appending the
-	// same line to DaemonLogPath - which is what that log is for. Nothing
-	// here makes a real failure exit 0 to stop the loop: reporting success
-	// for a failure is worse than a throttled retry.
+	// With socket activation that is the right shape for the first time.
+	// The helper's normal end is an idle exit with status 0, which this
+	// leaves alone, so the daemon goes away and stays away until the next
+	// connection; a crash or a failed start exits non-zero and is retried
+	// once per ThrottleInterval. A bare `true` would restart the idle exit
+	// immediately and make the helper resident again by another route.
 	//
-	// It is also the shape the intended design needs. Under socket
-	// activation the helper exits 0 when it goes idle, and only this form
-	// leaves an idle exit alone while still restarting a crash; a bare
-	// `true` would fight the idle-exit lifecycle.
+	// In v0.4, with no idle exit, the same key only meant that the daemon's
+	// own startup failures (EnsureGroup, InstallExec, the serve loop) were
+	// retried every 10 seconds forever. That is still what happens to a
+	// permanently failing start, and it is still the right trade: `install`
+	// has already validated the destination's ownership, copied both
+	// binaries and ensured the tetherd group as root, so a failure in the
+	// daemon's repeat of that work is more likely transient (dscl not
+	// answering yet early in boot) than permanent, and the retries append
+	// to DaemonLogPath, which is what that log is for. Nothing here makes a
+	// real failure exit 0 to stop the loop: reporting success for a failure
+	// is worse than a throttled retry.
 	plistText(&b, 1, "key", "KeepAlive")
 	b.WriteString("\t<dict>\n")
 	plistText(&b, 2, "key", "SuccessfulExit")
@@ -283,7 +337,7 @@ type InstallResult struct {
 // Install registers the LaunchDaemon, and is also the upgrade path: it is
 // idempotent, rewrites both binaries and the plist every time, and restarts
 // the daemon, so `brew upgrade tetherd && sudo tetherd-helper install` leaves
-// the new binaries resident.
+// the new binaries in place for the next activation.
 //
 // srcDir holds the tetherd-helper and tetherd-exec to copy. run is the
 // injection point for launchctl and dscl, the same shape EnsureGroup takes.

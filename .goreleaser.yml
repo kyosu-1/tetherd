@@ -47,7 +47,7 @@ changelog:
 # homebrew_casks, not homebrew_formulae: a formula cannot strip the quarantine
 # attribute Homebrew puts on what it downloads (Library/Homebrew/cask/
 # download.rb quarantines every cask download), and these binaries are neither
-# signed nor notarized. A cask can, in a postflight hook.
+# signed nor notarized. A cask can, in postflight_steps.
 homebrew_casks:
   - repository:
       owner: kyosu-1
@@ -82,10 +82,15 @@ homebrew_casks:
     # internal/doctor's CheckPlugin measures the condition that actually
     # matters (LookPath) and already prints the right remedy,
     # `brew install --cask session-manager-plugin`.
-    hooks:
-      post:
-        install: |
-          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", staged_path]
+
+    # custom_block, not hooks.post.install: hooks emit `postflight`, which
+    # Homebrew raises MethodDeprecatedError for under HOMEBREW_DEVELOPER.
+    # `{{"{{"}}` escapes GoReleaser's templater, which runs over the whole
+    # generated cask; the token must reach the file as {{staged_path}}.
+    custom_block: |
+      postflight_steps do
+        run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{"{{"}}staged_path}}"]
+      end
     # These two paths are the one duplication the design cannot remove: a cask
     # is configuration and cannot read helper.DaemonLabel or
     # helper.ExecInstallDir. internal/helper's TestCaskAgreesWithTheGoConstants

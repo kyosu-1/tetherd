@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -133,6 +134,18 @@ func readPlistElem(t *testing.T, dec *xml.Decoder, se xml.StartElement) pval {
 	return pval{}
 }
 
+// keysOf names what a dict actually contains, so a failure about a missing
+// key says what was there instead - a misspelled Sockets entry is otherwise
+// reported as "not present" with nothing to compare against.
+func keysOf(v pval) []string {
+	out := make([]string, 0, len(v.dict))
+	for k := range v.dict {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // flagValue returns the ProgramArgument that follows flag, requiring flag to
 // appear exactly once. Checking the pair rather than the presence of both
 // strings is what makes a swap of two values detectable.
@@ -228,13 +241,73 @@ func TestPlistCarriesEveryArgumentUnderItsOwnFlag(t *testing.T) {
 	}
 }
 
-func TestPlistKeepsTheHelperResidentButOnlyRestartsAFailedOne(t *testing.T) {
+// The Sockets entry is what makes the helper non-resident: launchd binds
+// and holds the socket, and the helper asks for the descriptor by the same
+// name. A wrong key name here is silent - launchd creates no socket, so
+// launch_activate_socket returns ENOENT and the helper quietly binds its own
+// path, which is v0.4's resident behaviour wearing v0.5.0's plist.
+func TestPlistHasLaunchdHoldTheSocketUnderTheNameTheHelperAsksFor(t *testing.T) {
+	const socket = "/root-owned/socket-file.sock"
+	b := Plist(DaemonLabel, "/h", socket, "/e", "/d", "/l")
+	lintWithPlutil(t, b)
+	root := parsePlist(t, b)
+
+	socks, ok := root.dict["Sockets"]
+	if !ok || socks.kind != "dict" {
+		t.Fatalf("Sockets = %+v (present = %v), want a dict: without it launchd never creates the socket "+
+			"and nothing but the implied RunAtLoad ever starts the helper", socks, ok)
+	}
+	// ActivationSocketName, not a literal: the helper passes the same
+	// constant to launch_activate_socket, and a second copy here could
+	// drift from it without any error at either end.
+	entry, ok := socks.dict[ActivationSocketName]
+	if !ok || entry.kind != "dict" {
+		t.Fatalf("Sockets[%q] = %+v (present = %v), want a dict; Sockets has %v", ActivationSocketName, entry, ok, keysOf(socks))
+	}
+	if got := entry.dict["SockPathName"]; got.kind != "string" || got.s != socket {
+		t.Errorf("SockPathName = %+v, want the string %q - the same path the helper is given as --socket", got, socket)
+	}
+	// `man launchd.plist` (Darwin 25.6.0), SockPathMode: "Known bug:
+	// Property lists don't support octal, so please convert the value to
+	// decimal." Dropping the key leaves the socket at launchd's default,
+	// which no admin user can write, so every `tetherd run` fails with a
+	// permission error on connect.
+	mode, ok := entry.dict["SockPathMode"]
+	if !ok || mode.kind != "integer" {
+		t.Fatalf("SockPathMode = %+v (present = %v), want an integer: without it the socket is not the 0666 "+
+			"that Server.ListenAndServe creates and no non-root client can connect", mode, ok)
+	}
+	n, err := strconv.Atoi(mode.s)
+	if err != nil {
+		t.Fatalf("SockPathMode = %q, which is not an integer", mode.s)
+	}
+	if n != socketMode {
+		t.Errorf("SockPathMode = %d (0%o), want %d (0%o) in decimal - the mode ListenAndServe chmods to. "+
+			"An octal literal here would be read as decimal by launchd", n, n, socketMode, socketMode)
+	}
+	if got := entry.dict["SockType"]; got.kind != "string" || got.s != "stream" {
+		t.Errorf("SockType = %+v, want the string \"stream\": the protocol is one JSON object per line over a stream", got)
+	}
+	if got := entry.dict["SockPassive"]; got.kind != "true" {
+		t.Errorf("SockPassive = %+v, want <true/>: launchd has to listen(2) on the socket, not connect(2) out of it", got)
+	}
+}
+
+func TestPlistLeavesTheIdleExitAloneButRestartsAFailedHelper(t *testing.T) {
 	root := parsePlist(t, Plist(DaemonLabel, "/h", "/s", "/e", "/d", "/l"))
 
-	// Ruling S: v0.4 has no socket activation, so launchd must start the
-	// helper at load or nothing ever starts it.
-	if got := root.dict["RunAtLoad"]; got.kind != "true" {
-		t.Errorf("RunAtLoad = %+v, want <true/>: without socket activation nothing else starts the helper", got)
+	// RunAtLoad is gone: a socket-activated daemon is started by demand.
+	//
+	// Removing the key is not what stops the speculative start, though -
+	// `man launchd.plist` (Darwin 25.6.0) says the implication twice and
+	// unconditionally: KeepAlive "implicitly implies RunAtLoad, causing
+	// launchd to speculatively launch the job", and SuccessfulExit "implies
+	// that "RunAtLoad" is set to true". So launchd still starts the helper
+	// once per load, and what makes it non-resident is the idle exit below.
+	// This assertion is therefore about the document saying what is meant,
+	// not about the behaviour.
+	if got, ok := root.dict["RunAtLoad"]; ok {
+		t.Errorf("RunAtLoad = %+v is still in the plist; socket activation is what starts the helper now", got)
 	}
 	ka, ok := root.dict["KeepAlive"]
 	if !ok {
@@ -243,11 +316,11 @@ func TestPlistKeepsTheHelperResidentButOnlyRestartsAFailedOne(t *testing.T) {
 	if ka.kind != "dict" {
 		// `man launchd.plist` (Darwin 25.6.0): SuccessfulExit false means
 		// "the job will be restarted in the inverse condition", i.e. on a
-		// non-zero exit only. A bare <true/> restarts it on a zero exit
-		// too, which is the idle exit the intended socket-activation
-		// design depends on.
-		t.Fatalf("KeepAlive is a <%s>, want a dict: a bare <true/> also restarts the helper after a clean "+
-			"exit 0, which fights the idle-exit lifecycle socket activation needs", ka.kind)
+		// non-zero exit only. A bare <true/> restarts it after a zero exit
+		// too - and the helper's normal end *is* a zero exit, so that
+		// would make it resident again by another route.
+		t.Fatalf("KeepAlive is a <%s>, want a dict: a bare <true/> also restarts the helper after the "+
+			"idle exit, which exits 0", ka.kind)
 	}
 	se, ok := ka.dict["SuccessfulExit"]
 	if !ok || se.kind != "false" {
@@ -677,9 +750,9 @@ func TestInstallIsIdempotentAndUpgradesInPlace(t *testing.T) {
 	// source directory now holds different binaries. If Install skips a
 	// copy whose destination already exists, everything else about the
 	// second run still looks right - same result, same plist, same modes,
-	// same launchctl sequence - and the old daemon stays resident, so the
-	// CLI hits the protocol-mismatch error that tells the user to run the
-	// command that just did nothing.
+	// same launchctl sequence - and the next activation starts the old
+	// binary, so the CLI hits the protocol-mismatch error that tells the
+	// user to run the command that just did nothing.
 	upgraded := map[string]string{
 		HelperName: "#!/bin/sh\necho upgraded-launchdaemon-helper\n",
 		ExecName:   "#!/bin/sh\necho upgraded-setgid-wrapper\n",
