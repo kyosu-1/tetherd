@@ -11,10 +11,41 @@ import (
 	"testing"
 )
 
+// nextHandOver is the next descriptor number handOverFD will use.
+//
+// Deliberately far above anything a test binary reaches. Two things go wrong
+// with a low number, and this file shipped both of them:
+//
+//   - "is the handed-over descriptor closed now?" is unanswerable about a
+//     low number. The kernel hands out the lowest free descriptor, so
+//     net.FileListener's own dup(2) lands on exactly the number that was
+//     just freed, and a closed descriptor reads as open.
+//   - Worse, a descriptor closed by the code under test and then closed
+//     again by a t.Cleanup closes whatever the runtime has since put on
+//     that number. That is what made tests elsewhere in this package fail:
+//     TestApplyAndDisconnectClears and TestResolverNeedsPfNotJustAPinnedRoute
+//     lost the socket under a live client and sat out the client's
+//     10-second call timeout, in two runs out of five, with nothing in
+//     either test touching socket activation. Measured by bisecting to the
+//     commit that added this file.
+var nextHandOver = 300
+
+// handOverFD copies fd to a high, fixed number and returns it as a plain
+// int: a raw descriptor has no os.File finalizer behind it, so the only
+// close is the one the code under test performs, which is the ownership
+// launchd's descriptors actually have.
+func handOverFD(t *testing.T, fd int) int {
+	t.Helper()
+	nextHandOver++
+	if err := syscall.Dup2(fd, nextHandOver); err != nil {
+		t.Fatalf("dup2 %d -> %d: %v", fd, nextHandOver, err)
+	}
+	return nextHandOver
+}
+
 // unixListenerFD returns a listening UNIX socket's descriptor, standing in
-// for what launchd hands over. net.Listener.File() dups, so the number
-// returned is ours to give away and the original listener stays usable for
-// the cleanup.
+// for what launchd hands over: InheritedListener takes ownership of it, and
+// nothing here closes it again.
 //
 // /tmp rather than t.TempDir(): a UNIX socket path is capped at 104 bytes on
 // darwin and t.TempDir() under a long test name already spends most of that.
@@ -35,8 +66,12 @@ func unixListenerFD(t *testing.T) (fd int, path string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { f.Close() })
-	return int(f.Fd()), path
+	fd = handOverFD(t, int(f.Fd()))
+	// Our own dup is released here and properly, through os.File: from now
+	// on the socket has exactly two references, the listener and the raw
+	// descriptor the code under test owns.
+	f.Close()
+	return fd, path
 }
 
 // fdIsOpen reports whether fd is still a descriptor of this process.
@@ -106,9 +141,15 @@ func TestInheritedListenerClosesItsCopyOfLaunchdsDescriptor(t *testing.T) {
 		t.Fatalf("fd %d is still open: InheritedListener kept its copy of launchd's descriptor as well as the dup inside the listener", fd)
 	}
 	// And the listener itself is unaffected by that close.
-	if _, err := net.Dial("unix", ln.Addr().String()); err != nil {
+	c, err := net.Dial("unix", ln.Addr().String())
+	if err != nil {
 		t.Fatalf("the inherited listener stopped working when our copy was closed: %v", err)
 	}
+	// Closed rather than discarded. A net.Conn left for the garbage
+	// collector closes its descriptor from a finalizer at an arbitrary
+	// later moment, which is how a descriptor bug in this file reached
+	// tests in other files.
+	c.Close()
 }
 
 // Extra descriptors under one Sockets entry are closed rather than left open
@@ -172,9 +213,12 @@ func TestInheritedListenerRejectsADescriptorThatIsNotAListener(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
 	defer w.Close()
-	ln, err := InheritedListener(func(string) ([]int, error) { return []int{int(r.Fd())}, nil }, ActivationSocketName)
+	// Handed over the same way a listener is: InheritedListener closes the
+	// descriptor it was given even on this path, so os.File must not own it.
+	fd := handOverFD(t, int(r.Fd()))
+	r.Close()
+	ln, err := InheritedListener(func(string) ([]int, error) { return []int{fd}, nil }, ActivationSocketName)
 	if ln != nil {
 		ln.Close()
 		t.Fatal("a pipe was accepted as a listening socket")
