@@ -578,6 +578,43 @@ cask の全文、root 所有のディレクトリにコピーする理由（と 
 9. `TETHERD_CONTROL` のリテラルが 1 つになり、`target.container` が黙って無視されず、`target.agent_container` が効く
 10. **実機 32〜38 はタグを打った後**（Task 5）。PR にはその時点の状態を正直に書く
 
+## 次の計画に回すもの: dev-env のタスク定義が毎回置き換わる
+
+**`aws_ecs_task_definition.api` は、何を apply しようとしても常に `forces
+replacement` になる。** v0.4 の IAM 権限 1 件を当てるだけの plan が
+`1 to add, 2 to change, 1 to destroy` になり、`-target=aws_iam_policy.developer`
+で回避した。**実害は「本物の変更がノイズに埋もれること」**で、実際にこの時
+コントローラの plan 予測が外れた。
+
+原因は実測済み（provider の更新ではない。lock file は `e9e83dc` 以降 `6.64.0`
+で固定、`ecs.tf` は以下のどのフィールドも書いていない）。**AWS が
+`DescribeTaskDefinition` で埋めて返す値**を refresh が state に取り込み、
+`jsonencode` した設定側には無いので毎回差分になる:
+
+| AWS が足すもの | 場所 |
+|---|---|
+| `hostPort`（`containerPort` と同値） | 両コンテナの `portMappings` |
+| `cpu: 0` | 両コンテナ直下 |
+| `mountPoints: []` / `volumesFrom: []` / `systemControls: []` | 両コンテナ直下 |
+| `drop: []` | agent の `linuxParameters.capabilities` |
+
+意味的には全て既定値で、置き換えても内容は同一（awsvpc では `hostPort` は
+`containerPort` と一致必須なので省略すれば AWS が同じ値を入れる）。
+
+**選択肢は 2 つあり、このリポジトリでは前者を選ぶべき:**
+
+1. **上表の既定値を `ecs.tf` に明示して JSON を往復させる。** plan が信用でき
+   るようになる。欠点は provider が将来さらに正規化を増やすと再発すること。
+2. `lifecycle { ignore_changes = [container_definitions] }`。1 行で消える。
+   **ただしこのリポジトリでは後者の代償が特に大きい** — タスク定義の
+   `container_definitions` は tetherd を導入するときに利用者が編集する場所その
+   もので（agent サイドカー、`TETHERD_ENV`、`SYS_PTRACE`、ポート）、無視すると
+   それらの変更が黙って効かなくなる。「タスク定義を Terraform 外で回す」構成
+   では定番の手だが、ここはそうではない。
+
+**「直った」と言うには実機で plan が空になることを確認する必要があり、それは
+apply を伴う**ので、この計画には含めない。
+
 ## 次の計画（v1.0、この計画には含めない）
 
 **agent / sampleapp イメージを公開レジストリ（GHCR）に publish する**（workflow 1 本とパッケージ権限が要る外向きのスコープ。v0.4 では Task 1 の決定 1 どおり `.goreleaser.yml` に含めず、代わりに README / `docs/design.md` / spec から「`ghcr.io/kyosu-1/tetherd-agent` を pull できる」という記述を取り除いた。**現状、利用者は `make push-images ECR_REGISTRY=...` で自分のレジストリに push する**）。**署名と notarization**（Apple Developer アカウントが必要。quarantine の `xattr` 回避をやめられる）。複数人が同じタスクに同時接続する実機検証（steal の照合は実装済みだが 2 人以上で測っていない）。現実的なアプリでのレイテンシ計測。`TETHERD_CONTROL` をデプロイ側から CLI に伝える経路。
