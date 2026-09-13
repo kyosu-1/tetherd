@@ -90,8 +90,10 @@ v0.4 の主張は「tetherd が入っていない Mac で、`brew install` か�
 | 34 | **通った**（`sudo launchctl print` は使わず、同じことを別経路で測った）。`ps` でデーモンは **uid 0 / ppid 1 / `/usr/local/libexec/tetherd/tetherd-helper`** から走っており、**Homebrew の prefix ではない**。`plutil -p` で plist の 7 キーを確認: `Label`、`ProgramArguments` の 4 パスすべてが `/usr/local/libexec/tetherd` 配下、`KeepAlive {SuccessfulExit: false}`、`RunAtLoad true`、`ThrottleInterval 10`、ログ 2 本。**`EvalSymlinks` の前提も実測で成立**: `/opt/homebrew/bin/tetherd-helper` → `Caskroom/tetherd/0.4.0/tetherd-helper` で `tetherd-exec` が同じディレクトリに実在した |
 | 35 | **通った。14 行すべて `✓`、exit 0。**`helper answered, protocol 2`。quarantine は `postflight` で除去済み（`xattr` に残るのは無害な `com.apple.provenance` のみ） |
 | 36 | **通った。**`aws sts get-caller-identity` が**タスクロール**の ARN（`assumed-role/tetherd-dev-api-task/4baaff64…`）を返した。helper ログに `pf enabled → pf applied for pid 77544 → pf cleared for pid 77544` の全ライフサイクル。終了後 `/etc/resolver/` は空、route の pin も無し。デーモンは常駐のまま（v0.4 の設計どおり） |
-| 37 | **未実施**（root が要る） |
-| 38 | **未実施**（v0.4.1 を real tap から入れ直すときに併せて実施する） |
+| 37 | **通った**（v0.4.1、本番 tap）。`sudo tetherd-helper install` を再実行して成功し、daemon が入れ替わった（`ps` の稼働時間が 18 秒、helper ログに 20:02:59 の `listening on /var/run/tetherd.sock`）。**これが `brew upgrade` 後の手順そのものなので、README の案内が真であることの確認でもある** |
+| 38 | **通った**。`brew uninstall --cask` で daemon が落ち、plist と `/usr/local/libexec/tetherd` が消えた。**ただし sudo を要求する** — cask の `uninstall launchctl:` / `delete:` が `/Library/LaunchDaemons` と `/usr/local/libexec` を触るので Homebrew が自分で昇格する。非対話シェルでは `sudo: a terminal is required` で止まり、**何も変更せずにアボートした**（daemon・plist・ディレクトリ・symlink すべて無傷、`brew list --cask` も認識したまま）。`docs/uninstall.md` に追記した |
+
+**32 行を本番経路で再実施（v0.4.1、2026-09-13 20:02）**: 一時ローカル tap を撤去して `brew install kyosu-1/tap/tetherd` が成功。`tetherd 0.4.1`、symlink は `Caskroom/tetherd/0.4.1/` を指す。`tetherd --version` / `tetherd-helper --version` ともに `0.4.1`。**doctor は 14 行すべて `✓` で exit 0**、plist の `ProgramArguments[0]` は `/usr/local/libexec/tetherd/tetherd-helper`（Homebrew prefix ではない）。**これで v0.4.0 の依存バグ修正が本番経路で検証された。**
 
 **この実施で見つかった欠陥 2 件:**
 
