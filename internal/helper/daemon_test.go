@@ -245,7 +245,7 @@ func TestPlistCarriesEveryArgumentUnderItsOwnFlag(t *testing.T) {
 // and holds the socket, and the helper asks for the descriptor by the same
 // name. A wrong key name here is silent - launchd creates no socket, so
 // launch_activate_socket returns ENOENT and the helper quietly binds its own
-// path, which is v0.4's resident behaviour wearing v1.0's plist.
+// path, which is v0.4's resident behaviour wearing v0.5.0's plist.
 func TestPlistHasLaunchdHoldTheSocketUnderTheNameTheHelperAsksFor(t *testing.T) {
 	const socket = "/root-owned/socket-file.sock"
 	b := Plist(DaemonLabel, "/h", socket, "/e", "/d", "/l")

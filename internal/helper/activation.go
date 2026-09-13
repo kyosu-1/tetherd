@@ -35,7 +35,7 @@ const DefaultIdleTimeout = 30 * time.Second
 //     hack/e2e-local.sh, which have worked since v0.2b.
 //   - ENOENT ("There was no socket of the specified name owned by the
 //     caller") - launchd started us, but from a plist with no matching
-//     Sockets entry. That is a v0.4 plist under a v1.0 binary, i.e. `brew
+//     Sockets entry. That is a v0.4 plist under a v0.5.0 binary, i.e. `brew
 //     upgrade tetherd` before `sudo tetherd-helper install`. Binding our own
 //     socket is right there too, and cannot clobber launchd's: a plist with
 //     no Sockets entry means launchd never created one.
