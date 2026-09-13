@@ -40,7 +40,9 @@ checksum:
 changelog:
   sort: asc
   filters:
-    exclude: ["^docs:", "^test:"]
+    exclude:
+      - '^(docs|test|chore|build|ci|style|refactor)(\(.+\))?!?:'
+      - "^Merge "
 
 # homebrew_casks, not homebrew_formulae: a formula cannot strip the quarantine
 # attribute Homebrew puts on what it downloads (Library/Homebrew/cask/
