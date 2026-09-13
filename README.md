@@ -121,6 +121,211 @@ four marks:
 
 Only `✗` rows affect the exit code.
 
+## How it works
+
+tetherd is four binaries: three on your laptop and one sidecar in the task.
+None of them puts your laptop inside the VPC. Both ends open an outbound
+connection to AWS Systems Manager, which joins them into one ECS Exec port
+forward, so there is no VPN, no inbound port on the task, and no
+security-group change beyond the ALB's target port.
+
+```mermaid
+flowchart LR
+  subgraph mac["Your Mac"]
+    child["your command<br/>(gid tetherd)"]
+    cli["tetherd"]
+    helper["tetherd-helper<br/>(root)"]
+  end
+  ssm(["AWS SSM"])
+  subgraph task["ECS task (one network namespace)"]
+    ssmagent["ssm-agent<br/>(ECS Exec)"]
+    agent["tetherd-agent<br/>:9900 control, loopback only<br/>:8080 behind the ALB"]
+    app["app<br/>:8081"]
+  end
+  alb(["ALB"])
+  vpc[("RDS, Cloud Map,<br/>anything in the VPC")]
+
+  child -- "VPC-bound TCP,<br/>redirected by pf" --> cli
+  cli -- "pf rules, /etc/resolver,<br/>natlook" --> helper
+  cli <== "one TCP connection,<br/>multiplexed with yamux" ==> ssm
+  ssm <==> ssmagent
+  ssmagent -- "127.0.0.1:9900" --> agent
+  alb --> agent
+  agent -- "every request<br/>nobody claimed" --> app
+  agent -- "dials from<br/>the task's ENI" --> vpc
+```
+
+| Binary | Runs as | Does |
+|---|---|---|
+| `tetherd` | you | Attaches to the agents, starts your command with the task's environment, and serves everything your command reaches through the agent: captured connections, DNS, the task-role credential endpoint, and stolen requests. |
+| `tetherd-exec` | setgid `tetherd` | Sets the real and effective gid to `tetherd`, then execs your command. pf matches on that gid and nothing else checks it, so it grants no other access. |
+| `tetherd-helper` | root, as a LaunchDaemon | Apart from a version check, it does only these things, and none of them runs a command: load and clear the pf rules, write and remove `/etc/resolver` files, look up a redirected connection's original destination, and pin and clear a host route. Only members of `admin` may use them. |
+| `tetherd-agent` | a sidecar in the task, with `SYS_PTRACE` | Reads the app container's environment, dials and resolves for the CLI, and sits between the ALB and the app. It never calls an AWS API. |
+
+### Attaching
+
+`tetherd run` lists the service's running tasks and, for each one, calls
+`ssm:StartSession` with the `AWS-StartPortForwardingSession` document and
+hands the result to `session-manager-plugin`, the same way
+`aws ssm start-session` does (the AWS CLI itself is not needed). The forward
+ends inside the task at `127.0.0.1:9900`, where the agent listens on loopback
+only, out of reach of the task's ENI.
+
+tetherd multiplexes that single TCP connection with yamux. The first stream
+is the control stream, carrying JSON Lines: `hello`, then `welcome`, then a
+`ping` every 5 seconds. The agent's `welcome` includes the app container's
+environment and its `TETHERD_ENV`, and `tetherd run` stops right there if
+that value doesn't match `target.env`. Every other stream starts with a
+one-line JSON header that names its type: `dial` and `resolve` streams are
+opened by the CLI, `http` streams by the agent.
+
+tetherd attaches to every running task, because the ALB decides which task a
+request lands on. The oldest task is the *primary*: its agent serves dials,
+DNS and the environment. tetherd re-reads the task list every 10 seconds, so
+it follows a rolling deploy instead of being left attached to stopped tasks.
+
+### Environment
+
+`pidMode: task` puts the app container's processes where the agent can see
+them, and `SYS_PTRACE` lets it read their `/proc/<pid>/environ`. The agent
+asks the task metadata endpoint which container is the app
+(`TETHERD_APP_CONTAINER`, `app` by default) and reads the environment of that
+container's oldest process: exactly what ECS injected at startup, with
+secrets already resolved. The CLI layers your local environment, then the
+task's, then `env.override`. It leaves out names that only mean something
+inside the container, such as `PATH`, `HOME`, `SSL_CERT_FILE` and
+`LD_LIBRARY_PATH`.
+
+### Outbound connections
+
+```mermaid
+sequenceDiagram
+  participant C as your command
+  participant K as pf
+  participant T as tetherd
+  participant H as tetherd-helper
+  participant A as tetherd-agent
+  participant R as RDS
+  C->>K: connect to 10.0.3.21:5432
+  Note over K: gid is tetherd and the destination<br/>is in the remote set, so route to lo0<br/>and redirect to tetherd's port
+  K->>T: connection accepted on 127.0.0.1
+  T->>H: natlook
+  H-->>T: original destination 10.0.3.21:5432
+  T->>A: dial stream to 10.0.3.21:5432
+  A->>R: connect from the task's ENI
+  Note over C,R: bytes are copied both ways until either side closes
+```
+
+Your command is started through `tetherd-exec`, so it and every process it
+starts run with gid `tetherd`. The helper loads a table and two rules into
+the pf anchor `com.apple/900.tetherd`. The default `/etc/pf.conf` already
+evaluates that anchor, so nothing is written to disk:
+
+```
+table <tetherd_remote> { 10.0.0.0/16 }
+rdr pass on lo0 inet proto tcp from any to <tetherd_remote> -> 127.0.0.1 port <tetherd's port>
+pass out route-to lo0 inet proto tcp from any to <tetherd_remote> group tetherd keep state
+```
+
+Only TCP from gid `tetherd` to an address in the remote set is redirected.
+Other processes on your Mac reach the same addresses as usual, and whatever
+your command sends outside the set (the internet, localhost, your LAN)
+leaves through your own network. The remote set is the task VPC's CIDRs,
+plus `network.remote_cidrs`, plus the prefix lists named in
+`network.remote_services`, minus `network.local_cidrs`. The connection is
+accepted by the kernel's own TCP stack, and the helper recovers its original
+destination with `DIOCNATLOOK`, so no TCP is reimplemented in user space.
+
+### DNS
+
+Your command doesn't send its own DNS queries: `getaddrinfo` hands them to
+`mDNSResponder`, which runs as root rather than as gid `tetherd`, so pf never
+matches them. Instead, for each domain in `network.remote_domains`, the
+helper writes `/etc/resolver/<domain>` pointing at tetherd's resolver on
+`127.0.0.1` (port 53530 when it's free). tetherd forwards each question over
+a `resolve` stream, and the agent answers with the task's own resolver. Only
+A records are answered, because capture is IPv4-only. Names like RDS
+endpoints already resolve publicly to private addresses inside the VPC
+CIDR, so a typical setup needs no `remote_domains` at all.
+
+### Task role
+
+```mermaid
+flowchart LR
+  sdk["AWS SDK in<br/>your command"]
+  ep["tetherd<br/>127.0.0.1:random port"]
+  agent["tetherd-agent"]
+  creds["169.254.170.2<br/>(inside the task)"]
+  aws(["S3, DynamoDB, SQS, ..."])
+  sdk -- "AWS_CONTAINER_CREDENTIALS_FULL_URI" --> ep
+  ep -- "dial stream" --> agent
+  agent --> creds
+  sdk -- "signed requests,<br/>straight from your laptop" --> aws
+```
+
+Inside the task, the SDK fetches credentials from `169.254.170.2`, an address
+that exists only inside the task. tetherd doesn't capture that address.
+Instead it serves an HTTP endpoint on a random loopback port, points
+`AWS_CONTAINER_CREDENTIALS_FULL_URI` and the ECS metadata variables at it,
+and removes `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`. It forwards each
+request over a `dial` stream to `169.254.170.2` inside the task. The SDKs
+check your own credentials before container credentials, so tetherd also
+removes your credential variables and points `AWS_CONFIG_FILE` and
+`AWS_SHARED_CREDENTIALS_FILE` at an empty file. Once the SDK has the task's
+temporary credentials, it signs requests and sends them straight from your
+laptop to AWS's public endpoints. That is how services outside the VPC, like
+S3, work without being captured.
+
+### Stealing requests
+
+```mermaid
+sequenceDiagram
+  participant B as client
+  participant L as ALB
+  participant A as tetherd-agent
+  participant P as app
+  participant T as tetherd
+  participant Y as your server
+  B->>L: GET /orders with X-Dev-User and X-Dev-Token
+  L->>A: port 8080
+  alt the user and token match an attached session
+    A->>T: http stream
+    T->>Y: localhost, incoming.local_port
+    Y-->>T: response
+    T-->>A: response
+  else no match: health checks, everyone else
+    A->>P: port 8081
+    P-->>A: response
+  end
+  A-->>L: response
+  L-->>B: response
+```
+
+The agent always runs as an HTTP/1.1 reverse proxy in front of the app, and
+it decides per request, because the ALB reuses its connections. It steals a
+request only when `X-Dev-User` names an attached user and `X-Dev-Token` is
+that user's token, compared in constant time. (Both header names are
+configurable with `incoming.match`.) The agent then opens an `http` stream to
+that user's CLI, which proxies the request to
+`localhost:<incoming.local_port>`. Every other request goes to the app:
+health checks, requests without both headers, and every WebSocket upgrade.
+
+Sometimes a matched request never reaches your server: the session went
+away, or nothing is listening on your local port. The agent then serves the
+request from the app instead, replaying the body it buffered, up to 1 MiB.
+If the body was larger than that, the client gets a 502. Once the request may
+have reached your server, a failure is relayed as a 502 rather than replayed,
+so a POST never runs twice.
+
+### Teardown
+
+When your command exits, or you press Ctrl-C, tetherd removes the
+`/etc/resolver` files and the pf rules and closes its sessions, and the agent
+sends every request to the app again. The helper treats each socket
+connection as a session. If tetherd dies without cleaning up, the helper
+removes that session's resolver files, host route and pf rules when the
+connection drops, and it clears anything left over each time it starts.
+
 ## What this cannot do
 
 - **No filesystem transparency.** Only the task's environment variables and
