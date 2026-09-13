@@ -45,14 +45,28 @@ type connState struct {
 	routeSet    bool
 }
 
-// ListenAndServe listens on a UNIX socket (mode 0666) until ctx is done.
+// socketMode is the mode of the helper's UNIX socket. Plist writes the same
+// value into SockPathMode (in decimal, as launchd requires), so that the
+// socket launchd binds and the one this function binds are identical: the
+// permissions are part of the protocol - internal/doctor and the CLI's "not
+// running" advice both assume any admin user can connect, and the actual
+// authorization is Server.Allow, not the file mode.
+const socketMode = 0o666
+
+// ListenAndServe binds its own UNIX socket and serves until ctx is done.
+//
+// This is the path taken when launchd handed over no listener: the
+// foreground `sudo tetherd-helper` of hack/e2e-local.sh, and a launchd start
+// from a plist with no Sockets entry. Under socket activation the caller
+// passes the inherited listener to Serve instead and nothing here runs -
+// binding would unlink the socket launchd owns.
 func (s *Server) ListenAndServe(ctx context.Context, socketPath string) error {
 	os.Remove(socketPath)
 	ln, err := net.Listen("unix", socketPath)
 	if err != nil {
 		return err
 	}
-	if err := os.Chmod(socketPath, 0o666); err != nil {
+	if err := os.Chmod(socketPath, socketMode); err != nil {
 		ln.Close()
 		return err
 	}
