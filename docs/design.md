@@ -87,7 +87,7 @@ mirror（共有 DB への二重書き込みの扱いを決めてから）、UDP 
 
 ### 3.1 tetherd-agent（サイドカー）
 
-- Go 製の単一バイナリ、distroless イメージ（`ghcr.io/kyosu-1/tetherd-agent`、arm64 / amd64）。タスク定義にコンテナを 1 つ足す
+- Go 製の単一バイナリ、distroless イメージ（arm64 / amd64）。タスク定義にコンテナを 1 つ足す。**イメージを公開しているパイプラインはこのリポジトリに無い**ので、利用者が自分のレジストリに push する（`make push-images ECR_REGISTRY=...`。`deploy/dev-env/` が ECR リポジトリを作る実例）。公開レジストリでの配布は v1.0 の計画に持ち越し
 - awsvpc モードではタスク内の全コンテナがネットワーク名前空間を共有するため、mirrord のエージェントと同じ立ち位置（同じ ENI、同じ SG、同じ IP）に立てる
 - `:8080` で ALB からのトラフィックを受け、常に HTTP/1.1 リバースプロキシとして動く。ALB は接続を keep-alive で使い回すので振り分けはリクエスト単位。セッションが無ければ全リクエストが `:8081` の app へ
 - セッション中だけルーティングテーブルを持ち、ユーザー名とトークンが一致したリクエストを該当ユーザーのラップトップへ流す
@@ -97,7 +97,7 @@ mirror（共有 DB への二重書き込みの扱いを決めてから）、UDP 
 - セッションが切れたら即座に素通しに戻す（リクエスト途中のものは完了まで待つ）
 - AWS API は呼ばない。Linux capability は env 読み取りのための `SYS_PTRACE` のみ。root で動かす（capability を effective にするため）
 - 常時データパスにいるので `essential: true` と `restartPolicy` を推奨
-- ALB を受けるポートは env で変更可（`TETHERD_PROXY`、既定 `0.0.0.0:8080`）。制御ポートの `TETHERD_CONTROL` も env にあるが**実質固定** — CLI の SSM トランスポートが 9900 を固定で転送するので、変えると誰も繋げなくなる（v0.4 でトランスポート側に教える）
+- ALB を受けるポートは env で変更可（`TETHERD_PROXY`、既定 `0.0.0.0:8080`）。制御ポートの `TETHERD_CONTROL` も env にあるが**実質固定**。v0.4 で agent 側の既定と CLI の SSM トランスポートが転送するポートを 1 つの定数（`internal/proto` の `DefaultControlPort`）にまとめたので両者がずれることは無くなったが、**デプロイが `TETHERD_CONTROL` を変えても CLI は追随できない** — 新しいポートを知るための唯一の経路が制御ポート自身なので、変えた agent は誰も繋げない listen になる。真に追随させるには `.tetherd.yml` に書かせる（CLI が接続前に読める場所）必要があり、それは v1 の判断
 
 ### 3.2 環境変数と secrets の取得 — 実行中のプロセスから読む
 
@@ -263,9 +263,9 @@ utun に `route-to` してユーザー空間スタックで終端する案は、
 ### macOS ヘルパーの配布と保守
 
 - 入れるのは root の LaunchDaemon 1 つ（Network Extension でも kext でもない）
-- 配布は Homebrew tap。`brew install kyosu-1/tetherd/tetherd && sudo tetherd-helper install`。sudo はこの 1 回だけで、グループ作成、`tetherd-exec` の配置、LaunchDaemon の plist 生成と登録を行う
-- **ヘルパーは常駐しない。** launchd がソケットを保持し、最初の接続で root プロセスを起動するソケットアクティベーション。接続が無くなれば終了し、クラッシュ時だけ launchd が再起動して起動時の掃除で残留ルールを消す。プロセスの寿命がセッションに一致する
-- brew 経由のバイナリには quarantine 属性が付かないので署名・公証は v1 ではしない。GitHub Releases からの直接ダウンロードは Developer ID を取ってから
+- 配布は Homebrew tap `kyosu-1/homebrew-tap`（GoReleaser の `homebrew_casks.repository.name` と一致）。`brew install kyosu-1/tap/tetherd && sudo tetherd-helper install`。sudo はこの 1 回だけで、グループ作成、`tetherd-exec` の配置、LaunchDaemon の plist 生成と登録を行う
+- **本来の設計ではヘルパーは常駐しない**（v0.4 実測: ソケットアクティベーションは未実装で、`RunAtLoad: true` で常駐する。spec §8 の Ruling S）。launchd がソケットを保持し、最初の接続で root プロセスを起動するソケットアクティベーション。接続が無くなれば終了し、クラッシュ時だけ launchd が再起動して起動時の掃除で残留ルールを消す。プロセスの寿命がセッションに一致する
+- 署名・公証は v1 ではしない。Homebrew は cask のダウンロードを**必ず** quarantine する（`$(brew --repository)/Library/Homebrew/cask/download.rb` の `quarantine` が `Quarantine.cask!` を呼ぶ）ので、属性は cask の `postflight` の `xattr -dr com.apple.quarantine` で外す。formula にはその口が無く、これが formula ではなく cask を選んだ理由（spec §8、`docs/install.md`）。GitHub Releases から手で落としたバイナリは属性が付いたままなので、その使い方はサポートしない。Developer ID を取ったら署名・公証してこの後始末を無くす
 - 依存 API は pf（Lion 以降、Apple 自身が使用、`pfctl` は現行 OS に健在）、`DIOCNATLOOK`、`setregid` の 3 つ。いずれも廃止の兆しは無い
 - pf の唯一の罠は `/etc/pf.conf` にアンカー参照を書くと OS 更新で消えること。そこで **ディスクには触らず**、既定の `/etc/pf.conf` がすでに持つワイルドカード参照 `rdr-anchor "com.apple/*"` / `anchor "com.apple/*"` に乗る子アンカー `com.apple/900.tetherd` にルールをロードする。メインルールセットには一切手を入れない。`pfctl -E` / `-X` の参照カウントで有効化する（`/etc/pf.conf` のコメントに書かれている作法）
 - Ventura 以降は LaunchDaemon 追加時に「バックグラウンド項目が追加されました」と通知が出てユーザーが無効化できるので、`doctor` がヘルパー無応答を検出して「システム設定 → 一般 → ログイン項目」を案内する
@@ -340,7 +340,9 @@ aws:
 target:
   cluster: myapp-dev
   service: api
-  container: app                # env を読むコンテナ
+  # `container:` は書けない（v0.4 から起動時エラー、終了コード 2）。env を読む
+  # コンテナを決めるのは agent 側の TETHERD_APP_CONTAINER（既定 app）
+  agent_container: tetherd-agent # サイドカーを改名しているときだけ（既定 tetherd-agent）
   env: dev                      # agent の TETHERD_ENV と照合
 
 env:
@@ -413,7 +415,7 @@ CLI (laptop)                         agent                          app / RDS
 2. ALB のターゲットグループのポートを 8080（agent）に向ける。sg-app のインバウンドも 8080 に
 3. サービスで `enableExecuteCommand: true`、タスクロールに SSM の権限（`ssmmessages:CreateControlChannel` / `CreateDataChannel` / `OpenControlChannel` / `OpenDataChannel`）。無ければ SSM の VPC Endpoint 3 つか NAT
 4. 開発者の IAM に ECS / EC2 の読み取りと `ssm:StartSession`（対象を dev クラスターのタスク ARN に限定）。Secrets Manager / SSM Parameter / KMS の権限は **不要**（env は agent が渡す）。`ecs:ExecuteCommand` も不要（ポートフォワードは StartSession を直接呼ぶ）
-5. 開発者のラップトップに `brew install kyosu-1/tetherd/tetherd && sudo tetherd-helper install`
+5. 開発者のラップトップに `brew install kyosu-1/tap/tetherd && sudo tetherd-helper install`
 
 ALB にルールを足す必要はない（agent が L7 で振り分ける）。本番のタスク定義には agent 自体を入れない。agent 側に AWS 権限は要らず、Linux capability は env 読み取りのための SYS_PTRACE のみ。インターネットに出られない VPC では agent イメージを ECR pull-through cache 経由で取る。`deploy/dev-env/`（Terraform）がこの手順の実例。
 
@@ -462,6 +464,12 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
       "Resource": "arn:aws:ssm:*:*:session/${aws:username}-*"
     },
     {
+      "Sid": "InspectTargetGroup",
+      "Effect": "Allow",
+      "Action": "elasticloadbalancing:DescribeTargetGroups",
+      "Resource": "*"
+    },
+    {
       "Sid": "Optional",
       "Effect": "Allow",
       "Action": ["sts:GetCallerIdentity", "servicediscovery:ListNamespaces"],
@@ -473,6 +481,7 @@ ALB にルールを足す必要はない（agent が L7 で振り分ける）。
 
 - 認証は AWS SDK の標準チェーン（SSO プロファイル、アクセスキー、AssumeRole）をそのまま使う。tetherd が `ssm:StartSession` を呼んでストリーム URL とトークンを得て session-manager-plugin に渡す（AWS CLI と同じ手順だが AWS CLI 自体は不要）
 - IAM Identity Center（SSO）では `${aws:username}` が無いので `OwnSessions` の Resource は `arn:aws:ssm:*:*:session/*` にする
+- `InspectTargetGroup` は `tetherd doctor` のターゲットグループの行だけが使う（steal は HTTP1 のターゲットグループでしか成立しない。spec §5.1。同じ呼び出しでターゲットグループのポートも分かるが、agent の受け口は `TETHERD_PROXY` で動かせるので既定と違っても `⚠` 止まり）。ELB の `Describe*` はリソースレベルの権限を取らない（Service Authorization Reference にリソース型が無い）ので `Resource` は `*` 以外に書けず、`doctor` を配らないなら外してよい
 - タスクロールの認証情報は CLI のループバック口から（`pin_credential_route` を有効にしたときは `169.254.170.2` の固定経路からも）ラップトップに届くので、開発者はローカルからタスクロールの権限を実質的に使える。「dev タスクができることは開発者もできる」という意味で dev では通常許容範囲だが、タスクロールが必要以上に広くないかは一度見ておく
 
 ---

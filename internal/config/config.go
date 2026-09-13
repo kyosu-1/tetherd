@@ -27,27 +27,31 @@ type AWS struct {
 }
 
 // Target names the service to attach to.
+//
+// There is deliberately no Container field. Which container's environment
+// is read is the agent's decision, and the agent already has
+// TETHERD_APP_CONTAINER in the task definition for it; honouring a second
+// name from here would put one fact in two places, and the failure when
+// they disagreed would be silent - the CLI asking for "web" while the agent
+// reads "app" and reports success. A `target.container` key is refused by
+// decodeShared, which names TETHERD_APP_CONTAINER, rather than being parsed
+// into a field nothing reads (which is what it was until v0.4) or falling
+// through to KnownFields(true)'s bare "field container not found".
 type Target struct {
 	Cluster string `yaml:"cluster"`
 	Service string `yaml:"service"`
-	// Container is parsed and deliberately not read. Which container's
-	// environment is read is the agent's decision, and the agent already
-	// has TETHERD_APP_CONTAINER in the task definition for it; honouring a
-	// second name from here would put one fact in two places, and the
-	// failure when they disagreed would be silent - the CLI asking for
-	// "web" while the agent reads "app" and reports success.
+	// AgentContainer is the name of the tetherd-agent sidecar, for a
+	// deployment that calls it something else. Unlike the refused
+	// `container` above, this one the CLI genuinely acts on: discovery
+	// rejects a task that has no container by this name, and doctor's
+	// target group row reads that container's TETHERD_PROXY out of the
+	// task definition - so a renamed sidecar is a name the CLI has to be
+	// told, not one it could learn from the agent.
 	//
-	// The cost of leaving it unread is that a developer whose app container
-	// is named "web" gets no error from setting this, and then debugs a
-	// `task env` failure whose advice points at a different mechanism. That
-	// is what docs/config.md's entry for the key is for: it says the name
-	// has to go in the task definition's TETHERD_APP_CONTAINER.
-	//
-	// KnownFields(true) is why the field stays rather than being deleted:
-	// removing it would turn every committed .tetherd.yml that carries the
-	// key into a hard parse error.
-	Container string `yaml:"container"`
-	Env       string `yaml:"env"`
+	// Empty means "the default", which is applied once, downstream
+	// (ecs.DefaultAgentContainer). This package holds no defaults.
+	AgentContainer string `yaml:"agent_container"`
+	Env            string `yaml:"env"`
 }
 
 // Env tunes what reaches the child.
@@ -181,9 +185,23 @@ func Load(sharedPath, personalPath string) (Config, error) {
 // struct; and a file with no `version` key at all - the commonest mistake -
 // gets a message that names the file and says what to add, instead of
 // "unsupported version 0".
+//
+// The same lenient pass carries the `target.container` refusal, for the
+// same reason: the field is gone from Target, so the strict decode below
+// would answer "field container not found in type config.Target" - true,
+// but it names neither why the key cannot work nor the setting that
+// actually decides. Refusing it here, before the strict decode, means the
+// message that reaches the developer names TETHERD_APP_CONTAINER. Presence
+// is read from a yaml.Node rather than a *string because presence is the
+// whole question: measured, a *string stays nil for `container:` and
+// `container: ~` (both of which are the key, written), while the node is
+// non-zero for every spelling and carries the line number.
 func decodeShared(path string, data []byte, into *Shared) error {
 	var probe struct {
 		Version *int `yaml:"version"`
+		Target  struct {
+			Container yaml.Node `yaml:"container"`
+		} `yaml:"target"`
 	}
 	if err := yaml.Unmarshal(data, &probe); err != nil {
 		return fmt.Errorf("%s: %w", path, err)
@@ -193,6 +211,10 @@ func decodeShared(path string, data []byte, into *Shared) error {
 		return fmt.Errorf("%s: missing `version` key; add `version: %d` at the top of the file", path, Version)
 	case *probe.Version != Version:
 		return fmt.Errorf("%s: unsupported version %d (this tetherd understands version %d)", path, *probe.Version, Version)
+	}
+	if !probe.Target.Container.IsZero() {
+		return fmt.Errorf("%s:%d: `target.container` does nothing and is refused rather than ignored: which container's environment tetherd reads is decided by TETHERD_APP_CONTAINER on the tetherd-agent sidecar in the task definition, not from here. Delete the key, and set TETHERD_APP_CONTAINER in the task definition if the application container is not the one the agent reads today",
+			path, probe.Target.Container.Line)
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)

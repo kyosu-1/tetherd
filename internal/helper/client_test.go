@@ -106,7 +106,8 @@ func TestDialRefusesAHelperSpeakingAnOlderProtocol(t *testing.T) {
 	if ve.Helper != "1" || ve.CLI != ProtocolVersion {
 		t.Errorf("VersionError = %+v, want helper 1 and cli %s", ve, ProtocolVersion)
 	}
-	// The remediation is spec §7's, and the same one internal/doctor's
+	// The remediation is spec §8's (配布とインストール; §7 is the
+	// control protocol), and the same one internal/doctor's
 	// CheckHelper puts in Next: the helper is a launchd daemon that
 	// `tetherd-helper install` bootstraps, so `brew services restart
 	// tetherd` cannot restart it. This is the only path a v0.2b user takes

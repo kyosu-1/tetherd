@@ -14,12 +14,14 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
 	awsecs "github.com/aws/aws-sdk-go-v2/service/ecs"
+	awselb "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	awsssm "github.com/aws/aws-sdk-go-v2/service/ssm"
 	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/kyosu-1/tetherd/internal/awsid"
 	"github.com/kyosu-1/tetherd/internal/capture"
 	"github.com/kyosu-1/tetherd/internal/capture/pfrdr"
+	"github.com/kyosu-1/tetherd/internal/doctor"
 	"github.com/kyosu-1/tetherd/internal/helper"
 	ecsprov "github.com/kyosu-1/tetherd/internal/provider/ecs"
 	"github.com/kyosu-1/tetherd/internal/transport"
@@ -60,6 +62,26 @@ type awsProvider interface {
 	// doctor` asks it first, so a machine with no working credentials is
 	// told so, instead of being told its dev service has no attachable task.
 	Identity(ctx context.Context) (string, error)
+}
+
+// targetGroupReader is the AWS read that only `tetherd doctor`'s target
+// group row makes: which ALB target group the service registers its tasks
+// in, what protocol version that group speaks, and the port the agent
+// container is told to serve the ALB on.
+//
+// It is a second interface rather than a method on awsProvider because not
+// every provider has a target group to read, and a method on awsProvider
+// would oblige each of them to carry an answer it does not have.
+// `--transport direct` is a bare TCP dial to an agent with no load balancer
+// in front of it at all (directProvider), and a second provider - Cloud Run
+// - answers "where does the incoming request arrive" its own way or not at
+// all. A provider that does not implement this gets a `?` row rather than a
+// green one, which is the same rule every other ungathered fact follows.
+//
+// Through the CLI that arm is unreachable: doctor refuses --transport direct
+// before any row is gathered, so the provider is always the one below.
+type targetGroupReader interface {
+	TargetGroup(ctx context.Context, t ecsprov.Target, definitionARN string) (doctor.TargetGroup, error)
 }
 
 // HelperClient is the part of the privileged helper the CLI uses.
@@ -242,6 +264,16 @@ func (p *sdkProvider) SecretNames(ctx context.Context, definitionARN string) (ma
 
 func (p *sdkProvider) PIDMode(ctx context.Context, definitionARN string) (string, error) {
 	return ecsprov.PIDMode(ctx, awsecs.NewFromConfig(p.cfg), definitionARN)
+}
+
+// TargetGroup implements targetGroupReader. One ECS client serves both ECS
+// reads - the service's load balancer configuration and the task definition
+// - and it is built from the same aws.Config as every other call this
+// provider makes, so doctor still opens exactly one AWS session however many
+// APIs a row touches.
+func (p *sdkProvider) TargetGroup(ctx context.Context, t ecsprov.Target, definitionARN string) (doctor.TargetGroup, error) {
+	ecsAPI := awsecs.NewFromConfig(p.cfg)
+	return ecsprov.TargetGroup(ctx, ecsAPI, awselb.NewFromConfig(p.cfg), ecsAPI, t, definitionARN)
 }
 
 func (p *sdkProvider) Identity(ctx context.Context) (string, error) {

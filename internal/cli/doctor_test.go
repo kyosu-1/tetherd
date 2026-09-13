@@ -20,6 +20,8 @@ import (
 
 	"github.com/kyosu-1/tetherd/internal/agent"
 	"github.com/kyosu-1/tetherd/internal/doctor"
+	"github.com/kyosu-1/tetherd/internal/proto"
+	ecsprov "github.com/kyosu-1/tetherd/internal/provider/ecs"
 	"github.com/kyosu-1/tetherd/internal/session"
 	"github.com/kyosu-1/tetherd/internal/transport"
 	ssmtr "github.com/kyosu-1/tetherd/internal/transport/ssm"
@@ -97,6 +99,11 @@ var everyDoctorRow = []string{
 	"your AWS identity",
 	"attachable task",
 	"pidMode",
+	// The ALB target group sits with the other reads keyed on the task
+	// rather than beside the steal row, because the agent handshake between
+	// them carries the report's longest allowance: a row gathered after it
+	// is the first the budget cuts short.
+	"target group",
 	"agent session",
 	"task env",
 	"task role",
@@ -124,8 +131,44 @@ func wantRowSet(t *testing.T, out string) []doctorRow {
 		t.Fatalf("the remote domains row must be printed last: %v", got)
 	}
 	wantUncheckedRowsSaySo(t, rows, out)
+	wantNoRawClockAsAFinding(t, rows, out)
 	wantNoStrayLines(t, out)
 	return rows
+}
+
+// wantNoRawClockAsAFinding is the other half of what the four statuses
+// promise, and it is asserted on every report the tests render for the same
+// reason wantUncheckedRowsSaySo is: a row that drifted onto the wrong status
+// is the bug doctor.Unknown exists to prevent, and it drifts one row at a
+// time.
+//
+// A context error is never a measurement. It says "my own clock ran out", so
+// a row carrying it as a ✓, ⚠ or ✗ is claiming a fact about the developer's
+// machine that doctor never established - and worse, it is answered with the
+// judgement's advice for a *different* problem: "sudo tetherd-helper install"
+// for a group database that was never read, "brew install" for a PATH that
+// was never searched, "check the tetherd-agent sidecar is running" for a
+// handshake that never got a reply. Every clock in doctor.go is therefore
+// routed through checkTimedOut, which names what did not answer.
+//
+// ? rows are exempt, and only ? rows: that mark means "not checked", it is
+// the one status that cannot move the exit code, and the steal row's clock
+// arm deliberately prints the error it got after its "not checked:" prefix.
+// A raw clock landing there is the honest outcome; landing anywhere else is
+// the defect.
+func wantNoRawClockAsAFinding(t *testing.T, rows []doctorRow, out string) {
+	t.Helper()
+	for _, r := range rows {
+		if r.mark == "?" {
+			continue
+		}
+		for _, raw := range []string{"context deadline exceeded", "context canceled"} {
+			if strings.Contains(r.detail, raw) {
+				t.Errorf("the %q row reports a clock as a %s finding: %q\n  → %s\n%s",
+					r.name, r.mark, r.detail, r.next, out)
+			}
+		}
+	}
 }
 
 // wantUncheckedRowsSaySo pins what the ? mark promises: a row that could not
@@ -191,18 +234,60 @@ func wantMarks(t *testing.T, rows []doctorRow, want map[string]string) {
 // is the state of every machine the test suite runs on.
 var errNoHelperForTest = errors.New("tetherd-helper is not running (/var/run/tetherd.sock): no such file")
 
+// albProvider is a fakeProvider that also reads an ALB target group - the
+// one capability `tetherd doctor` needs and `tetherd run` does not, which is
+// why it is a second interface in production too (see targetGroupReader).
+//
+// A wrapper rather than fields on fakeProvider: run's fixtures are built in
+// dozens of places and none of them has an opinion about a target group, so
+// the fixture that does lives with the tests that read it. Field promotion
+// means every existing doctor test still sets p.pidModeErr and the rest
+// through this type unchanged.
+type albProvider struct {
+	*fakeProvider
+	tg    doctor.TargetGroup
+	tgErr error
+	// tgTarget and tgDefinitionARN record what the row asked about, so a
+	// test can pin that it asks about the service under test and the task
+	// definition of the task that was discovered - not, say, a stale ARN.
+	tgTarget        ecsprov.Target
+	tgDefinitionARN string
+}
+
+func (p *albProvider) TargetGroup(_ context.Context, t ecsprov.Target, definitionARN string) (doctor.TargetGroup, error) {
+	p.tgTarget, p.tgDefinitionARN = t, definitionARN
+	return p.tg, p.tgErr
+}
+
+// healthyTargetGroup is the dev environment's own target group: HTTP/1.1 on
+// the port the agent serves the ALB on by default. The port is
+// proto.DefaultProxyPort and not 8080 because that is the whole point of
+// exporting the constant - a literal here would pass a test that the agent
+// and the check disagree about.
+func healthyTargetGroup() doctor.TargetGroup {
+	return doctor.TargetGroup{
+		Name:            "tethrd-dev",
+		Protocol:        "HTTP",
+		ProtocolVersion: doctor.TargetGroupHTTP1,
+		Port:            proto.DefaultProxyPort,
+	}
+}
+
 // healthyProvider is an AWS that answers every question correctly.
-func healthyProvider(agentAddr string) *fakeProvider {
-	return &fakeProvider{
-		region: "ap-northeast-1",
-		task: transport.Task{
-			ID: "t1", SubnetID: "subnet-a", DefinitionARN: "arn:def",
-			StartedAt: time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC),
+func healthyProvider(agentAddr string) *albProvider {
+	return &albProvider{
+		fakeProvider: &fakeProvider{
+			region: "ap-northeast-1",
+			task: transport.Task{
+				ID: "t1", SubnetID: "subnet-a", DefinitionARN: "arn:def",
+				StartedAt: time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC),
+			},
+			vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+			agentAddr: agentAddr,
+			pidMode:   "task",
+			identity:  "arn:aws:sts::1:assumed-role/dev/me",
 		},
-		vpc:       []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
-		agentAddr: agentAddr,
-		pidMode:   "task",
-		identity:  "arn:aws:sts::1:assumed-role/dev/me",
+		tg: healthyTargetGroup(),
 	}
 }
 
@@ -211,8 +296,8 @@ func healthyProvider(agentAddr string) *fakeProvider {
 // about. None of them touches the machine the tests run on: no dscl, no
 // /usr/local/libexec, no PATH lookup and no real interface list, so the rows
 // mean the same thing on a developer's laptop and in CI.
-func healthyDoctorDeps(p *fakeProvider) Deps {
-	d := depsFor(p)
+func healthyDoctorDeps(p *albProvider) Deps {
+	d := Deps{NewAWSProvider: func(context.Context, RunOptions) (awsProvider, error) { return p, nil }}
 	d.DialHelper = func(string) (HelperClient, error) { return &fakeHelperClient{}, nil }
 	d.LookupGroup = func(context.Context, string) (int, bool, error) { return 309, true, nil }
 	d.StatFile = func(string) (fs.FileMode, int, error) { return 0o755 | fs.ModeSetgid, 309, nil }
@@ -227,7 +312,7 @@ func healthyDoctorDeps(p *fakeProvider) Deps {
 // can pin that it opens exactly one: the identity row needs a session of its
 // own to attribute failures correctly, and that same session is handed to
 // discoverTask rather than letting it build a second.
-func countSessions(d *Deps, p *fakeProvider, sessions *int) {
+func countSessions(d *Deps, p *albProvider, sessions *int) {
 	d.NewAWSProvider = func(context.Context, RunOptions) (awsProvider, error) {
 		*sessions++
 		return p, nil
@@ -1003,6 +1088,137 @@ func TestBoundedCancelsTheCallItAbandons(t *testing.T) {
 	case <-cancelled:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the abandoned call was never cancelled, so whatever it started keeps running")
+	}
+}
+
+// TestBoundedsDirectArmDoesNotTakeAContextErrorAsAnAnswer is the pin for the
+// defect TestBoundedCancelsTheCallItAbandons only ever caught by luck.
+//
+// That test produces the same state by racing a real 50ms bound against a
+// call that answers with its own cancellation, so it passes whenever the
+// timer wins the select - which is nearly always, and was why the bug lived
+// through v0.3b while a test named after it stood green. Here the clock is
+// taken out of reach (a nil channel is never ready) and the outer context is
+// never done, so bounded's direct arm is the *only* arm the select can take,
+// on any machine, under any load. What arrives on it is what a dscl killed by
+// its own fctx answers: context.DeadlineExceeded and nothing else.
+//
+// Mutation: drop the boundedAnswered check from bounded's direct arm and this
+// fails on the raw error, deterministically, first run.
+func TestBoundedsDirectArmDoesNotTakeAContextErrorAsAnAnswer(t *testing.T) {
+	restoreBoundedAfter(t, func(time.Duration, <-chan struct{}) <-chan time.Time { return nil })
+
+	for _, answer := range []error{
+		context.DeadlineExceeded,
+		context.Canceled,
+		// Wrapped, which is how it actually arrives: LookupGroup returns
+		// exec.Cmd's error, the AWS SDK wraps its own.
+		fmt.Errorf("dscl: %w", context.DeadlineExceeded),
+	} {
+		v, err := bounded(context.Background(), 150*time.Millisecond, "the tetherd group lookup",
+			func(context.Context) (int, error) { return 7, answer }, nil)
+		if !isCheckTimeout(err) {
+			t.Errorf("answer %v: err = %v, want a check timeout so the row can route it", answer, err)
+		}
+		if err != nil && strings.Contains(err.Error(), "context") {
+			t.Errorf("answer %v: the raw clock reached the caller: %q", answer, err.Error())
+		}
+		if v != 0 {
+			t.Errorf("answer %v: v = %d, want the zero value - nothing was measured", answer, v)
+		}
+	}
+}
+
+// TestBoundedJudgesADeliveredResultTheWayAbandonBoundedDoes pins the property
+// that the fix is, rather than the two call sites it has: whichever of the
+// two paths a delivered result takes to the caller, the caller gets the same
+// thing. The direct arm and abandonBounded's re-check are reachable for the
+// *same* result - fctx's deadline and the bound's timer are derived from one
+// timeout microseconds apart, so the call's own cancellation and the clock
+// become ready at the same instant and a blocked select picks between them at
+// random - and a report whose wording depends on that coin flip is the
+// misattribution the four statuses exist to prevent.
+//
+// Asserted as an equality between the two paths, not as two copies of the
+// expected answer, so the test still holds if the answer itself is later
+// changed on purpose. Both are deterministic: the direct arm gets a clock
+// that cannot fire, and abandonBounded is called with the result already in
+// the channel.
+func TestBoundedJudgesADeliveredResultTheWayAbandonBoundedDoes(t *testing.T) {
+	restoreBoundedAfter(t, func(time.Duration, <-chan struct{}) <-chan time.Time { return nil })
+	boom := errors.New("dscl: eDSPermissionError")
+
+	for _, answer := range []error{
+		nil,
+		boom,
+		fmt.Errorf("read group: %w", boom),
+		context.DeadlineExceeded,
+		context.Canceled,
+		fmt.Errorf("dscl: %w", context.DeadlineExceeded),
+		fmt.Errorf("dial: %w", context.Canceled),
+	} {
+		direct, directErr := bounded(context.Background(), 150*time.Millisecond, "probe",
+			func(context.Context) (int, error) { return 7, answer }, nil)
+
+		ch := make(chan boundedResult[int], 1)
+		ch <- boundedResult[int]{v: 7, err: answer}
+		abandoned, abandonedErr := abandonBounded(ch, nil, &checkTimeout{msg: "probe did not answer"})
+
+		if direct != abandoned {
+			t.Errorf("answer %v: direct arm gave %d, abandonBounded gave %d", answer, direct, abandoned)
+		}
+		if isCheckTimeout(directErr) != isCheckTimeout(abandonedErr) {
+			t.Errorf("answer %v: one path called this a clock and the other did not: %v vs %v",
+				answer, directErr, abandonedErr)
+		}
+		if errors.Is(directErr, boom) != errors.Is(abandonedErr, boom) {
+			t.Errorf("answer %v: only one path kept the call's own failure: %v vs %v",
+				answer, directErr, abandonedErr)
+		}
+		if (directErr == nil) != (abandonedErr == nil) {
+			t.Errorf("answer %v: only one path reported a failure: %v vs %v", answer, directErr, abandonedErr)
+		}
+	}
+}
+
+// TestDoctorBlamesTheClockNotTheGroupDatabaseWhenTheLookupIsCancelled is the
+// row the defect was seen through, made deterministic. On a pristine
+// e88a20b/main tree TestDoctorBoundsAWedgedGroupLookup printed
+//
+//	setgid tetherd-exec  ✗  cannot read the tetherd group: context deadline exceeded
+//
+// in 1 of 20 rounds of `-race -count=5` (measured, this package) - advice to
+// run `sudo tetherd-helper install` for a group database that was never read.
+// This test reaches the same row with no clock in play at all: the per-check
+// bound cannot fire, so the lookup's answer is the only thing that can end
+// the wait, and the answer is its own cancellation.
+func TestDoctorBlamesTheClockNotTheGroupDatabaseWhenTheLookupIsCancelled(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	d := healthyDoctorDeps(healthyProvider(ag.addr))
+	restoreBoundedAfter(t, func(time.Duration, <-chan struct{}) <-chan time.Time { return nil })
+	d.LookupGroup = func(context.Context, string) (int, bool, error) {
+		return 0, false, context.DeadlineExceeded
+	}
+
+	opts := doctorOpts()
+	opts.Timeout = 150 * time.Millisecond
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), opts, &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1\n%s", code, out.String())
+	}
+	rows := wantRowSet(t, out.String())
+	r := findRow(t, rows, "setgid tetherd-exec")
+	if !strings.Contains(r.detail, "did not answer") {
+		t.Errorf("the row must say the lookup never answered, got %q", r.detail)
+	}
+	// The next step is the one that matters to a person: install advice for
+	// a database nothing read sends them to fix a machine that is fine.
+	if strings.Contains(r.next, "tetherd-helper install") {
+		t.Errorf("a clock must not be answered with install advice: %q", r.next)
 	}
 }
 
@@ -2610,5 +2826,171 @@ func TestSkipAgentHelpNamesEveryRowItGivesUp(t *testing.T) {
 		if !strings.Contains(f.Usage, row) {
 			t.Errorf("--skip-agent help does not name the %q row it gives up: %q", row, f.Usage)
 		}
+	}
+}
+
+// --- the target group row --------------------------------------------------
+
+// TestDoctorReportsTheTargetGroup: the row reads the service under test and
+// the task definition of the task discovery actually found, and reports the
+// group it got. An ARN from somewhere else would be a verdict about
+// somebody else's target group.
+func TestDoctorReportsTheTargetGroup(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	p := healthyProvider(ag.addr)
+	d := healthyDoctorDeps(p)
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	wantMarks(t, rows, map[string]string{"target group": "✓"})
+	if code != 0 {
+		t.Fatalf("a healthy target group must not fail the report, got %d\n%s", code, out.String())
+	}
+	if p.tgTarget.Cluster != "c" || p.tgTarget.Service != "api" {
+		t.Errorf("the row asked about %+v, not the service under test", p.tgTarget)
+	}
+	if p.tgDefinitionARN != p.task.DefinitionARN {
+		t.Errorf("the row asked about task definition %q, want the discovered task's %q", p.tgDefinitionARN, p.task.DefinitionARN)
+	}
+}
+
+// TestDoctorFailsAnHTTP2TargetGroup is the verdict half of the row: spec
+// §5.1 puts HTTP2 and gRPC out of scope, the agent is an HTTP/1.1 server, so
+// behind such a group no request reaches it at all. That is a ✗ and it fails
+// the command.
+func TestDoctorFailsAnHTTP2TargetGroup(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	p := healthyProvider(ag.addr)
+	p.tg.ProtocolVersion = "HTTP2"
+	d := healthyDoctorDeps(p)
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	row := findRow(t, rows, "target group")
+	if row.mark != "✗" || !strings.Contains(row.detail, "HTTP2") {
+		t.Errorf("target group = %q %q, want ✗ naming HTTP2", row.mark, row.detail)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1: steal cannot work behind an HTTP2 target group\n%s", code, out.String())
+	}
+}
+
+// TestDoctorWarnsRatherThanFailsOnADifferentTargetGroupPort is the ruling
+// this row must not lose. TETHERD_PROXY moves the port the agent serves the
+// ALB on, so a target group pointed somewhere other than the default may be
+// exactly right - and a ✗ would fail the report for a working service.
+func TestDoctorWarnsRatherThanFailsOnADifferentTargetGroupPort(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	p := healthyProvider(ag.addr)
+	p.tg.Port = 9090
+	d := healthyDoctorDeps(p)
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	row := findRow(t, rows, "target group")
+	if row.mark != "⚠" {
+		t.Errorf("target group = %q %q, want ⚠: a moved port is a question, not a verdict", row.mark, row.detail)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0: a port difference must not fail a script\n%s", code, out.String())
+	}
+	// And the same deployment with TETHERD_PROXY pointed at that port is
+	// green: the comparison is real, not a guess about the default.
+	p.tg.AgentProxy = "0.0.0.0:9090"
+	var green strings.Builder
+	if _, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &green, d); err != nil {
+		t.Fatal(err)
+	}
+	if m := findRow(t, parseDoctorRows(green.String()), "target group").mark; m != "✓" {
+		t.Errorf("target group = %q, want ✓ once TETHERD_PROXY names the port\n%s", m, green.String())
+	}
+}
+
+// TestDoctorDoesNotFailADeveloperWithoutTheTargetGroupGrant: the grant is
+// new, and a developer whose IAM policy predates it has a working
+// environment. The row says it could not be checked, names the permission,
+// and leaves the exit code alone.
+func TestDoctorDoesNotFailADeveloperWithoutTheTargetGroupGrant(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	p := healthyProvider(ag.addr)
+	p.tgErr = errors.New("operation error Elastic Load Balancing v2: DescribeTargetGroups, https response error StatusCode: 403, AccessDenied")
+	d := healthyDoctorDeps(p)
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	row := findRow(t, rows, "target group")
+	if row.mark != "?" {
+		t.Errorf("target group = %q %q, want ?", row.mark, row.detail)
+	}
+	if !strings.Contains(row.next, "elasticloadbalancing:DescribeTargetGroups") {
+		t.Errorf("the next step must name the grant: %q", row.next)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0: a missing permission is not a broken environment\n%s", code, out.String())
+	}
+}
+
+// A row that could not be gathered because the task was never found says so
+// rather than claiming a healthy target group, the way every other
+// task-dependent row does.
+func TestDoctorReportsTheTargetGroupAsNotCheckedWithoutATask(t *testing.T) {
+	p := healthyProvider("127.0.0.1:1")
+	p.discErr = errors.New("no attachable task")
+	d := healthyDoctorDeps(p)
+
+	var out strings.Builder
+	if _, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d); err != nil {
+		t.Fatal(err)
+	}
+	row := findRow(t, wantRowSet(t, out.String()), "target group")
+	if row.mark != "?" || !strings.Contains(row.detail, "task could not be found") {
+		t.Errorf("target group = %q %q, want ? saying the task was not found", row.mark, row.detail)
+	}
+	if p.tgDefinitionARN != "" {
+		t.Errorf("the target group must not be read without a task: asked about %q", p.tgDefinitionARN)
+	}
+}
+
+// The clock is not a finding about the target group. CheckTargetGroup
+// answers any error by naming the grant, which is the wrong thing to tell a
+// developer who holds it and whose report ran out of time - and it would
+// answer it as a `?`, so an incomplete report would exit 0.
+func TestDoctorFailsTheTargetGroupRowOnAClock(t *testing.T) {
+	ag := startAgentFor(t, map[string]string{"PORT": "1"}, nil, nil)
+	p := healthyProvider(ag.addr)
+	p.tgErr = context.DeadlineExceeded
+	d := healthyDoctorDeps(p)
+
+	var out strings.Builder
+	code, err := DoctorRunWithDeps(context.Background(), doctorOpts(), &out, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := wantRowSet(t, out.String())
+	row := findRow(t, rows, "target group")
+	if row.mark != "✗" {
+		t.Errorf("target group = %q %q, want ✗ for a check that never answered", row.mark, row.detail)
+	}
+	if strings.Contains(row.next, "elasticloadbalancing:DescribeTargetGroups") {
+		t.Errorf("a clock must not be answered with an IAM grant: %q", row.next)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1: an incomplete report must not exit 0\n%s", code, out.String())
 	}
 }

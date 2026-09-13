@@ -372,6 +372,8 @@ func TestCheckCredentialEndpoint(t *testing.T) {
 func TestEveryUncheckedRowSaysSoInTheSameWords(t *testing.T) {
 	for _, r := range []Result{
 		CheckCredentialEndpoint("127.0.0.1:1", "/v2/credentials/x", "", nil, errors.New("i/o timeout")),
+		CheckTargetGroup(TargetGroup{}, errors.New("AccessDenied")),
+		CheckTargetGroup(TargetGroup{Name: "tg", Protocol: "TCP", Port: proto.DefaultProxyPort}, nil),
 		CheckDomains([]string{"a.internal"}, nil),
 		CheckDomains([]string{"a.internal", "b.internal"}, map[string]DomainProbe{"a.internal": {NotFound: true}}),
 	} {
@@ -391,6 +393,9 @@ func TestEveryUncheckedRowSaysSoInTheSameWords(t *testing.T) {
 		CheckCredentialEndpoint("", "", "", nil, nil),
 		CheckCredentialEndpoint("127.0.0.1:1", "/v2/credentials/x", "", errors.New("HTTP 502"), nil),
 		CheckCredentialEndpoint("127.0.0.1:1", "/v2/credentials/x", "arn", nil, nil),
+		CheckTargetGroup(TargetGroup{Name: "tg", Protocol: "HTTP", ProtocolVersion: TargetGroupHTTP1, Port: proto.DefaultProxyPort}, nil),
+		CheckTargetGroup(TargetGroup{Name: "tg", Protocol: "HTTP", ProtocolVersion: "HTTP2", Port: proto.DefaultProxyPort}, nil),
+		CheckTargetGroup(TargetGroup{Name: "tg", Protocol: "HTTP", ProtocolVersion: TargetGroupHTTP1, Port: 9090}, nil),
 		CheckSteal(proto.Incoming{}, 0, false),
 		CheckSteal(proto.Incoming{Enabled: true, Header: "X-Dev-User", TokenHeader: "X-Dev-Token"}, 8080, false),
 		CheckOverlap([]string{"en0 10.0.3.14/24 overlaps 10.0.0.0/16"}),
@@ -813,5 +818,179 @@ func TestCheckNamesAreStableAndDistinct(t *testing.T) {
 	// gets.
 	if CheckIdentity("arn", nil).Name == CheckCredentialEndpoint("127.0.0.1:1", "/v2/credentials/x", "arn", nil, nil).Name {
 		t.Error("the developer's identity row and the task role row must not share a name")
+	}
+}
+
+// TestCheckTargetGroup: the ALB target group is the one precondition of
+// steal that nothing else in the report can see, and its three outcomes are
+// deliberately three different marks.
+//
+// The ⚠ arms are the point of the test. A port that does not match the
+// agent's is *not* a failure - TETHERD_PROXY moves the port the agent serves
+// the ALB on, so an operator who pointed the target group at 9090 and told
+// the agent to listen there has a working service - and this check got that
+// wrong once. Every case below that disagrees about a port is asserted not
+// to be a Fail, one by one and then as a class.
+func TestCheckTargetGroup(t *testing.T) {
+	const name = "tethrd-dev"
+	http1 := func(port int, proxy string) TargetGroup {
+		return TargetGroup{Name: name, Protocol: "HTTP", ProtocolVersion: TargetGroupHTTP1, Port: port, AgentProxy: proxy}
+	}
+	denied := errors.New("operation error Elastic Load Balancing v2: DescribeTargetGroups, AccessDenied")
+	cases := []struct {
+		name   string
+		got    Result
+		status Status
+		want   []string
+	}{
+		{
+			"HTTP1 on the agent's default port",
+			CheckTargetGroup(http1(proto.DefaultProxyPort, ""), nil),
+			OK,
+			[]string{name, "HTTP1", "8080"},
+		},
+		{
+			"HTTP1 on a port TETHERD_PROXY moved the agent to",
+			CheckTargetGroup(http1(9090, "0.0.0.0:9090"), nil),
+			OK,
+			[]string{"9090", "TETHERD_PROXY=0.0.0.0:9090"},
+		},
+		{
+			"HTTP2",
+			CheckTargetGroup(TargetGroup{Name: name, Protocol: "HTTP", ProtocolVersion: "HTTP2", Port: proto.DefaultProxyPort}, nil),
+			Fail,
+			[]string{"HTTP2", "HTTP1"},
+		},
+		{
+			"gRPC",
+			CheckTargetGroup(TargetGroup{Name: name, Protocol: "HTTP", ProtocolVersion: "GRPC", Port: proto.DefaultProxyPort}, nil),
+			Fail,
+			[]string{"GRPC", "HTTP1"},
+		},
+		{
+			// The ruling this check exists to preserve.
+			"a port the agent's default does not match",
+			CheckTargetGroup(http1(9090, ""), nil),
+			Warn,
+			[]string{"9090", "8080", "sets no TETHERD_PROXY"},
+		},
+		{
+			"a port TETHERD_PROXY does not match either",
+			CheckTargetGroup(http1(8080, "0.0.0.0:9090"), nil),
+			Warn,
+			[]string{"8080", "9090", "TETHERD_PROXY=0.0.0.0:9090"},
+		},
+		{
+			"a TETHERD_PROXY that is not an address",
+			CheckTargetGroup(http1(8080, "8080"), nil),
+			Warn,
+			[]string{`"8080"`, "not an address"},
+		},
+		{
+			"a target group that names no port",
+			CheckTargetGroup(http1(0, ""), nil),
+			Warn,
+			[]string{"no port"},
+		},
+		{
+			// A developer whose IAM policy predates the grant has a working
+			// environment: ? , and ? never moves the exit code.
+			"the permission is absent",
+			CheckTargetGroup(TargetGroup{}, denied),
+			Unknown,
+			[]string{"AccessDenied", "DescribeTargetGroups"},
+		},
+		{
+			"the service registers no target group",
+			CheckTargetGroup(TargetGroup{}, errors.New("service c/api registers no target group")),
+			Unknown,
+			[]string{"registers no target group"},
+		},
+		{
+			// ELB reports a protocol version for HTTP and HTTPS groups only,
+			// so a TCP group answers nothing here - and "nothing" must not
+			// be read as "not HTTP1".
+			"a TCP target group reports no protocol version",
+			CheckTargetGroup(TargetGroup{Name: name, Protocol: "TCP", Port: proto.DefaultProxyPort}, nil),
+			Unknown,
+			[]string{"TCP", "HTTP and HTTPS"},
+		},
+	}
+	seen := map[string]string{}
+	for _, c := range cases {
+		if c.got.Status != c.status {
+			t.Errorf("%s: status %v, want %v (%+v)", c.name, c.got.Status, c.status, c.got)
+		}
+		for _, want := range c.want {
+			if !strings.Contains(c.got.Detail, want) {
+				t.Errorf("%s: detail %q does not mention %q", c.name, c.got.Detail, want)
+			}
+		}
+		if c.got.Name != "target group" {
+			t.Errorf("%s: row name %q", c.name, c.got.Name)
+		}
+		if c.status == OK && c.got.Next != "" {
+			t.Errorf("%s: nothing to do, so nothing to say: %q", c.name, c.got.Next)
+		}
+		if c.status != OK && c.got.Next == "" {
+			t.Errorf("%s: a row that is not green must say what to do", c.name)
+		}
+		// The ? rule, in the words every other ? row uses.
+		if (c.got.Status == Unknown) != strings.HasPrefix(c.got.Detail, "not checked:") {
+			t.Errorf("%s: status %v with detail %q breaks the ? rule", c.name, c.got.Status, c.got.Detail)
+		}
+		if prev, dup := seen[c.got.Detail]; dup {
+			t.Errorf("%s and %s share the detail %q", prev, c.name, c.got.Detail)
+		}
+		seen[c.got.Detail] = c.name
+	}
+	// And as a class: nothing about a port may ever fail the report. Every
+	// pairing of a target group port with an agent port is a legal
+	// deployment of one or the other, so the only ✗ this check may reach is
+	// the protocol version's.
+	for _, port := range []int{0, 80, 8080, 9090, 65535} {
+		for _, proxy := range []string{"", "0.0.0.0:8080", "0.0.0.0:9090", ":8080", "127.0.0.1:9090", "8080", "nonsense", "0.0.0.0:http", "0.0.0.0:0", "0.0.0.0:-1"} {
+			r := CheckTargetGroup(http1(port, proxy), nil)
+			if r.Status == Fail {
+				t.Errorf("target group port %d against TETHERD_PROXY %q must not fail the report: %+v", port, proxy, r)
+			}
+		}
+	}
+	// The only ✗, and it survives whatever the ports say: an HTTP2 target
+	// group is a verdict, not a question.
+	for _, port := range []int{0, 8080, 9090} {
+		r := CheckTargetGroup(TargetGroup{Name: name, Protocol: "HTTP", ProtocolVersion: "HTTP2", Port: port}, nil)
+		if r.Status != Fail {
+			t.Errorf("HTTP2 on port %d must fail: %+v", port, r)
+		}
+	}
+	// The next step must send the developer to recreate the group, not to
+	// edit it: protocol_version is absent from ModifyTargetGroup's input, so
+	// there is no field to change.
+	bad := CheckTargetGroup(TargetGroup{Name: name, Protocol: "HTTP", ProtocolVersion: "HTTP2", Port: 8080}, nil)
+	if !strings.Contains(bad.Next, "recreate") {
+		t.Errorf("the next step must say the group has to be recreated: %q", bad.Next)
+	}
+	// The ? arm names the grant it needs, because that is the only action
+	// available to a developer whose policy predates it.
+	if u := CheckTargetGroup(TargetGroup{}, denied); !strings.Contains(u.Next, "elasticloadbalancing:DescribeTargetGroups") {
+		t.Errorf("the unchecked row must name the grant: %q", u.Next)
+	}
+}
+
+// The agent's default proxy port is one constant, read by the agent that
+// applies it and by the check that compares a deployment against it. A
+// literal in the check would let the two drift, and the drift would show up
+// as doctor warning about a target group pointed exactly where the agent is
+// listening.
+func TestTheAgentsDefaultProxyPortIsTheOneTheCheckCompares(t *testing.T) {
+	tg := TargetGroup{Name: "tg", Protocol: "HTTP", ProtocolVersion: TargetGroupHTTP1, Port: proto.DefaultProxyPort}
+	if r := CheckTargetGroup(tg, nil); r.Status != OK {
+		t.Errorf("a target group on the agent's own default port must be green: %+v", r)
+	}
+	// And the same port spelled out by the deployment is the same answer.
+	tg.AgentProxy = fmt.Sprintf("0.0.0.0:%d", proto.DefaultProxyPort)
+	if r := CheckTargetGroup(tg, nil); r.Status != OK {
+		t.Errorf("TETHERD_PROXY naming the default port must be green too: %+v", r)
 	}
 }

@@ -44,7 +44,7 @@ const DefaultDoctorTimeout = 10 * time.Second
 // one cannot leave this behind.
 const DefaultAgentCheckTimeout = ssmtr.StartupWait + session.HandshakeWait
 
-// DefaultDoctorBudget bounds the whole report, not just each row. Thirteen
+// DefaultDoctorBudget bounds the whole report, not just each row. Fourteen
 // checks plus one resolve per configured domain, each allowed
 // DefaultDoctorTimeout, adds up to minutes in the worst case; nobody waits
 // that long for a diagnostic. What the budget cuts short is reported as
@@ -191,7 +191,16 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 			gid, found, err := d.LookupGroup(c, helper.GroupName)
 			return localGroup{gid: gid, found: found}, err
 		}, nil)
-	if gerr != nil {
+	switch {
+	case isCheckTimeout(gerr):
+		// A lookup that never answered, routed the way this row's other
+		// clock (the stat below) and every other clock-sensitive row route
+		// theirs. The arm below is right for a group database that answered
+		// "no" or "you may not", and its next step - run the installer - is
+		// the wrong thing to tell someone whose opendirectoryd is wedged:
+		// the install will hang on the same lookup.
+		results = append(results, timedOut("setgid tetherd-exec", gerr))
+	case gerr != nil:
 		// Not CheckExecSetgid(groupFound: false): that says "the tetherd
 		// group does not exist", which is a claim this failure gives no
 		// grounds for - the group database could not be read at all.
@@ -201,7 +210,7 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 			Detail: fmt.Sprintf("cannot read the %s group: %v", helper.GroupName, gerr),
 			Next:   "sudo tetherd-helper install",
 		})
-	} else {
+	default:
 		st, serr := bounded(ctx, timeout, execPath,
 			func(context.Context) (fileFacts, error) {
 				mode, gid, err := d.StatFile(execPath)
@@ -274,6 +283,47 @@ func DoctorRunWithDeps(ctx context.Context, opts DoctorOptions, stdout io.Writer
 			results = append(results, timedOut("pidMode", checkTimedOut(ctx, "ecs:DescribeTaskDefinition", timeout)))
 		} else {
 			results = append(results, doctor.CheckPIDMode(mode, modeErr))
+		}
+	}
+
+	// 4b. The ALB target group in front of the service. This is the one
+	// precondition of steal that is invisible from everywhere else: the
+	// agent is an HTTP/1.1 server, and behind an HTTP2 or gRPC target group
+	// the ALB speaks h2c to it, so the health check fails and the target
+	// goes unhealthy - every request, stolen or not. Neither the agent nor
+	// the ECS service can report it (ecs/types carries no protocol version
+	// at all), which is why this row costs a third API and a grant nothing
+	// else needs.
+	//
+	// It sits with the other reads keyed on the task rather than beside the
+	// steal row below, so that a service whose agent never answers still
+	// gets the verdict: the handshake's allowance is the longest in the
+	// report, and a row gathered after it is the first to be cut short when
+	// the budget runs out.
+	switch {
+	case taskErr != nil:
+		results = append(results, notChecked("target group", "the task could not be found, so the service's target group is unknown"))
+	default:
+		if tgr, ok := prov.(targetGroupReader); !ok {
+			// See targetGroupReader: unreachable through the CLI, because
+			// doctor has already refused every transport whose provider
+			// does not read one.
+			results = append(results, notChecked("target group", "the AWS provider in use does not read an ALB target group"))
+		} else {
+			gctx, gcancel := context.WithTimeout(ctx, timeout)
+			tg, tgErr := tgr.TargetGroup(gctx, ecsTarget(opts.RunOptions), task.DefinitionARN)
+			gcancel()
+			// The clock, routed the way every other clock-sensitive row
+			// routes it. CheckTargetGroup answers any error with "grant
+			// elasticloadbalancing:DescribeTargetGroups", which is the
+			// wrong thing to tell a developer who already holds it and
+			// whose report simply ran out of time - and it would answer it
+			// as a `?`, so the incomplete report would exit 0.
+			if isContextError(tgErr) {
+				results = append(results, timedOut("target group", checkTimedOut(ctx, "the target group lookup", timeout)))
+			} else {
+				results = append(results, doctor.CheckTargetGroup(tg, tgErr))
+			}
 		}
 	}
 
@@ -799,6 +849,17 @@ func helperExecDefaultPath() string {
 // instead means a completed call can only ever be observed through ch, and
 // the two give-up branches re-check ch before declaring anything, so an
 // answer that has already landed always wins.
+//
+// All three arms read a delivered result through boundedAnswered, which is
+// what keeps the report honest when the bound and the call finish at the same
+// instant. The direct arm used not to: fctx's deadline and the timer are
+// derived from the same timeout microseconds apart, so the call is woken by
+// its own cancellation just before the timer fires, and whichever channel
+// becomes ready first wins a blocked select. When ch won, the raw
+// context.DeadlineExceeded was returned as the check's answer - isCheckTimeout
+// saw nothing, and the row reported "cannot read the tetherd group: context
+// deadline exceeded" as a finding about the group database. Measured at 1
+// round in 20 of `-race -count=5` on this package.
 func bounded[T any](ctx context.Context, timeout time.Duration, what string, f func(context.Context) (T, error), discard func(T)) (T, error) {
 	ch := make(chan boundedResult[T], 1)
 	delivered := make(chan struct{})
@@ -811,13 +872,37 @@ func bounded[T any](ctx context.Context, timeout time.Duration, what string, f f
 	}()
 	select {
 	case r := <-ch:
-		return r.v, r.err
+		if boundedAnswered(r.err) {
+			return r.v, r.err
+		}
+		// Not abandonBounded: ch is already drained, and its default arm
+		// would park a discard receiver on a channel nothing will ever send
+		// to again. Nothing is discarded here for the same reason it is not
+		// discarded on abandonBounded's drain path - a result carrying an
+		// error carries no resource.
+		var zero T
+		return zero, checkTimedOut(ctx, what, timeout)
 	case <-boundedAfter(timeout, delivered):
 		return abandonBounded(ch, discard, checkTimedOut(ctx, what, timeout))
 	case <-ctx.Done():
 		return abandonBounded(ch, discard, checkTimedOut(ctx, what, timeout))
 	}
 }
+
+// boundedAnswered reports whether a delivered result is an answer to the
+// question the check asked, or only this very bound seen from the inside.
+//
+// It exists to be the one place that decision is made. Both of the ways a
+// delivered result reaches a caller - bounded's direct arm and
+// abandonBounded's re-check - go through it, because a context error taken as
+// an answer on one path and routed to a clock on the other makes the row's
+// wording depend on which of two simultaneously ready channels a select
+// happened to pick, and hides the timeout from isCheckTimeout. Every caller
+// of bounded either asks isCheckTimeout or hands the error to a judgement
+// that has advice for a misconfigured machine and none for a wedged one, so
+// the answer to this question decides whether a developer is sent to fix
+// something that is not broken.
+func boundedAnswered(err error) bool { return !isContextError(err) }
 
 // boundedResult is what a bounded call delivers.
 type boundedResult[T any] struct {
@@ -839,9 +924,8 @@ var boundedAfter = func(d time.Duration, delivered <-chan struct{}) <-chan time.
 // A result already sitting in the channel wins: a call that answered is an
 // answer, whatever the clock says. The exception is a call that answered only
 // "my context was cancelled", which is this very timeout seen from the
-// inside - taking that as the answer would make the row's wording depend on
-// which of two ready channels a select happened to pick, and would hide the
-// timeout from isCheckTimeout.
+// inside - and that judgement is boundedAnswered's, shared with bounded's
+// direct arm so the two cannot drift apart.
 //
 // The discard goroutine belongs on the *default* arm and nowhere else. The
 // channel holds exactly one result and nothing is ever sent twice, so once
@@ -851,7 +935,7 @@ var boundedAfter = func(d time.Duration, delivered <-chan struct{}) <-chan time.
 func abandonBounded[T any](ch chan boundedResult[T], discard func(T), timedOutErr *checkTimeout) (T, error) {
 	select {
 	case r := <-ch:
-		if !isContextError(r.err) {
+		if boundedAnswered(r.err) {
 			return r.v, r.err
 		}
 	default:

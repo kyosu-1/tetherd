@@ -62,8 +62,16 @@ func EnsureGroup(run func(string, ...string) (string, error), name string) (int,
 }
 
 // InstallExec copies src to dir/ExecName owned by root:gid with mode 02755.
+//
+// mkdirAllMode, not os.MkdirAll: os.MkdirAll's mode is masked by the umask,
+// so under `umask 077` this created the directory holding the setgid wrapper
+// at 0700 and nobody but root could traverse it - and CheckOwnership passes
+// such a directory (root-owned, not group- or world-writable, a directory),
+// so a later `install` neither fails nor repairs anything above its own leaf.
+// Install was fixed in 68b2329; this path, reached by `sudo tetherd-helper`
+// with no subcommand, still followed the umask.
 func InstallExec(src, dir string, gid int) (string, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := mkdirAllMode(dir, installDirMode); err != nil {
 		return "", err
 	}
 	dst := filepath.Join(dir, ExecName)

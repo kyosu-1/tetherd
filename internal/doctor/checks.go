@@ -3,9 +3,12 @@ package doctor
 import (
 	"fmt"
 	"io/fs"
+	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 
+	"github.com/kyosu-1/tetherd/internal/helper"
 	"github.com/kyosu-1/tetherd/internal/proto"
 	"github.com/kyosu-1/tetherd/internal/transport"
 )
@@ -17,7 +20,10 @@ func CheckHelper(protocol string, dialErr error) Result {
 	if dialErr != nil {
 		r.Status = Fail
 		r.Detail = dialErr.Error()
-		r.Next = "sudo tetherd-helper install  (then: sudo launchctl kickstart -k system/dev.tetherd.helper)"
+		// The label is helper.DaemonLabel's, not a second copy of it:
+		// this line tells the user what to kickstart, and a literal here
+		// would keep printing the old name after a rename.
+		r.Next = "sudo tetherd-helper install  (then: sudo launchctl kickstart -k system/" + helper.DaemonLabel + ")"
 		return r
 	}
 	r.Detail = "answered, protocol " + protocol
@@ -109,7 +115,7 @@ func CheckTask(task transport.Task, err error) Result {
 	if err != nil {
 		r.Status = Fail
 		r.Detail = err.Error()
-		r.Next = "grant ecs:ListTasks / ecs:DescribeTasks, or enable ECS Exec on the service and deploy the tetherd-agent sidecar (see docs/dev-env.md)"
+		r.Next = "grant ecs:ListTasks / ecs:DescribeTasks, or enable ECS Exec on the service and deploy the tetherd-agent sidecar (see deploy/dev-env)"
 		return r
 	}
 	// StartedAt is formatted in whatever location it carries, so the row does
@@ -140,6 +146,182 @@ func CheckPIDMode(mode string, err error) Result {
 	return r
 }
 
+// TargetGroupHTTP1 is the only protocol version steal works behind. It is
+// the value ELB reports, so it is compared verbatim rather than folded:
+// DescribeTargetGroups answers "HTTP1", "HTTP2" or "GRPC" for an HTTP or
+// HTTPS target group (measured against the SDK's own type - see
+// elasticloadbalancingv2/types.TargetGroup.ProtocolVersion), and a
+// case-insensitive compare here would pass a value ELB never sends while
+// hiding the day it starts sending another one.
+const TargetGroupHTTP1 = "HTTP1"
+
+// TargetGroup is the ALB target group the dev service's tasks are registered
+// in, as DescribeTargetGroups reports it, plus the one fact about the agent
+// the port cannot be judged without.
+//
+// The facts are gathered by two calls the caller makes (the ECS service says
+// which target group it registers tasks in; ELB says what that group is), and
+// none of them is knowable from the agent: an HTTP2 target group shows up on
+// the agent's side only as requests it cannot parse.
+type TargetGroup struct {
+	// Name is the group's own name, so the row names something a developer
+	// can find in the console. The ARN would be the other choice and is
+	// four times as long for the same identification.
+	Name string
+	// Protocol is the group's Protocol - "HTTP", "HTTPS", "TCP", ... - and
+	// it is here to word the one case this row must not judge. ELB reports
+	// ProtocolVersion for HTTP and HTTPS groups only, so an empty version
+	// is the normal answer for a TCP group rather than a finding about it.
+	Protocol string
+	// ProtocolVersion is protocol_version verbatim, and "" for a group
+	// whose protocol reports none.
+	ProtocolVersion string
+	// Port is the port the group says its targets listen on, 0 when it
+	// names none (ELB documents the field as unused for a Lambda target).
+	Port int
+	// AgentProxy is TETHERD_PROXY as the agent container's environment sets
+	// it in the task definition, and "" when it sets none. It is the raw
+	// value rather than a port number because "unset" (the default applies)
+	// and "set to something that is not an address" are different states
+	// and the row says which one it saw.
+	AgentProxy string
+}
+
+// CheckTargetGroup reports whether the ALB in front of the dev service can
+// deliver a request to the agent at all, which is the precondition every
+// other steal row assumes.
+//
+// The verdict is protocol_version and only protocol_version: spec §5.1 puts
+// gRPC and HTTP2 out of scope, the agent is an HTTP/1.1 server, and behind an
+// HTTP2 target group the ALB speaks h2c to it - so the health check fails,
+// the target goes unhealthy and every stolen request goes with it. That is a
+// failure of the setup, so it is ✗.
+//
+// The port is a question, never a verdict, and that distinction is the whole
+// reason this row is not two rows. TETHERD_PROXY moves the port the agent
+// serves the ALB on, so a deployment that points the target group somewhere
+// other than the default is *correctly configured* - a ✗ there would fail the
+// report for a service that works. Reading TETHERD_PROXY out of the task
+// definition makes the comparison a real one rather than a guess, but it does
+// not make a difference a verdict: nothing here establishes which of the two
+// numbers the operator meant, only that they disagree.
+//
+// err is why none of it could be established, and it is Unknown rather than a
+// failure on purpose: a developer whose IAM policy predates the
+// elasticloadbalancing:DescribeTargetGroups grant has a working environment,
+// and ? is the one status that cannot move the exit code. The same arm takes
+// a service with no load balancer at all, which is an ordinary setup for
+// somebody who runs with --no-incoming.
+func CheckTargetGroup(tg TargetGroup, err error) Result {
+	r := Result{Name: "target group"}
+	if err != nil {
+		r.Status = Unknown
+		r.Detail = "not checked: " + err.Error()
+		r.Next = "grant elasticloadbalancing:DescribeTargetGroups (it takes no resource ARN, so the statement's Resource is *) and ecs:DescribeServices; only this row reads them, and steal works or does not work either way"
+		return r
+	}
+	name := tg.Name
+	if name == "" {
+		name = "the target group"
+	}
+	if tg.ProtocolVersion == "" {
+		// Not a finding. ELB reports protocol_version for HTTP and HTTPS
+		// target groups only, so a TCP group - an NLB in front of the task -
+		// answers nothing here, and calling that "not HTTP1" would fail a
+		// setup this check has established nothing about.
+		r.Status = Unknown
+		r.Detail = fmt.Sprintf("not checked: %s routes %s, and a protocol version is reported for HTTP and HTTPS target groups only", name, protocolName(tg.Protocol))
+		r.Next = "nothing, if that is deliberate; spec §5.1 describes steal behind an ALB's HTTP target group, and this row can only check one of those"
+		return r
+	}
+	if tg.ProtocolVersion != TargetGroupHTTP1 {
+		r.Status = Fail
+		r.Detail = fmt.Sprintf("%s has protocol_version %s; steal needs %s", name, tg.ProtocolVersion, TargetGroupHTTP1)
+		// protocol_version cannot be modified after creation - it is absent
+		// from ModifyTargetGroup's input entirely (measured against the SDK)
+		// - so the next step says replace, not change: a developer told to
+		// "set it to HTTP1" goes looking for a field the console will not let
+		// them edit.
+		r.Next = "recreate the target group with protocol_version HTTP1 (ModifyTargetGroup cannot change it); the agent is an HTTP/1.1 server, so behind this group the ALB's health check fails and no request reaches it, stolen or not"
+		return r
+	}
+	agentPort, agentPortKnown := proxyPort(tg.AgentProxy)
+	switch {
+	case !agentPortKnown:
+		r.Status = Warn
+		r.Detail = fmt.Sprintf("%s is %s on port %d, but the agent container's TETHERD_PROXY is %q, which is not an address, so the two cannot be compared", name, TargetGroupHTTP1, tg.Port, tg.AgentProxy)
+		r.Next = "set TETHERD_PROXY on the agent container to an address the ALB can reach (host:port), or unset it to take the default 0.0.0.0:" + strconv.Itoa(proto.DefaultProxyPort)
+		return r
+	case tg.Port == 0:
+		r.Status = Warn
+		r.Detail = fmt.Sprintf("%s is %s but names no port, so where the ALB would deliver cannot be compared against the agent's %d", name, TargetGroupHTTP1, agentPort)
+		r.Next = "check the target group's port is the port the agent listens on"
+		return r
+	case tg.Port != agentPort:
+		// ⚠ and not ✗, and this is the one line of this check that has been
+		// got wrong once already. Both numbers can be right: the target
+		// group's port is what the ALB was pointed at, TETHERD_PROXY is where
+		// the agent listens, and an operator who moved both to 9090 has a
+		// working service. All this row can honestly say is that the two
+		// values it can see do not match.
+		r.Status = Warn
+		r.Detail = fmt.Sprintf("%s is %s on port %d, but the agent serves the ALB on %d (%s)", name, TargetGroupHTTP1, tg.Port, agentPort, proxySource(tg.AgentProxy))
+		r.Next = "point the target group at the port the agent listens on, or set TETHERD_PROXY on the agent container to the target group's port; if the two are deliberately different this row cannot tell, and steal still works"
+		return r
+	}
+	r.Detail = fmt.Sprintf("%s is %s on port %d, where the agent serves the ALB (%s)", name, TargetGroupHTTP1, tg.Port, proxySource(tg.AgentProxy))
+	return r
+}
+
+// protocolName is a target group's protocol for a sentence, for a group that
+// somehow reports none.
+func protocolName(protocol string) string {
+	if protocol == "" {
+		return "a protocol it does not report"
+	}
+	return protocol
+}
+
+// proxyPort is the port the agent serves the ALB on, given TETHERD_PROXY as
+// the task definition sets it. An unset value is the agent's own default -
+// internal/agent applies the identical constant, which is why it lives in
+// internal/proto - and anything that is not an address is no answer at all,
+// which the second return distinguishes from a port of 0.
+//
+// The value is an address rather than a port because that is what the agent
+// listens on, so a bare "8080" is not a TETHERD_PROXY the agent would accept
+// and must not be read as one here: net.Listen("tcp", "8080") fails, so a row
+// that parsed it would report agreement with a target group the agent never
+// answers.
+func proxyPort(proxy string) (int, bool) {
+	if proxy == "" {
+		return proto.DefaultProxyPort, true
+	}
+	_, port, err := net.SplitHostPort(proxy)
+	if err != nil {
+		return 0, false
+	}
+	// Atoi and not net.LookupPort: a service name ("http") is a legal
+	// listen address, but resolving it would read this machine's
+	// /etc/services to make a claim about the task's, and the two need not
+	// agree. An unnumbered port is reported as one this row could not read.
+	n, err := strconv.Atoi(port)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// proxySource says where the agent's port came from, because "the deployment
+// asked for this" and "nobody said, so the default applies" send a developer
+// to different files.
+func proxySource(proxy string) string {
+	if proxy == "" {
+		return "the agent's default proxy port; the agent container sets no TETHERD_PROXY"
+	}
+	return "TETHERD_PROXY=" + proxy
+}
+
 // CheckAgentSession reports whether the tetherd-agent sidecar actually
 // answered: the transport opened, the control stream came up and the agent
 // sent its welcome. This is a different fact from CheckTask, which only
@@ -162,7 +344,7 @@ func CheckAgentSession(protocol, agentEnv, wantEnv string, dialErr error) Result
 	if dialErr != nil {
 		r.Status = Fail
 		r.Detail = dialErr.Error()
-		r.Next = "check the tetherd-agent sidecar is running in the task and listening on its control port (see docs/dev-env.md)"
+		r.Next = "check the tetherd-agent sidecar is running in the task and listening on its control port (see deploy/dev-env)"
 		return r
 	}
 	if agentEnv != wantEnv {

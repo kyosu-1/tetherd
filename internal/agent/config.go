@@ -3,7 +3,13 @@
 // traffic. It never calls AWS APIs.
 package agent
 
-import "errors"
+import (
+	"errors"
+	"net"
+	"strconv"
+
+	"github.com/kyosu-1/tetherd/internal/proto"
+)
 
 // Config comes from environment variables only.
 type Config struct {
@@ -15,15 +21,18 @@ type Config struct {
 	// security-group change, and the SSM port forward terminates inside
 	// the task, on 127.0.0.1 (docs/design.md: ":9900 (lo only)").
 	//
-	// It is not a deployment setting, despite reading like one: the CLI's
-	// ssm transport forwards to a fixed 9900 (internal/transport/ssm's
-	// controlPort, sent as the port-forwarding document's portNumber), so
-	// a task that sets TETHERD_CONTROL=127.0.0.1:9901 listens where no CLI
-	// looks and the failure arrives as "the agent is unreachable" -
-	// pointing at the transport rather than at the setting that was
-	// changed. So this exists for tests and for an embedded agent; making
-	// it a real deployment knob means teaching the transport the port
-	// (v0.4, with the distribution work).
+	// It is not a deployment setting, despite reading like one. The CLI's
+	// ssm transport and this default now come from one constant
+	// (proto.DefaultControlPort), so the two cannot drift, but the CLI
+	// still cannot follow a deployment that changes this: the only channel
+	// on which it could learn the new port is the control port itself. A
+	// task that sets TETHERD_CONTROL=127.0.0.1:9901 therefore listens
+	// where no CLI looks, and the failure arrives as "the agent is
+	// unreachable" - pointing at the transport rather than at the setting
+	// that was changed. So this exists for tests and for an embedded
+	// agent; carrying a changed port properly means putting it in
+	// .tetherd.yml, which the CLI reads before it connects, and that is a
+	// v1 decision.
 	Control      string
 	AppContainer string // TETHERD_APP_CONTAINER, default defaultAppContainer.
 	MetadataURL  string // ECS_CONTAINER_METADATA_URI_V4, set by ECS; empty outside ECS.
@@ -42,10 +51,24 @@ type Config struct {
 // Config - ConfigFromEnv and Config.withDefaults - read these, because the
 // copy that drifts is the one no task definition mentions.
 const (
-	defaultControl      = "127.0.0.1:9900"
 	defaultAppContainer = "app"
-	defaultProxy        = "0.0.0.0:8080"
 	defaultAppAddr      = "127.0.0.1:8081"
+)
+
+// defaultControl and defaultProxy are the two listen addresses, and neither
+// port half is written here: both numbers live in internal/proto, where the
+// other side of each one reads them too - `tetherd doctor` compares the ALB
+// target group's port against the proxy port, and the CLI's ssm transport
+// forwards to the control port. A literal here as well would be the second
+// copy, and the one that drifts.
+//
+// Vars rather than consts only because the addresses are assembled from
+// those ports; nothing assigns to either. defaultControl is loopback on
+// purpose (see Config.Control); defaultProxy is 0.0.0.0 for the opposite
+// reason, because the ALB reaches the task over the VPC network.
+var (
+	defaultControl = net.JoinHostPort("127.0.0.1", strconv.Itoa(proto.DefaultControlPort))
+	defaultProxy   = net.JoinHostPort("0.0.0.0", strconv.Itoa(proto.DefaultProxyPort))
 )
 
 // withDefaults fills in what a Config built by hand would otherwise hand on

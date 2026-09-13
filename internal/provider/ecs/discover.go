@@ -22,12 +22,19 @@ type ECSAPI interface {
 	DescribeTasks(ctx context.Context, in *awsecs.DescribeTasksInput, opts ...func(*awsecs.Options)) (*awsecs.DescribeTasksOutput, error)
 }
 
+// DefaultAgentContainer is the name of the sidecar container, and the one
+// place it is written down: discovery rejects a task without it, and
+// doctor's target group row reads that container's TETHERD_PROXY out of the
+// task definition. A second literal would be the one that drifts after a
+// rename.
+const DefaultAgentContainer = "tetherd-agent"
+
 // Target names the service to attach to.
 type Target struct {
 	Cluster        string
 	Service        string
 	TaskID         string // optional: pin one task
-	AgentContainer string // default "tetherd-agent"
+	AgentContainer string // default DefaultAgentContainer
 }
 
 // NotReadyError explains why running tasks were rejected.
@@ -57,7 +64,7 @@ func (e *NotReadyError) Error() string {
 // Discover below - may read all[0] unchecked on success.
 func DiscoverAll(ctx context.Context, api ECSAPI, t Target) ([]transport.Task, error) {
 	if t.AgentContainer == "" {
-		t.AgentContainer = "tetherd-agent"
+		t.AgentContainer = DefaultAgentContainer
 	}
 	list, err := api.ListTasks(ctx, &awsecs.ListTasksInput{
 		Cluster:       aws.String(t.Cluster),

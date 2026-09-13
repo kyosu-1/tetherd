@@ -47,6 +47,12 @@ type RunOptions struct {
 	TaskID    string
 	TargetEnv string
 	NoEnv     bool
+	// AgentContainer is target.agent_container: the name of the
+	// tetherd-agent sidecar, for a deployment that renamed it. No flag
+	// binds it (it is a property of the deployment, the same for everyone
+	// attaching to that service, so it belongs in the committed file), and
+	// empty means the default, applied once in internal/provider/ecs.
+	AgentContainer string
 
 	LocalCIDRs     []string
 	RemoteServices []string
@@ -429,9 +435,17 @@ func remoteSet(ctx context.Context, opts RunOptions, prov awsProvider, task tran
 	return applyLocalCIDRs(cidrs, local, credentialRouteFloor(opts))
 }
 
-// ecsTarget is the discovery target the flags and the config describe.
+// ecsTarget is the discovery target the flags and the config describe. It
+// is the only place a provider Target is built, so every command's
+// discovery sees the same fields - including AgentContainer, which no flag
+// binds and which therefore reaches discovery only through here.
 func ecsTarget(opts RunOptions) ecsprov.Target {
-	return ecsprov.Target{Cluster: opts.Cluster, Service: opts.Service, TaskID: opts.TaskID}
+	return ecsprov.Target{
+		Cluster:        opts.Cluster,
+		Service:        opts.Service,
+		TaskID:         opts.TaskID,
+		AgentContainer: opts.AgentContainer,
+	}
 }
 
 // usageError marks a discoverTask failure as a bad invocation (missing or

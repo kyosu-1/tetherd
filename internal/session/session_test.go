@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1169,5 +1170,219 @@ func TestAPreAcceptLoopCLIAnswersAnHTTPStreamWithNothing(t *testing.T) {
 	}
 	if errors.Is(err, io.EOF) {
 		t.Fatalf("err = %v, want a timeout: an older CLI does not close the stream either, it simply never reads it", err)
+	}
+}
+
+// slowHelloConn is the client's end of a transport with the one delay that
+// decides whether a refusal keeps its type: the hello is on the wire before
+// the delay starts, and what is held back is yamux's notification that the
+// write succeeded.
+//
+// That is not an invented failure. It is what a busy machine does to the
+// goroutine inside Dial - it queues the hello and is not scheduled again
+// until the agent has already answered - and yamux's Stream.Write then
+// selects between "that write succeeded" and "the session is gone". Held
+// 50ms against the ~200µs a refusal takes on loopback, the ordering is not
+// a coin flip in either direction: the agent's whole answer lands inside
+// the delay, so the old server (which closed the mux the instant it wrote
+// the refusal) loses the type every time, and the current one keeps it
+// every time.
+type slowHelloConn struct {
+	net.Conn
+	hold time.Duration
+	once sync.Once
+}
+
+func (c *slowHelloConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if err == nil && bytes.Contains(p, []byte(`"`+proto.TypeHello+`"`)) {
+		c.once.Do(func() { time.Sleep(c.hold) })
+	}
+	return n, err
+}
+
+// serveOneRefusal runs the agent side of a refused session the way
+// internal/agent's Serve does - Serve on its own goroutine, conn.Close the
+// moment it returns - and reports what Serve returned.
+func serveOneRefusal(t *testing.T, sc net.Conn, e proto.Error, opts ServeOptions) <-chan error {
+	t.Helper()
+	h := &fakeHandler{reject: &e, closed: make(chan struct{})}
+	served := make(chan error, 1)
+	go func() {
+		err := Serve(context.Background(), sc, h, opts)
+		sc.Close()
+		served <- err
+	}()
+	return served
+}
+
+// TestARefusalKeepsItsTypeWhenTheHelloWriteIsNoticedLate is the pin for the
+// defect refuse exists for. Every caller that acts on a refusal reads it
+// with errors.As on *RejectedError - run.go's duplicate_user retry
+// (isDuplicateUser, and so the whole of DefaultAttachRetryBudget),
+// statusReason, doctor's helper row - so a refusal that arrives as a
+// transport error does not read as "the agent refused" to any of them. The
+// assertion is on the type and the code, never on the message: the code is
+// the wire contract and swapping the typed error for errors.New with the
+// same text must fail here.
+func TestARefusalKeepsItsTypeWhenTheHelloWriteIsNoticedLate(t *testing.T) {
+	cc, sc := pair(t)
+	served := serveOneRefusal(t, sc, proto.Error{Code: proto.CodeDuplicateUser, Message: "already attached"}, ServeOptions{})
+
+	slow := &slowHelloConn{Conn: cc, hold: 50 * time.Millisecond}
+	_, err := Dial(context.Background(), slow, proto.Hello{Version: proto.Version, User: "shota"}, Options{})
+
+	var rej *RejectedError
+	if !errors.As(err, &rej) {
+		t.Fatalf("err = %v (%T), want the agent's refusal as a *session.RejectedError", err, err)
+	}
+	if rej.Err.Code != proto.CodeDuplicateUser {
+		t.Fatalf("refusal code = %q, want %q", rej.Err.Code, proto.CodeDuplicateUser)
+	}
+	select {
+	case serr := <-served:
+		if serr == nil {
+			t.Fatal("Serve returned nil for a session it refused")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve never returned")
+	}
+}
+
+// TestAVersionMismatchKeepsItsTypeWhenTheHelloWriteIsNoticedLate is the same
+// race on the other refusal that matters: doctor's helper row comments that
+// a protocol mismatch "arrives here as the dial error", and it can only tell
+// a mismatch from an agent that is not there if the code survives the trip.
+func TestAVersionMismatchKeepsItsTypeWhenTheHelloWriteIsNoticedLate(t *testing.T) {
+	cc, sc := pair(t)
+	h := &fakeHandler{closed: make(chan struct{})}
+	served := make(chan error, 1)
+	go func() {
+		err := Serve(context.Background(), sc, h, ServeOptions{})
+		sc.Close()
+		served <- err
+	}()
+
+	slow := &slowHelloConn{Conn: cc, hold: 50 * time.Millisecond}
+	_, err := Dial(context.Background(), slow, proto.Hello{Version: "v0-not-this-one", User: "shota"}, Options{})
+
+	var rej *RejectedError
+	if !errors.As(err, &rej) {
+		t.Fatalf("err = %v (%T), want a *session.RejectedError", err, err)
+	}
+	if rej.Err.Code != proto.CodeVersionMismatch {
+		t.Fatalf("refusal code = %q, want %q", rej.Err.Code, proto.CodeVersionMismatch)
+	}
+	// Waited for, not abandoned: a Serve left mid-refusal outlives the test
+	// and holds the conn its own cleanup is about to close.
+	select {
+	case <-served:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve never returned")
+	}
+}
+
+// TestTheRefusalWaitEndsOnTheClientsCloseAndNotOnTheClock checks the
+// mechanism refuse's comment names, because a wait whose comment credits
+// the peer and whose behaviour credits a timer is this repository's oldest
+// mistake. With the backstop set to a minute, a Serve that returns promptly
+// can only have been released by the client closing the mux after decoding
+// the refusal.
+func TestTheRefusalWaitEndsOnTheClientsCloseAndNotOnTheClock(t *testing.T) {
+	cc, sc := pair(t)
+	served := serveOneRefusal(t, sc, proto.Error{Code: proto.CodeDuplicateUser, Message: "already attached"},
+		ServeOptions{RefusalReadWait: time.Minute})
+
+	if _, err := Dial(context.Background(), cc, proto.Hello{Version: proto.Version, User: "shota"}, Options{}); err == nil {
+		t.Fatal("a refused hello must not produce a session")
+	}
+	select {
+	case <-served:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve is still waiting for a refusal the client already has: the client's close must end the wait, not refusalReadWait")
+	}
+}
+
+// TestARefusedClientThatNeverReadsDoesNotParkTheAgent pins the other arm.
+// The wait is one goroutine and one conn on the agent, inside the task, and
+// a peer that takes the refusal at the yamux level and then neither reads it
+// nor closes - an older CLI, a wedged one, anything pointed at the port -
+// must not hold either for longer than RefusalReadWait.
+//
+// Measured at two settings, and compared against them, because a single
+// measurement against a fixed ceiling cannot see the setting at all: this
+// test configured 100ms and asserted 5s, and `refuse` ignoring its wait
+// parameter and hardcoding 2 seconds passed the whole package. RefusalReadWait
+// exists *so that* a test can shorten or lengthen it (ServeOptions' own
+// comment), so the thing worth asserting is that doing so changes what
+// happens. The per-run window is tied to the configured value and the two
+// runs are compared with each other, which no hardcoded constant can satisfy
+// whatever value it hardcodes.
+func TestARefusedClientThatNeverReadsDoesNotParkTheAgent(t *testing.T) {
+	// giveUp is how long Serve takes to return for a client that never
+	// reads the refusal and never closes.
+	giveUp := func(t *testing.T, wait time.Duration) time.Duration {
+		t.Helper()
+		cc, sc := pair(t)
+		served := serveOneRefusal(t, sc, proto.Error{Code: proto.CodeDuplicateUser, Message: "already attached"},
+			ServeOptions{RefusalReadWait: wait})
+
+		cfg := yamux.DefaultConfig()
+		cfg.LogOutput = io.Discard
+		mux, err := yamux.Client(cc, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mux.Close()
+		control, err := mux.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Before the hello, not after: the agent can have read it and
+		// armed its read deadline before this goroutine is scheduled
+		// again, and a start taken after that would make the lower
+		// bound below fire on scheduling rather than on the wait.
+		start := time.Now()
+		if err := proto.NewEncoder(control).Encode(proto.TypeHello, proto.Hello{Version: proto.Version, User: "shota"}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case serr := <-served:
+			if serr == nil {
+				t.Fatal("Serve returned nil for a session it refused")
+			}
+			return time.Since(start)
+		case <-time.After(wait + 8*time.Second):
+			t.Fatalf("Serve parked on a client that never reads: RefusalReadWait (%s) must bound the wait", wait)
+			return 0
+		}
+	}
+
+	const (
+		short = 100 * time.Millisecond
+		long  = 1 * time.Second
+		// Generous for a loaded machine, and still well under the 2s
+		// default this has to be able to tell apart from `short`.
+		slack = 750 * time.Millisecond
+		// A deadline never fires early; this is only for clock
+		// granularity at the edge.
+		grace = 2 * time.Millisecond
+	)
+	gotShort, gotLong := giveUp(t, short), giveUp(t, long)
+
+	for _, c := range []struct{ wait, got time.Duration }{{short, gotShort}, {long, gotLong}} {
+		if c.got+grace < c.wait {
+			t.Errorf("RefusalReadWait %s: Serve gave up after %s, before the wait it was given - the refusal is on the wire and the client has not read it, so nothing should have released the read", c.wait, c.got)
+		}
+		if c.got > c.wait+slack {
+			t.Errorf("RefusalReadWait %s: Serve took %s to give up on a client that never read the refusal, which is not the bound it was given", c.wait, c.got)
+		}
+	}
+	// The two together: a wait that ignores its argument takes the same
+	// time at both settings, whatever constant it uses.
+	if diff := gotLong - gotShort; diff < (long-short)/2 {
+		t.Errorf("RefusalReadWait %s gave up after %s and %s after %s: raising the setting by %s changed the wait by only %s, so the configured value is not what bounds it",
+			short, gotShort, long, gotLong, long-short, diff)
 	}
 }

@@ -16,7 +16,7 @@
 | steal の一致 | `X-Dev-User` + `X-Dev-Token`（ユーザー固定トークン） | ヘッダー 1 つ → 2 つ |
 | 複数タスク | RUNNING な全タスクに接続 | 1 タスク → 全タスク |
 | トランスポート | `ssm:StartSession` を SDK で呼び `session-manager-plugin` を子プロセスで起動 | AWS CLI 依存を削除 |
-| agent イメージ | `ghcr.io/kyosu-1/tetherd-agent` | 未決 → GHCR |
+| agent イメージ | 利用者が自分のレジストリに push（`make push-images ECR_REGISTRY=...`） | 未決 → 当初 GHCR を想定したが、公開するパイプラインは未実装。v1.0 に持ち越し |
 | 検証環境 | `deploy/dev-env/`（Terraform） | 新規 |
 | v1 から外す | mirror、env-rewrite、`remote_localhost`、`init`、UDP、IPv6、Linux、Cloud Run、公証 | ロードマップ再編 |
 
@@ -46,7 +46,7 @@
 | UDP / IPv6 | rdr 方式ではフロー単位の元宛先が取れない | netstack 導入時 |
 | WebSocket / gRPC の steal | agent は upgrade を app にそのまま通す | — |
 | Linux / Cloud Run | design.md §13 のとおり | Capturer / Transport の実装追加 |
-| Developer ID 署名・公証 | brew 経由なら quarantine が付かない | Developer ID 取得後 |
+| Developer ID 署名・公証 | cask の `postflight` が quarantine を外す（brew でも属性は必ず付く。§8） | Developer ID 取得後 |
 | 同一マシンでの複数セッション | gid `tetherd` を共有すると pf が区別できない | セッションごとの gid |
 
 ---
@@ -129,7 +129,7 @@ CLI が `127.0.0.1:<redirect_port>` で accept したら、helper に `natlook{p
 - 接続時に peer credential（`LOCAL_PEERCRED`）を取り、uid が **`admin` グループのメンバー**であることを要求（`resolver.set` はマシン全体の名前解決に影響するため）
 - 1 接続 = 1 セッション。`pf.apply` は接続ごとに 1 回。接続が切れたら（CLI の異常終了含む）helper がそのセッションの pf ルール・resolver ファイル・host route を消す（消す順は resolver → route → pf）
 - 同時セッションは 1 つ。2 つ目の `pf.apply` は `busy{pid, command, since}` で拒否
-- 最初に `version` を交換。プロトコルバージョン不一致なら CLI が `brew upgrade tetherd && sudo tetherd-helper install`（その後 `sudo launchctl kickstart -k system/dev.tetherd.helper`）を案内する。helper は `/Library/LaunchDaemons/dev.tetherd.helper.plist` で launchd が持つので brew の service ではなく、`brew services restart tetherd` では再起動できない（§7）
+- 最初に `version` を交換。プロトコルバージョン不一致なら CLI が `brew upgrade tetherd && sudo tetherd-helper install`（その後 `sudo launchctl kickstart -k system/dev.tetherd.helper`）を案内する。helper は `/Library/LaunchDaemons/dev.tetherd.helper.plist` で launchd が持つので brew の service ではなく、`brew services restart tetherd` では再起動できない（§8）
 
 | 操作 | 引数 | 内容 |
 |---|---|---|
@@ -206,7 +206,7 @@ S3 / DynamoDB / SQS / Secrets Manager / Bedrock など VPC 外のサービスは
 
 README に書くこと: 条件が無い環境ではラップトップ経路のほうが緩い（NAT の無い VPC でもラップトップは自前で出られる）、CloudTrail の `sourceIPAddress` はラップトップの IP になる。
 
-### 4.3 開発者の IAM ポリシー
+### 4.4 開発者の IAM ポリシー
 
 design.md §9 のものに EC2 の読み取り 4 つを追加。
 
@@ -257,9 +257,9 @@ agent は root で動く（`SYS_PTRACE` を effective にするため。distrole
 ### 5.5 設定と配布
 
 - env のみ: `TETHERD_ENV`（必須）、`TETHERD_PROXY`（`0.0.0.0:8080`。ALB を受ける口）、`TETHERD_APP_ADDR`（`127.0.0.1:8081`。app への転送先）、`TETHERD_CONTROL`（`127.0.0.1:9900`）、`TETHERD_APP_CONTAINER`（`app`）、`TETHERD_TASK_ARN`（任意。メタデータが取れればそちらが優先）
-- `TETHERD_CONTROL` は**実装上は固定**。CLI の `ssm` トランスポートが転送先ポートに 9900 を固定で入れる（`internal/transport/ssm` の `controlPort`）ので、これを変えた agent は誰も繋げない listen になり、失敗は「agent に届かない」として出る。テストと埋め込み用の口であり、デプロイのつまみではない（トランスポート側に教えるのは v0.4）
+- `TETHERD_CONTROL` は**実装上は固定**。agent 側の既定と CLI の `ssm` トランスポートが転送先ポートに入れる値は v0.4 で 1 つの定数（`internal/proto` の `DefaultControlPort`、`internal/transport/ssm` の `controlPort` がこれを参照）になったので両者がずれることは無いが、**これを変えた agent は依然として誰も繋げない listen になる** — CLI が新しいポートを知る経路は制御ポート自身しか無いため（循環）。失敗は「agent に届かない」として出る。テストと埋め込み用の口であり、デプロイのつまみではない。真に追随させるには CLI が接続前に読める場所（`.tetherd.yml`）に書かせる必要があり、それは v1 の判断
 - AWS API は呼ばない
-- イメージ `ghcr.io/kyosu-1/tetherd-agent`、distroless static、linux/arm64 + linux/amd64
+- イメージは distroless static、linux/arm64 + linux/amd64。**このリポジトリには公開レジストリへ push するパイプラインが無い**（v0.4 実測: `.goreleaser.yml` に `dockers:` / `kos:` は無く、イメージを扱うのは `make push-images` だけで、呼び出し元が渡す ECR レジストリへ push する）。利用者は `make push-images ECR_REGISTRY=...` で自分のレジストリに置く。公開レジストリでの配布は v1.0 に持ち越し
 - タスク定義の推奨: `essential: true`、`restartPolicy.enabled: true`、`linuxParameters.capabilities.add: ["SYS_PTRACE"]`、`pidMode: task`
 - インターネットに出られない VPC 向けに ECR pull-through cache を README で案内
 
@@ -336,9 +336,11 @@ tetherd token rotate
 - `doctor` の検査項目（各項目に「次に何をするか」を付ける）:
   helper が応答しバージョンが一致 / `tetherd` グループと setgid `tetherd-exec` / session-manager-plugin の有無 / AWS 認証 / サービスの `enableExecuteCommand` / タスクの agent コンテナと ExecuteCommandAgent / タスク定義の `pidMode: task` / ターゲットグループが HTTP1 / ECS・EC2 の読み取り権限 / VPC CIDR とローカル IF の重なり / `remote_domains` が agent 側で解けるか / `remote_cidrs` に `0.0.0.0/0` が無いか
 
-  v0.2b で実装したのは 9 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲の広さ / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査は v0.3b にも入らず、v0.4 に送った** — `elasticloadbalancing:DescribeTargetGroups` を呼ぶ SDK が無いため。理由と残作業は §12 の v0.3b に書いた。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
+  v0.2b で実装したのは 9 項目（helper の応答とバージョン / `tetherd` グループと setgid `tetherd-exec` / `session-manager-plugin` / AWS 認証 / 接続可能なタスク / `pidMode: task` / 捕捉範囲の広さ / 捕捉範囲とローカル IF の重なり / `remote_domains` が agent 側で解けるか）。**ターゲットグループが HTTP1 かの検査は v0.4 で入れた**（`target group` の行。`aws-sdk-go-v2/service/elasticloadbalancingv2` を足し、developer policy に `elasticloadbalancing:DescribeTargetGroups` を戻した。v0.3b に入らなかった理由は §12 の v0.3b）。ECS・EC2 の読み取り権限は個別項目にせず、各検査が `AccessDenied` で失敗したときにそのメッセージで示す
 
   v0.3a / v0.3b で足したのは、`agent session`（tetherd 自身が通した handshake。ECS の見解とは別）・`task env`（agent が読めた変数と `env_error`）・`task role`（子プロセスと同じ経路でループバック口から取った認証情報の ARN）・`steal`（一致条件と、ラップトップ側に listener が居るか）の 4 行と、**`?`（検査できなかった）ステータス**。`?` は「動くが注意」の `⚠` と分けてあり、**どの行でも exit code を動かさない**（失敗した行は既にそれ自身で数えられているため）。`pin_credential_route` の行は入っていない
+
+  v0.4 で足したのは `target group` の 1 行。`protocol_version` が `HTTP1` でなければ `✗`（spec §5.1 が gRPC / HTTP2 を対象外にしており、agent は HTTP/1.1 サーバなので ALB の h2c ヘルスチェックが落ちる）、`elasticloadbalancing:DescribeTargetGroups` が無ければ `?`（権限が古い開発者の環境は壊れていない）、**ターゲットグループのポートが agent の受け口と違えば `⚠` で、`✗` にはしない** — `TETHERD_PROXY` で動かせる以上、違うポートを向けた配置は正しく設定されている。その `TETHERD_PROXY` はタスク定義の agent コンテナの env から読むので、ポートの比較は既定値の当て推量ではなく実際の値どうしになる（env-file や Secrets 経由で設定されていて読めないときは `?`）
 
 ### 6.6 出力
 
@@ -355,7 +357,9 @@ aws:
 target:
   cluster: myapp-dev
   service: api
-  container: app                # env を読むコンテナ
+  # `container:` は書けない（v0.4 から起動時エラー、終了コード 2）。env を読む
+  # コンテナを決めるのは agent 側の TETHERD_APP_CONTAINER（既定 app）
+  agent_container: tetherd-agent # サイドカーを改名しているときだけ（既定 tetherd-agent）
   env: dev                      # welcome.env と照合
 env:
   override:
@@ -412,18 +416,23 @@ design.md §8 のとおり yamux + JSON Lines。ストリーム 0 が制御。
 ## 8. 配布とインストール
 
 ```
-brew install kyosu-1/tetherd/tetherd
+brew install kyosu-1/tap/tetherd
 sudo tetherd-helper install        # sudo はこの 1 回
 tetherd doctor
 ```
 
-- tap `kyosu-1/homebrew-tetherd`。GoReleaser がタグ push で GitHub Release（darwin arm64 / amd64）、GHCR の agent と sampleapp イメージ、tap の formula 更新を行う
-- formula は 3 バイナリを prefix に置くだけ。`service` ブロックは使わない（launchd の登録は helper 自身が行う）
-- brew はインストール時に root の処理を実行できないので、root が要る初期化は `sudo tetherd-helper install` が行う: グループ `tetherd` の作成、`tetherd-exec` の `/usr/local/libexec/tetherd/` へのコピー（`root:tetherd`、`2755`）、`/Library/LaunchDaemons/dev.tetherd.helper.plist` の生成と `launchctl bootstrap`。`brew upgrade tetherd` の後は `sudo tetherd-helper install` を再実行する（冪等。`doctor` がバージョン不一致を検出して案内する）
-- **helper は常駐しない。** plist の `Sockets` で launchd が `/var/run/tetherd.sock` を保持し、最初の接続で helper を root で起動する（ソケットアクティベーション。`launch_activate_socket()` は cgo を使わず `purego` で呼ぶ）。helper は接続が無くなって 30 秒でアイドル終了する。`KeepAlive: {SuccessfulExit: false}` で、クラッシュ時だけ launchd が再起動し、起動時の掃除で残留ルールが消える
+- **リリースは `v0.4.0` から始まる。`v0.1`〜`v0.3b` は `docs/plans/` の開発マイルストーンで、公開リリースは存在しない**（v0.4 実測: タグが 1 つも無い）。マイルストーン名はこの spec と Go のコメントに 241 箇所あり、その大半は「いつ・なぜ変わったか」の記録なので**番号を振り直さない**。歴史の記録を書き換えるより、タグ一覧に穴があるほうを選ぶ
+- tap `kyosu-1/homebrew-tap`（`brew install kyosu-1/tap/tetherd`）。GoReleaser がタグ push で GitHub Release（darwin arm64 / amd64）と tap の cask 更新を行う。**イメージは含めない**（v0.4 実測: `.goreleaser.yml` に `dockers:` / `kos:` は無い。Task 1 の決定 1 で `tetherd-agent` を意図的に除外した）。agent / sampleapp イメージは利用者が `make push-images ECR_REGISTRY=...` で自分のレジストリに push する。公開レジストリへの publish は v1.0 に持ち越し
+- **formula ではなく cask。** 3 バイナリを prefix に置くだけなのは変わらない（v0.4 実測: cask DSL の `binary` スタンザ 3 本）。cask にした理由は署名していないこと: Homebrew は cask のダウンロードを必ず quarantine するので、`postflight` で `xattr -dr com.apple.quarantine` を外す必要があり、formula にはその口が無い。`service` ブロックは使わない（launchd の登録は helper 自身が行う）。cask の `uninstall launchctl:` / `delete:` は `brew uninstall` が daemon を止めるための保険で、アンインストールの本体ではない（下記）
+- brew はインストール時に root の処理を実行できないので、root が要る初期化は `sudo tetherd-helper install` が行う: グループ `tetherd` の作成、`tetherd-exec` の `/usr/local/libexec/tetherd/` へのコピー（`root:tetherd`、`2755`）、**`tetherd-helper` 自身の同じディレクトリへのコピー**（v0.4 で追加。plist が指すのは Homebrew の prefix ではなくこのコピー。理由は `tetherd-exec` と同じで「Homebrew の prefix はユーザが書ける」、しかも launchd が root で起動するのはこちらなのでより強く効く）、`/Library/LaunchDaemons/dev.tetherd.helper.plist` の生成と `launchctl bootstrap`。**`install` は転送先パスの各構成要素（`/`, `/usr`, `/usr/local`, `/usr/local/libexec`, `/usr/local/libexec/tetherd`）が root 所有・group/world 書き込み不可・かつディレクトリであることを先に確かめ、違えば何も書かずに失敗する。エラーは違反した構成要素と、それを直すコマンドの両方を出す**（v0.4。Homebrew がどのディレクトリを書き込み可能にするかを当てにしない）。**同じ検査を `/Library/LaunchDaemons` と `/var/log` にも掛ける**（plist は launchd が「root で何を起動するか」を決めるもう一方の入力であり、ディレクトリに group が書ければファイル自身の mode に関係なく差し替えられる。`/var/log` は plist の `StandardOutPath` / `StandardErrorPath` を launchd が **root で開く**先で、ここに書けるユーザは log のパスに symlink を置いて root の追記先を選べる。plist が root に触らせる 3 つのパスすべてを検査する）。`install` が作るディレクトリの mode は umask に任せず明示する（`sudo` は呼び出し元の umask と 0022 の和を使うので、`umask 077` の開発者では `MkdirAll` が 0700 を作り、setgid の `tetherd-exec` に到達できなくなる）。`brew upgrade tetherd` の後は `sudo tetherd-helper install` を再実行する（冪等。`doctor` がバージョン不一致を検出して案内する）
+- **v0.4 の helper は常駐する（`RunAtLoad: true`、`Sockets` なし）。** 以下のソケットアクティベーションが本来の設計で、まだ実装が無い。
+  - 本来の設計: plist の `Sockets` で launchd が `/var/run/tetherd.sock` を保持し、最初の接続で helper を root で起動する（ソケットアクティベーション。`launch_activate_socket()` は cgo を使わず `purego` で呼ぶ）。helper は接続が無くなって 30 秒でアイドル終了する
+  - v0.4 でそうしなかった理由: `purego` は新しい依存であり、v0.4 の計画は「依存を増やさない」を制約にしている。加えて継承した fd を `helper.Server` に渡す経路とアイドル終了のライフサイクルが要る。常駐なら `helper.Server` に変更が 1 行も要らない。**`Sockets` が無い plist では `RunAtLoad` 以外に helper を起動するものが無い**ので、常駐は選択ではなく帰結
+  - `KeepAlive: {SuccessfulExit: false}` は常駐でも同じ形を使う。**この形の意味は「終了コードが 0 以外なら再起動」**（`man launchd.plist` 実測、Darwin 25.6.0: "If true, the job will be restarted as long as the program exits and with an exit status of zero. If false, the job will be restarted in the inverse condition."）。したがって `cmd/tetherd-helper` が初期化失敗で終了コード 1 で落ちる経路も `ThrottleInterval` ごとに再試行され、**恒久的な失敗なら無限に再試行して `/var/log/tetherd-helper.log` に同じ行を書き続ける**。v0.4 の当初の記述はこれを逆に書いていた（「この形なら終了コード 1 の経路は再試行されない」）。誤りなので訂正する。それでもこの形を選ぶ理由: launchd が daemon を起動する時点で `sudo tetherd-helper install` が root で所有権検査・両バイナリのコピー・グループ作成を済ませているので、daemon 側の初期化失敗は恒久的なものより一時的なもの（起動直後に `dscl` が応答しない等）の方がありうる。**失敗を終了コード 0 にしてループを止めることはしない**（失敗を成功として報告する方が悪い）。そして本来の設計であるソケットアクティベーションではアイドル終了が終了コード 0 になるので、**この形だけがアイドル終了を放置しつつクラッシュだけ拾える**（素の `true` はアイドル終了と喧嘩する）。`ThrottleInterval` は launchd の既定値と同じ 10 秒だが（`man launchd.plist`: "by default, jobs will not be spawned more than once every 10 seconds"）、既定値に頼らず明示する。なお `KeepAlive` は `RunAtLoad` を含意する（同 man: "implicitly implies RunAtLoad"）ので `RunAtLoad` の明示は冗長だが、読み手のために残す
+  - 常駐しているあいだ helper は listen しているだけで、pf も `/etc/resolver` も触らない（`run` が来るまで何も起きない）。とはいえ「使っていないのに常駐している」ことは README に明記する
 - helper は起動のたびに残留アンカーと resolver ファイルを掃除してから listen する
 - 署名・公証は v1 ではしない。GitHub Releases からの直接ダウンロードは非サポートと明記
-- アンインストール: `sudo tetherd-helper uninstall`（`launchctl bootout`、plist、グループ、`/usr/local/libexec/tetherd` の削除）→ `brew uninstall tetherd`
+- アンインストール: `sudo tetherd-helper uninstall`（`launchctl bootout`、plist、グループ、`/usr/local/libexec/tetherd` の削除。この 4 つを 1 コマンドで行い、途中が失敗しても残りを試す）→ `brew uninstall --cask tetherd`。**グループを消すのは仕様どおり**で、消さないと初回インストールの検証ができない（`EnsureGroup` が既存の gid を返してグループ作成の経路を通らない）
 - Ventura 以降の「バックグラウンド項目が追加されました」で無効化されたら `doctor` が案内。毎年の macOS メジャーリリースで動作確認
 
 ---
@@ -685,6 +694,14 @@ v0.4 でやること 3 つ（どれも独立）: (1) `aws-sdk-go-v2/service/elas
 | 30 | `token rotate` の直後は走行中のセッションが古いトークンのまま steal し続ける | 未実施 |
 
 ---
+
+### v0.4（配布とインストール）
+
+**§8 を実装に合わせて 5 点直した**（このセクションの本文に反映済み）: tap 名と `brew install` の行、formula → cask、`install` が `tetherd-helper` 自身もコピーして転送先パスの所有者を検査すること、そして **helper が v0.4 では常駐すること**（`RunAtLoad: true`。ソケットアクティベーションは `purego` という新しい依存が要るので次に送った。**黙って乖離させず、spec 側に書いた**）。5 点目は所有者検査の対象に `/var/log` を足したこと（最終レビュー R2。plist が root に書かせる 3 つ目のパスで、`docs/install.md` は元から 3 つを同じ文で「検査は通る」と書いていたのに、ループは 2 つしか見ていなかった）。
+
+設計と実測の詳細は `docs/install.md`（cask 全文、root 所有ディレクトリに入れる理由、`KeepAlive` の判断、quarantine と署名の扱い、ラベルが Go と cask の 2 箇所にあること）。
+
+**検証は実機のインストールが必要なので `docs/e2e-aws.md` の v0.4 の行で行う**（`brew install` からの初回インストール、`EvalSymlinks`、`launchctl print`、`doctor`、冪等な再実行、`brew uninstall --cask`）。単体テストで確かめられるのは plist の内容・所有者検査・`install`/`uninstall` の冪等性と launchctl の呼び出し順までで、**launchd が実際にこの plist を受け付けて helper を起動することは実機でしか分からない**。
 
 ---
 

@@ -19,7 +19,6 @@ aws:
 target:
   cluster: myapp-dev
   service: api
-  container: app
   env: dev
 env:
   override:
@@ -560,5 +559,79 @@ func TestEnsurePersonalWithATokenIsByteIdentical(t *testing.T) {
 	}
 	if string(after) != string(body) {
 		t.Fatalf("a file with a token must be untouched: got %q want %q", after, body)
+	}
+}
+
+// `target.container` was accepted and silently dropped until v0.4: the key
+// was parsed into a field nothing read, so a developer whose application
+// container is named "web" wrote it here, got no error, and then debugged a
+// `tetherd env` failure that pointed at a mechanism they had never heard of.
+//
+// It is now refused, and what this test is really about is the *wording*.
+// "Startup failed" is not the fix - the field could simply have been
+// deleted for that, leaving KnownFields(true) to answer "field container
+// not found in type config.Target", which says nothing about why the key
+// cannot work or what to set instead. The error has to name
+// TETHERD_APP_CONTAINER, the setting that actually decides, so the
+// assertion below is on that name and not merely on err != nil.
+func TestLoadRefusesTargetContainerAndNamesTETHERDAPPCONTAINER(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct{ name, body string }{
+		{"a name", "version: 1\ntarget:\n  cluster: c\n  container: web\n"},
+		{"empty", "version: 1\ntarget:\n  container: \"\"\n"},
+		// A key written with no value is still the key, written. A *string
+		// would read this as absent (measured), which is why presence comes
+		// from a yaml.Node.
+		{"null", "version: 1\ntarget:\n  container:\n"},
+		{"tilde", "version: 1\ntarget:\n  container: ~\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := write(t, dir, "c-"+strings.ReplaceAll(tc.name, " ", "-")+".yml", tc.body)
+			_, err := Load(p, "")
+			if err == nil {
+				t.Fatal("`target.container` must be refused, not accepted and ignored")
+			}
+			if !strings.Contains(err.Error(), "TETHERD_APP_CONTAINER") {
+				t.Errorf("the refusal must name the setting that actually decides which container is read.\ngot:  %v\nwant: an error containing TETHERD_APP_CONTAINER", err)
+			}
+			if !strings.Contains(err.Error(), "target.container") {
+				t.Errorf("the refusal must name the key it is refusing: %v", err)
+			}
+			if !strings.Contains(err.Error(), p) {
+				t.Errorf("the refusal must name the file it came from: %v", err)
+			}
+		})
+	}
+}
+
+// The refusal comes from the lenient probe, so it must not be reachable
+// only through it: a file with no `target.container` at all still parses,
+// and one that misspells the key still gets the unknown-field error rather
+// than this one.
+func TestLoadWithoutTargetContainerIsUnaffected(t *testing.T) {
+	dir := t.TempDir()
+	ok := write(t, dir, "ok.yml", "version: 1\ntarget:\n  cluster: c\n  service: s\n")
+	if _, err := Load(ok, ""); err != nil {
+		t.Fatalf("a file that does not set the key must parse: %v", err)
+	}
+	typo := write(t, dir, "typo.yml", "version: 1\ntarget:\n  contaner: web\n")
+	if _, err := Load(typo, ""); err == nil || !strings.Contains(err.Error(), "contaner") {
+		t.Fatalf("a misspelled key must still be reported as unknown: %v", err)
+	}
+}
+
+// The version gate stays ahead of the container refusal: a version: 2 file
+// is a newer schema this binary cannot read at all, and reporting one of
+// its keys instead of the version would send the developer to delete a key
+// from a file they should be told to upgrade for.
+func TestLoadReportsTheVersionBeforeTheContainerRefusal(t *testing.T) {
+	dir := t.TempDir()
+	p := write(t, dir, "v2.yml", "version: 2\ntarget:\n  container: web\n")
+	_, err := Load(p, "")
+	if err == nil || !strings.Contains(err.Error(), "unsupported version 2") {
+		t.Fatalf("the version must be reported first: %v", err)
+	}
+	if strings.Contains(err.Error(), "TETHERD_APP_CONTAINER") {
+		t.Fatalf("a version: 2 file must not be told to fix a v1 key: %v", err)
 	}
 }
