@@ -50,6 +50,15 @@ Then, to remove the three binaries from `PATH`:
 brew uninstall --cask tetherd
 ```
 
+**This prompts for your password**, and needs a terminal that can ask. The
+cask's `uninstall launchctl:` / `delete:` stanzas touch
+`/Library/LaunchDaemons` and `/usr/local/libexec`, so Homebrew escalates on
+its own. Measured: run without a tty it stops at `sudo: a terminal is
+required to read the password` and **changes nothing** - the daemon, the
+plist, the install directory and the symlinks were all still in place
+afterwards, and `brew list --cask` still listed it. So a failure here is
+safe to retry rather than something to clean up after.
+
 The cask's own `uninstall launchctl:` / `delete:` stanza (`.goreleaser.yml`)
 would do the bootout and delete the plist and `/usr/local/libexec/tetherd`
 even if you skipped `sudo tetherd-helper uninstall` — it exists as a safety
