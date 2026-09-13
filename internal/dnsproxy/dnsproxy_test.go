@@ -20,7 +20,7 @@ func start(t *testing.T, r Resolver) netip.AddrPort {
 	s := &Server{Resolve: r, Logf: t.Logf}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); s.Close() })
-	addr, err := s.Start(ctx, 0)
+	addr, err := s.StartPreferring(ctx, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +301,7 @@ func TestSlowResolveTimesOutWithoutBlockingOtherQueries(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); s.Close() })
-	addr, err := s.Start(ctx, 0)
+	addr, err := s.StartPreferring(ctx, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +347,7 @@ func TestCloseCancelsInFlightResolvesInsteadOfWaiting(t *testing.T) {
 		QueryTimeout: 10 * time.Second,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	addr, err := s.Start(ctx, 0)
+	addr, err := s.StartPreferring(ctx, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
