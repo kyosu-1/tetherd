@@ -544,6 +544,22 @@ design.md §10 に加えて:
 
 ## 12. 先に潰す検証（順序つき）
 
+### v0.4 の実機検証（2026-09-13）
+
+**配布経路が他人の Mac で成立することを確認した。**`docs/e2e-aws.md` の 32〜38 行、リリース v0.4.0 と v0.4.1 に対して実施。
+
+ローカルでは原理的に確かめられなかった 2 点が、どちらも成立した:
+
+- **launchd はこの plist を受理して root でデーモンを起動する。** `ps` で uid 0 / ppid 1 / `/usr/local/libexec/tetherd/tetherd-helper` から走行。`plutil -p` で 7 キーすべて意図どおり（`ProgramArguments` の 4 パスが全て root 所有配下、`KeepAlive {SuccessfulExit: false}`、`RunAtLoad true`、`ThrottleInterval 10`）。**Homebrew の prefix を指していない** — 権限昇格を防ぐ設計が実機で成立
+- **`EvalSymlinks` の前提が成立する。** `/opt/homebrew/bin/tetherd-helper` → `Caskroom/tetherd/<ver>/tetherd-helper` で、`tetherd-exec` が同じディレクトリに実在した
+
+さらに: `doctor` は **14 行すべて `✓` で exit 0**、`tetherd run -- aws sts get-caller-identity` が子プロセスにタスクロールを渡し（helper ログに `pf enabled → applied → cleared` の全ライフサイクル、終了後 `/etc/resolver` は空）、`sudo tetherd-helper install` は冪等で daemon を入れ替える、`brew uninstall --cask` は daemon を落とす。quarantine は `postflight` で除去されている。
+
+**この検証が見つけた欠陥 2 件:**
+
+1. **v0.4.0 は `brew install` できなかった**（v0.4.1 で修正）。cask が `depends_on formula: ["session-manager-plugin"]` を宣言していたが、それは cask であって formula ではない。**計画に「formula として実在する（`brew info` で確認済み）」と書いたのが誤り** — `brew info` は formula と cask を横断して解決するので、主張した区別ができないコマンドで確認していた。正解は `internal/doctor/checks.go` に v0.2b から `--cask` として存在していた。依存は `cask:` に直すのではなく**宣言をやめた**: `depends_on` は「brew が入れたか」を問うが、必要なのは「PATH にあるか」で、AWS 公式インストーラは Homebrew に見えない場所に置く
+2. **`postflight` は Homebrew 6.x で deprecated**（`Warning: Calling postflight is deprecated! Use postflight_steps instead.`）。GoReleaser の cask テンプレートが生成するので設定から変えられない。**現状は機能しているが、削除されたら quarantine の除去が黙って止まる — cask を選んだ唯一の理由なので、v1.0 の最優先項目**
+
 設計の妥当性を左右するものから。1〜4 は AWS 不要。
 
 1. `tetherd-exec`（`setregid`）+ pf `group` + `rdr` で、bash / zsh / Go / Node の子プロセスの TCP が捕まり、他プロセスは捕まらないこと（9.3 の第 3 層）
